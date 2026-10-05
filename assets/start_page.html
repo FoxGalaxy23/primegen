@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meetlook Browser</title>
+    <!-- Google Fonts: Poppins -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Poppins', sans-serif;
+        }
+
+        body {
+            background-color: #0f172a;
+            color: #f8fafc;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            align-items: center;
+            padding: 2rem 1rem;
+            overflow-x: hidden;
+        }
+
+        /* Background glow decoration */
+        .bg-glow {
+            position: absolute;
+            top: 30%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 500px;
+            height: 500px;
+            background: radial-gradient(circle, rgba(99, 102, 241, 0.15) 0%, rgba(15, 23, 42, 0) 70%);
+            z-index: -1;
+            pointer-events: none;
+        }
+
+        /* Central Container */
+        .main-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            max-width: 680px;
+            margin: auto 0;
+        }
+
+        /* Title Styling */
+        h1.title {
+            font-size: 3rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 2rem;
+            text-align: center;
+            letter-spacing: -0.5px;
+            text-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+        }
+
+        /* Search Box Wrapper */
+        .search-form {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 9999px;
+            padding: 0.5rem 0.75rem 0.5rem 1.5rem;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .search-form:focus-within {
+            border-color: #6366f1;
+            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.25), 0 15px 30px -5px rgba(0, 0, 0, 0.4);
+            background: #1e293b;
+        }
+
+        .search-icon {
+            color: #64748b;
+            font-size: 1.2rem;
+            margin-right: 1rem;
+        }
+
+        /* Search Input */
+        .search-input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: #f8fafc;
+            font-size: 1.1rem;
+            font-weight: 400;
+        }
+
+        .search-input::placeholder {
+            color: #64748b;
+        }
+
+        /* Submit Button */
+        .search-button {
+            background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+            color: #ffffff;
+            border: none;
+            border-radius: 9999px;
+            padding: 0.75rem 1.5rem;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .search-button:hover {
+            opacity: 0.95;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(79, 70, 229, 0.4);
+        }
+
+        .search-button:active {
+            transform: translateY(0);
+        }
+
+        /* Footer / Quick Links Section */
+        .links-container {
+            width: 100%;
+            max-width: 600px;
+            display: flex;
+            justify-content: center;
+            gap: 1.25rem;
+            flex-wrap: wrap;
+            margin-top: auto;
+            padding-top: 2rem;
+        }
+
+        /* Individual Link Card */
+        .link-card {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            background: #1e293b;
+            border: 1px solid #334155;
+            padding: 0.75rem 1.25rem;
+            border-radius: 12px;
+            color: #cbd5e1;
+            text-decoration: none;
+            font-size: 0.95rem;
+            font-weight: 500;
+            transition: all 0.25s ease;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .link-card i {
+            font-size: 1.1rem;
+            color: #818cf8;
+            transition: color 0.25s ease;
+        }
+
+        .link-card:hover {
+            background: #334155;
+            color: #ffffff;
+            border-color: #6366f1;
+            transform: translateY(-3px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+        }
+
+        .link-card:hover i {
+            color: #a855f7;
+        }
+
+        /* Responsive design */
+        @media (max-width: 640px) {
+            h1.title {
+                font-size: 2.25rem;
+            }
+
+            .search-form {
+                padding: 0.4rem 0.5rem 0.4rem 1rem;
+            }
+
+            .search-button span {
+                display: none;
+            }
+
+            .search-button {
+                padding: 0.75rem;
+                border-radius: 50%;
+            }
+
+            .links-container {
+                gap: 0.75rem;
+            }
+
+            .link-card {
+                padding: 0.6rem 1rem;
+                font-size: 0.85rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-glow"></div>
+
+    <main class="main-container">
+        <h1 class="title">Meetlook Browser</h1>
+
+        <!-- Search form redirects directly to Google -->
+        <form class="search-form" action="https://www.google.com/search" method="GET">
+            <i class="fa-solid fa-magnifying-glass search-icon"></i>
+            <input
+                type="text"
+                name="q"
+                class="search-input"
+                placeholder="Искать в интернете..."
+                required
+                autofocus
+                autocomplete="off"
+            >
+            <button type="submit" class="search-button">
+                <span>Найти</span>
+                <i class="fa-solid fa-arrow-right"></i>
+            </button>
+        </form>
+    </main>
+
+    <footer class="links-container">
+        <a href="https://meetlookers.com" target="_blank" class="link-card">
+            <i class="fa-solid fa-globe"></i>
+            <span>Meetlookers</span>
+        </a>
+        <a href="http://old-dos.ru" target="_blank" class="link-card">
+            <i class="fa-solid fa-floppy-disk"></i>
+            <span>Old-DOS.ru</span>
+        </a>
+        <a href="https://wikipedia.org" target="_blank" class="link-card">
+            <i class="fa-solid fa-book"></i>
+            <span>Wikipedia</span>
+        </a>
+    </footer>
+</body>
+</html>

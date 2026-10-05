@@ -1,0 +1,38 @@
+# webpage — движок веб-страниц
+
+Конвейер: **HTML → дерево → каскад CSS → раскладка → display list → отрисовка**.
+Старый плоский движок (`parse_html` + `layout`) остаётся для интерфейса браузера и служебных страниц;
+`layout_and_render()` сам переключается на этот модуль, если корень DOM создан `parse_document()` (`node->v2`).
+
+| файл | что делает |
+|---|---|
+| `html.c` | токенайзер и построение дерева: raw-text (`style/script/textarea/title/noscript`), сущности, неявные закрытия тегов, кодировки (UTF-8, windows-1251, KOI8-R, latin1), URL-ы |
+| `css.c` | цвета, длины и `calc()/min()/max()/clamp()`, `@media`, `@import`, `@font-face` (+`unicode-range`), декларации, селекторы (комбинаторы, `[attr]`, `:nth-child`, `:not/:is/:where`, …) |
+| `style.c` | UA-стили, индекс правил, каскад (специфичность, `!important`), `var()`, наследование → `node->st` |
+| `layout2.c` (+`l2_flex/grid/table.inc`) | блоки с схлопыванием отступов, строчный поток, float, inline-block, flex, grid (базовый), таблицы, relative/absolute/fixed |
+| `paint.c` | скруглённые рамки с AA, тени, фоновые картинки, текст, формы, hit-test, выделение, GET-отправка форм |
+| `images.c` | параллельная предзагрузка (в дочернем процессе загрузки), декодирование `stb_image` (PNG/JPEG/GIF/BMP), кэш |
+
+Запуск с URL: `./my_browser https://pypi.org/` или `./my_browser /path/to/page.html`.
+
+Не поддерживается: JavaScript-управляемая вёрстка, SVG/WebP-картинки, CFF/WOFF2-шрифты, `::before/::after`,
+`z-index`-стекинг, градиенты (берётся первый цвет), анимации, `position:sticky` (ведёт себя как relative).
+
+## JavaScript
+
+Ядро языка — **QuickJS** (`mods/frame/quickjs/`, MIT; ES2023: классы, `async/await`, генераторы, промисы, RegExp, Map/Set, BigInt, модули).
+Браузерная часть:
+
+| файл | что делает |
+|---|---|
+| `js.c` | нативные DOM-примитивы (`__dom.*`): дерево с id узлов, мутации + перелинеаризация, атрибуты, `innerHTML`, селекторы (тот же движок, что в CSS), геометрия из layout, таймеры, `fetch` (синхронно), ES-модули; жизненный цикл страницы |
+| `js_prelude.js` → `js_prelude.c` | весь веб-API поверх примитивов: `Node/Element/Document`, события (capture/bubble, `on*`-атрибуты), `classList/style/dataset`, `location/history/navigator`, `Storage`, `URL`, `fetch/XMLHttpRequest/Headers/Response`, `Intersection/Resize/MutationObserver`, `console`… После правок: `python3 tools/embed_js.py` |
+
+Как это работает: дочерний процесс загрузки скачивает внешние `<script src>` и таблицы стилей и кладёт их в `cache/tab_N.bundle`;
+родитель создаёт JS-контекст, исполняет скрипты по порядку, генерирует `DOMContentLoaded`/`load`. После мутаций DOM каскад пересчитывается
+(без сети) и страница перерисовывается. `main.c` вызывает `webpage_js_tick()` каждый кадр (таймеры, промисы), доставляет `click`/`keydown`/`input`/`submit`,
+исполняет навигацию, запрошенную из JS (`location.href`, `history.back()`).
+
+Ограничения: `fetch/XHR` — только GET и синхронный (блокирует UI на время запроса), нет Web Workers/WebSocket/`Intl`/canvas,
+`localStorage` не переживает переход на другую страницу, `MutationObserver` — заглушка, `IntersectionObserver` срабатывает сразу.
+Пример: `./my_browser examples/js-demo/index.html`.
