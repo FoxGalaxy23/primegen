@@ -13,6 +13,8 @@
 #include <sys/wait.h>
 #include <sys/select.h>
 
+bool webpage_mixed_blocked(const char* url);
+
 /* Протокол по внутренним пайпам — как в ws.c: 1 байт type + 4 байта BE length + payload. */
 static void emit(int fd, char type, const void* payload, uint32_t len) {
     unsigned char h[5]; h[0] = (unsigned char)type; h[1] = (unsigned char)(len >> 24); h[2] = (unsigned char)(len >> 16); h[3] = (unsigned char)(len >> 8); h[4] = (unsigned char)len;
@@ -44,7 +46,7 @@ static JSValue w_close(JSContext* c, JSValueConst t, int argc, JSValueConst* arg
 static JSValue w_fetch_sync(JSContext* c, JSValueConst t, int argc, JSValueConst* argv) {
     (void)t; if (argc < 1) return JS_NULL;
     const char* url = JS_ToCString(c, argv[0]); if (!url) return JS_NULL;
-    char* body = nal_http_get(url); JS_FreeCString(c, url);
+    char* body = webpage_mixed_blocked(url) ? NULL : nal_http_get(url); JS_FreeCString(c, url);
     if (!body) return JS_NULL;
     JSValue r = JS_NewString(c, body); free(body); return r;
 }
@@ -98,7 +100,7 @@ static void worker_dispatch_message(JSContext* ctx, const char* json) {
 
 static void child_main(const char* script_url, int out_fd, int in_fd) {
     g_out_fd = out_fd;
-    char* src = nal_http_get(script_url);
+    char* src = webpage_mixed_blocked(script_url) ? NULL : nal_http_get(script_url);
     if (!src) { emit(out_fd, 'E', "worker: failed to load script", 30); _exit(0); }
 
     JSRuntime* rt = JS_NewRuntime(); JSContext* ctx = JS_NewContext(rt);

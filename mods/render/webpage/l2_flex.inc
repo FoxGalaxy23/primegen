@@ -76,11 +76,15 @@ static float layout_flex(Box* b, float cx, float cy, float cw, float ch, LS* ls)
                 float oh = c->mt + c->h + c->mb; if (oh > cross) cross = oh;
             }
             if (single && ch >= 0 && ch > cross) cross = ch;
+            else if (single && ch >= 0 && cross > ch) {         /* строка фиксированной высоты: растянутые элементы с overflow ограничиваются ею (внутри — прокрутка) */
+                int clipper = 0; for (int i = start; i < end; i++) { const NodeStyle* cs = it[i].b->st; if (cs->overflow_hidden && !cs->height.set && flex_align(it[i].b, st) == AI_STRETCH) clipper = 1; }
+                if (clipper) cross = ch;
+            }
             float maxfb = 0; int have_fb = 0;
             for (int i = start; i < end; i++) { Box* c = it[i].b; if (flex_align(c, st) == AI_BASELINE && c->fb > -1e8f) { float v = c->mt + (c->fb - c->y); if (v > maxfb) maxfb = v; have_fb = 1; } }
             for (int i = start; i < end; i++) {
                 Box* c = it[i].b; int a = flex_align(c, st); float oh = c->mt + c->h + c->mb, dy = 0;
-                if (a == AI_STRETCH) { if (!c->st->height.set && !c->repl) { float nh = cross - c->mt - c->mb; if (nh > c->h) patch_h(c, nh); } }
+                if (a == AI_STRETCH) { if (!c->st->height.set && !c->repl) { float nh = cross - c->mt - c->mb; if (nh > c->h || (c->st->overflow_hidden && single && ch >= 0 && nh < c->h && nh > 0)) patch_h(c, nh); } }
                 else if (a == AI_CENTER) dy = (cross - oh) / 2;
                 else if (a == AI_END) dy = cross - oh;
                 else if (a == AI_BASELINE && have_fb && c->fb > -1e8f) dy = maxfb - (c->mt + (c->fb - c->y));
@@ -115,7 +119,25 @@ static float layout_flex(Box* b, float cx, float cy, float cw, float ch, LS* ls)
             int need = 0;
             if (tg > 0) for (int i = 0; i < k; i++) { float extra = freeSp * it[i].b->st->flex_grow / tg; if (extra > 0.5f && !it[i].b->st->height.set) { fhf[i] = it[i].b->h + extra; need = 1; } }
             if (need) {
-                l2_dn = mark;
+                l2_dn = mark; grp_trunc(mark);
+                if (own) { own->abs = sv_abs; own->abs_tail = sv_tail; if (sv_tail) sv_tail->next = NULL; }
+                continue;
+            }
+        }
+        if (pass == 0 && ch >= 0 && total > ch + 0.5f) {
+            /* column: элементам не хватает высоты. Элементы с overflow (для них min-height:auto = 0) сжимаются
+               пропорционально flex-shrink * высота — иначе прокручиваемая область растянулась бы по содержимому */
+            float over = total - ch, ts = 0; int need = 0;
+            for (int i = 0; i < k; i++) { const NodeStyle* cs = it[i].b->st; if (cs->overflow_hidden && cs->flex_shrink > 0) ts += cs->flex_shrink * it[i].b->h; }
+            if (ts > 0) for (int i = 0; i < k; i++) {
+                Box* c = it[i].b; const NodeStyle* cs = c->st; if (!(cs->overflow_hidden && cs->flex_shrink > 0)) continue;
+                float exh = c->pt + c->pb + c->bt + c->bb, nh = c->h - over * cs->flex_shrink * c->h / ts;
+                float mnh = cs->min_h.set ? lenpx(&cs->min_h, ch) + (cs->box_sizing ? 0 : exh) : 0;
+                if (nh < mnh) nh = mnh; if (nh < exh) nh = exh;
+                if (nh < c->h - 0.5f) { fhf[i] = nh; need = 1; }
+            }
+            if (need) {
+                l2_dn = mark; grp_trunc(mark);
                 if (own) { own->abs = sv_abs; own->abs_tail = sv_tail; if (sv_tail) sv_tail->next = NULL; }
                 continue;
             }

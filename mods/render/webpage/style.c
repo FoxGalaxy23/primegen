@@ -311,13 +311,15 @@ static void parse_gradient_stops(Cx* c, NodeStyle* st, const char* tk) {
 }
 
 static void parse_bg(Cx* c, NodeStyle* st, const char* v, int full) {
-    char tk[512]; const char* p = v; uint32_t col;
+    char tk[16384]; const char* p = v; uint32_t col;                       /* data-URI в url(...) бывают длинными */
     if (full) { st->bg = 0; st->bg_url[0] = 0; st->bg_repeat = 0; st->bg_size_mode = 0; memset(&st->bg_px, 0, sizeof(Len) * 2); st->bg_px.pct = st->bg_py.pct = 0; st->bg_px.set = st->bg_py.set = 0; st->bg_grad_type = 0; }
     int posn = 0; int in_size = 0;
     while (tok_next(&p, tk, sizeof tk)) {
         if (!strncasecmp(tk, "url(", 4)) {
             const char* q = tk + 4; while (isspace((unsigned char)*q)) q++; char qc = (*q == '"' || *q == '\'') ? *q++ : 0; size_t k = 0;
-            while (*q && (qc ? *q != qc : *q != ')') && k < 190) st->bg_url[k++] = *q++; st->bg_url[k] = 0;
+            const char* qe = q; while (*qe && (qc ? *qe != qc : *qe != ')')) qe++;
+            if (qe - q > 5 && !strncasecmp(q, "data:", 5)) { char dp[200]; if (!webpage_data_uri_to_file(q, (size_t)(qe - q), dp, sizeof dp)) dp[0] = 0; snprintf(st->bg_url, sizeof st->bg_url, "%s", dp); }   /* data: → файл кэша */
+            else { while (*q && (qc ? *q != qc : *q != ')') && k < 190) st->bg_url[k++] = *q++; st->bg_url[k] = 0; }
         } else if (!strncasecmp(tk, "linear-gradient(", 16) || !strncasecmp(tk, "-webkit-linear-gradient(", 24) || !strncasecmp(tk, "radial-gradient(", 16)) {
             parse_gradient_stops(c, st, tk);
         } else if (!strcasecmp(tk, "no-repeat")) st->bg_repeat = 3; else if (!strcasecmp(tk, "repeat-x")) st->bg_repeat = 1;
@@ -378,20 +380,31 @@ static void set_line_height(Cx* c, NodeStyle* st, const char* v) {
     Len l; if (css_parse_len(v, &l, c->em, c->rem) && l.set) { st->lh_px = l.px + l.pct * st->font_size / 100.0f; st->lh_mult = 0; }
 }
 
+/* font-weight → 100..900 (0 — не распознано). bolder/lighter без учёта родителя: 700 / 300 */
+static int parse_weight_val(const char* v) {
+    while (isspace((unsigned char)*v)) v++;
+    if (!strncasecmp(v, "normal", 6)) return 400;
+    if (!strncasecmp(v, "bold", 4) && strncasecmp(v, "bolder", 6)) return 700;
+    if (!strncasecmp(v, "bolder", 6)) return 700;
+    if (!strncasecmp(v, "lighter", 7)) return 300;
+    if (isdigit((unsigned char)*v)) { int w = atoi(v); if (w >= 1 && w <= 1000) { w = (w + 50) / 100 * 100; return w < 100 ? 100 : w > 900 ? 900 : w; } }
+    return 0;
+}
 static void apply_font_shorthand(Cx* c, DOMNode* n, NodeStyle* st, const char* v, int size_pass) {
-    char tk[256]; const char* p = v; int bold = 0, ital = 0;
+    char tk[256]; const char* p = v; int bold = 0, ital = 0, wt = 400;
     if (!strcasecmp(v, "inherit")) return;
     while (tok_next(&p, tk, sizeof tk)) {
         if (!strcasecmp(tk, "italic") || !strcasecmp(tk, "oblique")) ital = 1;
         else if (!strcasecmp(tk, "normal") || !strcasecmp(tk, "small-caps")) {}
-        else if (!strcasecmp(tk, "bold") || !strcasecmp(tk, "bolder") || (atoi(tk) >= 600 && isdigit((unsigned char)tk[0]) && !strchr(tk, 'p'))) bold = 1;
-        else if (isdigit((unsigned char)tk[0]) && !strchr(tk, '.') && !strchr(tk, 'p') && !strchr(tk, 'e') && !strchr(tk, '%')) {}   /* weight 100..500 */
+        else if (!strcasecmp(tk, "bold") || !strcasecmp(tk, "bolder") || (atoi(tk) >= 600 && isdigit((unsigned char)tk[0]) && !strchr(tk, 'p'))) { bold = 1; wt = parse_weight_val(tk); if (!wt) wt = 700; }
+        else if (isdigit((unsigned char)tk[0]) && !strchr(tk, '.') && !strchr(tk, 'p') && !strchr(tk, 'e') && !strchr(tk, '%')) { int w = parse_weight_val(tk); if (w) wt = w; }   /* weight 100..500 */
+        else if (!strcasecmp(tk, "lighter")) wt = 300;
         else {                                                             /* размер[/высота] */
             char sz[64] = "", lh[64] = ""; const char* sl = strchr(tk, '/');
             if (sl) { snprintf(sz, sizeof sz, "%.*s", (int)(sl - tk), tk); snprintf(lh, sizeof lh, "%s", sl + 1); } else snprintf(sz, sizeof sz, "%s", tk);
             if (size_pass) { set_font_size(c, st, sz); }
             else {
-                st->bold = (uint8_t)bold; st->italic = (uint8_t)ital;
+                st->bold = (uint8_t)bold; st->italic = (uint8_t)ital; st->weight = (uint16_t)wt;
                 if (lh[0]) set_line_height(c, st, lh); else { st->lh_mult = 0; st->lh_px = 0; }
                 while (isspace((unsigned char)*p)) p++;
                 if (*p) set_family(n, p);
@@ -411,6 +424,8 @@ static void put_utf8(char* out, size_t cap, size_t* o, unsigned cp) {
     if (*o + (size_t)l + 1 >= cap) return;
     memcpy(out + *o, b, (size_t)l); *o += (size_t)l; out[*o] = 0;
 }
+/* сырой байт исходного текста: он уже в UTF-8, поэтому многобайтовые символы копируем как есть (put_utf8 по байтам их портил) */
+static void put_raw(char* out, size_t cap, size_t* o, unsigned char ch) { if (*o + 2 >= cap) return; out[(*o)++] = (char)ch; out[*o] = 0; }
 static void parse_content(Cx* c, const char* v) {
     char* out = c->content; size_t cap = 248, o = 0; out[0] = 0; c->has_content = 0;
     const char* p = v;
@@ -431,8 +446,8 @@ static void parse_content(Cx* c, const char* v) {
                         if (cp == 0 || cp > 0x10FFFF) cp = 0xFFFD;
                         put_utf8(out, cap, &o, cp);
                     } else if (*p == '\n') p++;
-                    else if (*p) { put_utf8(out, cap, &o, (unsigned char)*p); p++; }
-                } else { put_utf8(out, cap, &o, (unsigned char)*p); p++; }
+                    else if (*p) { put_raw(out, cap, &o, (unsigned char)*p); p++; }
+                } else { put_raw(out, cap, &o, (unsigned char)*p); p++; }
             }
             if (*p) p++;
         } else if (!strncasecmp(p, "attr(", 5)) {
@@ -440,7 +455,7 @@ static void parse_content(Cx* c, const char* v) {
             char nm[64]; size_t l = (size_t)(e - (p + 5)); if (l > 63) l = 63; memcpy(nm, p + 5, l); nm[l] = 0;
             char* t = nm; while (isspace((unsigned char)*t)) t++;
             size_t tl = strlen(t); while (tl && isspace((unsigned char)t[tl - 1])) t[--tl] = 0;
-            char av[200]; if (c->owner && attr_val(c->owner, t, av, sizeof av)) for (char* q = av; *q; q++) put_utf8(out, cap, &o, (unsigned char)*q);
+            char av[200]; if (c->owner && attr_val(c->owner, t, av, sizeof av)) for (char* q = av; *q; q++) put_raw(out, cap, &o, (unsigned char)*q);
             p = e + 1;
         } else if (!strncasecmp(p, "open-quote", 10)) { put_utf8(out, cap, &o, 0x201C); p += 10; }
         else if (!strncasecmp(p, "close-quote", 11)) { put_utf8(out, cap, &o, 0x201D); p += 11; }
@@ -463,7 +478,7 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
         const NodeStyle* ps = &pa->st;
         switch (prop) {
             case P_COLOR: st->color = ps->color; break; case P_BG_COLOR: st->bg = ps->bg; break;
-            case P_FONT_WEIGHT: st->bold = ps->bold; break; case P_FONT_STYLE: st->italic = ps->italic; break;
+            case P_FONT_WEIGHT: st->bold = ps->bold; st->weight = ps->weight; break; case P_FONT_STYLE: st->italic = ps->italic; break;
             case P_FONT_FAMILY: set_family(n, pa->font_family); break; case P_TEXT_ALIGN: st->text_align = ps->text_align; break;
             case P_DISPLAY: st->display = ps->display; break; case P_VISIBILITY: st->visibility = ps->visibility; break;
             case P_WIDTH: st->width = ps->width; break; case P_HEIGHT: st->height = ps->height; break;
@@ -486,18 +501,31 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
         st->is_grid = (!strcasecmp(w, "grid") || !strcasecmp(w, "inline-grid"));
         for (int i = 0; M[i].k; i++) if (!strcasecmp(w, M[i].k)) { st->display = (uint8_t)M[i].d; return; }
         st->display = DSP_INLINE; return; }
-    case P_POSITION: st->position = !strcasecmp(val, "absolute") ? POS_ABSOLUTE : !strcasecmp(val, "fixed") ? POS_FIXED : !strcasecmp(val, "relative") || !strcasecmp(val, "sticky") ? POS_RELATIVE : POS_STATIC; return;
+    case P_POSITION: st->sticky = (uint8_t)(!strcasecmp(val, "sticky") || !strcasecmp(val, "-webkit-sticky"));
+        st->position = !strcasecmp(val, "absolute") ? POS_ABSOLUTE : !strcasecmp(val, "fixed") ? POS_FIXED : (!strcasecmp(val, "relative") || st->sticky) ? POS_RELATIVE : POS_STATIC; return;
     case P_FLOAT: st->float_ = (!strcasecmp(val, "left") || !strcasecmp(val, "inline-start")) ? FLT_LEFT : (!strcasecmp(val, "right") || !strcasecmp(val, "inline-end")) ? FLT_RIGHT : FLT_NONE; return;
     case P_CLEAR: st->clear = !strcasecmp(val, "both") ? 3 : !strcasecmp(val, "left") ? 1 : !strcasecmp(val, "right") ? 2 : 0; return;
     case P_VISIBILITY: st->visibility = (!strcasecmp(val, "hidden") || !strcasecmp(val, "collapse")); return;
     case P_OVERFLOW: case P_OVERFLOW_X: case P_OVERFLOW_Y: {
-        int hid = strncasecmp(val, "visible", 7) != 0; if (prop == P_OVERFLOW || hid) st->overflow_hidden = (uint8_t)hid; return; }
+        /* вид значения: 0 visible, 1 hidden/clip (только отсечение), 2 auto/scroll (отсечение + прокрутка) */
+        #define OV_KIND(v) (!strncasecmp((v), "auto", 4) || !strncasecmp((v), "scroll", 6) || !strncasecmp((v), "overlay", 7) ? 2 : (!strncasecmp((v), "visible", 7) || !*(v)) ? 0 : 1)
+        if (prop == P_OVERFLOW) {                       /* overflow: <x> [<y>] */
+            const char* v2 = val; while (*v2 && !isspace((unsigned char)*v2)) v2++; while (*v2 && isspace((unsigned char)*v2)) v2++;
+            int kx = OV_KIND(val), ky = *v2 ? OV_KIND(v2) : kx;
+            st->overflow_hidden = (uint8_t)(kx || ky); st->sc_x = (uint8_t)(kx == 2); st->sc_y = (uint8_t)(ky == 2); return;
+        }
+        int k = OV_KIND(val);
+        if (k) st->overflow_hidden = 1;
+        if (prop == P_OVERFLOW_X) st->sc_x = (uint8_t)(k == 2); else st->sc_y = (uint8_t)(k == 2);
+        if (!k && !st->sc_x && !st->sc_y) { /* visible по обеим осям: сохраняем прежнее поведение — отсечение не отключаем, если задано другой осью */ }
+        #undef OV_KIND
+        return; }
     case P_TEXT_ALIGN: st->center_blocks = (!strcasecmp(val, "-webkit-center") || !strcasecmp(val, "-moz-center")); st->text_align = (!strcasecmp(val, "right") || !strcasecmp(val, "end")) ? ALIGN_RIGHT : (!strcasecmp(val, "center") || !strcasecmp(val, "-webkit-center")) ? ALIGN_CENTER : !strcasecmp(val, "justify") ? ALIGN_JUSTIFY : ALIGN_LEFT; return;
     case P_WHITE_SPACE: st->white_space = !strcasecmp(val, "nowrap") ? WS_NOWRAP : !strcasecmp(val, "pre") ? WS_PRE : (!strcasecmp(val, "pre-wrap") || !strcasecmp(val, "break-spaces")) ? WS_PRE_WRAP : !strcasecmp(val, "pre-line") ? WS_PRE_LINE : WS_NORMAL; return;
     case P_TEXT_DECO: case P_TEXT_DECO_LINE: {
         uint8_t d = 0; if (strcasestr(val, "underline")) d |= DECO_UNDERLINE; if (strcasestr(val, "line-through")) d |= DECO_LINE_THROUGH; if (strcasestr(val, "overline")) d |= DECO_OVERLINE;
         st->deco = d; return; }
-    case P_FONT_WEIGHT: st->bold = (!strcasecmp(val, "bold") || !strcasecmp(val, "bolder") || atoi(val) >= 600); return;
+    case P_FONT_WEIGHT: { int w = parse_weight_val(val); if (w) { st->weight = (uint16_t)w; st->bold = w >= 600; } return; }
     case P_FONT_STYLE: st->italic = (!strncasecmp(val, "italic", 6) || !strncasecmp(val, "oblique", 7)); return;
     case P_FONT_FAMILY: set_family(n, val); return;
     case P_FONT: apply_font_shorthand(c, n, st, val, 0); return;
@@ -643,7 +671,7 @@ static void init_style(DOMNode* n, DOMNode* pa) {
     st->grid_span = 1;
     if (pa) {
         const NodeStyle* ps = &pa->st;
-        st->color = ps->color; st->font_size = ps->font_size; st->lh_px = ps->lh_px; st->lh_mult = ps->lh_mult; st->bold = ps->bold; st->italic = ps->italic;
+        st->color = ps->color; st->font_size = ps->font_size; st->lh_px = ps->lh_px; st->lh_mult = ps->lh_mult; st->bold = ps->bold; st->weight = ps->weight; st->italic = ps->italic;
         st->text_align = ps->text_align; st->white_space = ps->white_space; st->text_transform = ps->text_transform; st->visibility = ps->visibility;
         st->center_blocks = ps->center_blocks; st->list_style = ps->list_style; st->pointer = ps->pointer; st->break_word = ps->break_word; st->spacing = ps->spacing;
         st->deco = ps->deco; snprintf(n->font_family, sizeof n->font_family, "%s", pa->font_family);
@@ -712,7 +740,7 @@ static void finish_style(DOMNode* n, DOMNode* pa) {
         if (st->border_c[i] == CUR_COLOR) st->border_c[i] = st->color;
     }
     if ((st->sh_color & 0xFF000000u) == 0x01000000u) st->sh_color = st->color;
-    if (st->bg_url[0] && strncmp(st->bg_url, "data:", 5) != 0) { char ab[512]; webpage_resolve_url(g_base, st->bg_url, ab, sizeof ab); snprintf(st->bg_url, sizeof st->bg_url, "%s", ab); }
+    if (st->bg_url[0] && strncmp(st->bg_url, "data:", 5) != 0 && strncmp(st->bg_url, "cache/data_", 11) != 0) { char ab[512]; webpage_resolve_url(g_base, st->bg_url, ab, sizeof ab); snprintf(st->bg_url, sizeof st->bg_url, "%s", ab); }
     if (pa) { st->opacity *= pa->st.opacity; if (st->display == DSP_INLINE_BLOCK || st->float_ || st->position >= POS_ABSOLUTE) st->deco = st->deco & 0; if (pa->st.deco && st->display != DSP_INLINE_BLOCK && !st->float_ && st->position < POS_ABSOLUTE) st->deco |= pa->st.deco; }
 }
 
@@ -768,13 +796,13 @@ static void cascade_node(Doc* d, RIndex* ix, RuleSet* rs, DOMNode* n, float root
 static int g_style_offline = 0;
 void style_apply(DOMNode* head, SheetList* sheets, const char* base_url) {
     Arena A = {0}; RuleSet rs = {0}; RIndex ix; memset(&ix, 0, sizeof ix);
-    css_fetch_budget = g_style_offline ? 0 : 12; g_base = base_url;
+    css_fetch_budget = g_style_offline ? 0 : 12; g_base = base_url; webpage_set_doc_url(base_url);
     css_parse_sheet(&A, &rs, UA_CSS, NULL, 0, 0);
     int nsheet = 0;
     for (int i = 0; i < sheets->n; i++) {
         SheetSrc* s = &sheets->v[i];
         if (!css_media_matches(s->media)) continue;
-        if (!s->css && s->href && nsheet < 10 && css_fetch_budget > 0 && !strncmp(s->href, "http", 4)) {      /* скачиваем и сохраняем текст в бандле */
+        if (!s->css && s->href && nsheet < 10 && css_fetch_budget > 0 && !strncmp(s->href, "http", 4) && !webpage_mixed_blocked(s->href)) {      /* скачиваем и сохраняем текст в бандле */
             css_fetch_budget--; nsheet++;
             s->css = nal_http_get(s->href);
         }

@@ -52,22 +52,185 @@ static int dl_add(Cmd c) {
     if (l2_dn == g_dcap) { g_dcap = g_dcap ? g_dcap * 2 : 4096; Cmd* n = realloc(l2_dl, (size_t)g_dcap * sizeof(Cmd)); if (!n) return -1; l2_dl = n; }
     c.fixed = (uint8_t)g_fixed; l2_dl[l2_dn] = c; return l2_dn++;
 }
-static void dl_shift(int s, int e, float dx, float dy) { for (int i = s; i < e; i++) { l2_dl[i].x += dx; l2_dl[i].y += dy; } }
+static void dl_shift(int s, int e, float dx, float dy) {
+    for (int i = s; i < e; i++) { l2_dl[i].x += dx; l2_dl[i].y += dy; if (l2_dl[i].t == C_STK) { l2_dl[i].ex[1] += dy; l2_dl[i].ex[2] += dy; } }
+}
 void l2_release(void) { free(l2_dl); l2_dl = NULL; l2_dn = g_dcap = 0; free(l2_rects); l2_rects = NULL; l2_nrects = 0; }
+
+
+/* ══════════════ стекинг-контексты (z-index) ══════════════
+   Раскладка выдаёт display list в порядке обхода дерева. Чтобы элементы с z-index≠0 рисовались в правильном порядке,
+   каждый контекст (позиционированный блок с z-index, flex-элемент с z-index, position:fixed, корень) запоминает свой
+   диапазон команд [start,end). После раскладки диапазоны с z<0 переносятся в начало содержимого ближайшего
+   охватывающего контекста, с z>0 — в его конец (по возрастанию z). При переносе из-под overflow-отсечения вокруг
+   перенесённого диапазона восстанавливаются те же C_CLIP/C_UNCLIP, поэтому отсечение и прокрутка сохраняются. */
+typedef struct {
+    int start, cstart, cend, end, z, has_clip, lift;   /* lift: позиционированный элемент с z=auto (sticky) рисуется поверх обычного потока */
+    int parent, first_child, last_child, next_sib;
+    int cdepth_s, cdepth_c;          /* глубина стека отсечений: перед start и внутри содержимого (после собственного C_CLIP) */
+    int* snap;                        /* индексы C_CLIP, активных перед start (только у переносимых) */
+    unsigned char detach, bad;
+} StkGrp;
+static StkGrp* g_sg; static int g_sgn, g_sgcap;
+static void grp_record(int start, int cstart, int cend, int end, int z, int has_clip, int lift) {
+    if (end <= start) return;
+    if (g_sgn == g_sgcap) { int nc = g_sgcap ? g_sgcap * 2 : 64; StkGrp* nv = realloc(g_sg, (size_t)nc * sizeof(StkGrp)); if (!nv) return; g_sg = nv; g_sgcap = nc; }
+    StkGrp* g = &g_sg[g_sgn++]; memset(g, 0, sizeof *g);
+    g->start = start; g->cstart = cstart < start ? start : cstart; g->cend = cend > end ? end : cend; g->end = end; g->z = z; g->has_clip = has_clip; g->lift = lift;
+}
+/* раскладка части поддерева выполняется заново (flex): забываем контексты, записанные после mark */
+static void grp_trunc(int mark) { int k = 0; for (int i = 0; i < g_sgn; i++) if (g_sg[i].start < mark) g_sg[k++] = g_sg[i]; g_sgn = k; }
+
+static Cmd* so_out; static int so_n, so_cap;
+static void so_push(const Cmd* c) {
+    if (so_n == so_cap) { so_cap = so_cap ? so_cap * 2 : 4096; Cmd* nv = realloc(so_out, (size_t)so_cap * sizeof(Cmd)); if (!nv) return; so_out = nv; }
+    so_out[so_n++] = *c;
+}
+static void so_copy(int a, int b) { for (int i = a; i < b; i++) so_push(&l2_dl[i]); }
+static int g_sgv;                                  /* индекс виртуального корня (весь список) */
+static int so_zcmp(const void* a, const void* b) {
+    const StkGrp* x = &g_sg[*(const int*)a]; const StkGrp* y = &g_sg[*(const int*)b];
+    if (x->z != y->z) return x->z < y->z ? -1 : 1;
+    return x->start < y->start ? -1 : x->start > y->start;
+}
+static void so_emit(int gi);
+static void so_emit_detached(int di, int pi) {
+    StkGrp* D = &g_sg[di]; int from = g_sg[pi].cdepth_c, to = D->cdepth_s;
+    for (int j = from; j < to; j++) so_push(&l2_dl[D->snap[j]]);
+    so_emit(di);
+    for (int j = to - 1; j >= from; j--) { Cmd u; memset(&u, 0, sizeof u); u.t = C_UNCLIP; u.fixed = l2_dl[D->snap[j]].fixed; so_push(&u); }
+}
+static void so_emit(int gi) {
+    StkGrp* G = &g_sg[gi]; int nd = 0; int* dk = NULL;
+    for (int c = G->first_child; c >= 0; c = g_sg[c].next_sib) if (g_sg[c].detach) nd++;
+    if (nd && (dk = malloc((size_t)nd * sizeof(int)))) { int k = 0; for (int c = G->first_child; c >= 0; c = g_sg[c].next_sib) if (g_sg[c].detach) dk[k++] = c; qsort(dk, (size_t)nd, sizeof(int), so_zcmp); }
+    else nd = 0;
+    so_copy(G->start, G->cstart);
+    for (int k = 0; k < nd; k++) if (g_sg[dk[k]].z < 0) so_emit_detached(dk[k], gi);
+    int i = G->cstart;
+    for (int c = G->first_child; c >= 0; c = g_sg[c].next_sib) {
+        StkGrp* C = &g_sg[c]; if (C->start < i || C->end > G->cend) continue;     /* защита от нарушенной вложенности */
+        so_copy(i, C->start);
+        if (!C->detach) so_emit(c);
+        i = C->end;
+    }
+    if (i < G->cend) so_copy(i, G->cend);
+    for (int k = 0; k < nd; k++) if (g_sg[dk[k]].z >= 0) so_emit_detached(dk[k], gi);   /* z=0 (sticky) идёт перед z>0 */
+    so_copy(G->cend > i ? G->cend : i, G->end);
+    free(dk);
+}
+static int so_ordcmp(const void* a, const void* b) {
+    int ia = *(const int*)a, ib = *(const int*)b; const StkGrp* x = &g_sg[ia]; const StkGrp* y = &g_sg[ib];
+    if (x->start != y->start) return x->start < y->start ? -1 : 1;
+    if (x->end != y->end) return x->end > y->end ? -1 : 1;
+    return ib - ia;                                 /* при совпадении диапазонов внешний записан позже — он первый */
+}
+static void stk_reorder(void) {
+    int n = g_sgn, any = 0; if (n == 0 || l2_dn == 0) return;
+    for (int i = 0; i < n; i++) if (g_sg[i].z != 0 || g_sg[i].lift) { any = 1; break; }
+    if (!any) return;
+    StkGrp* nv = realloc(g_sg, (size_t)(n + 1) * sizeof(StkGrp)); if (!nv) return; g_sg = nv; g_sgcap = n + 1;
+    int* ord = malloc((size_t)n * sizeof(int)); int* stk = malloc((size_t)n * sizeof(int)); if (!ord || !stk) { free(ord); free(stk); return; }
+    for (int i = 0; i < n; i++) ord[i] = i;
+    qsort(ord, (size_t)n, sizeof(int), so_ordcmp);
+    g_sgv = n; StkGrp* V = &g_sg[n]; memset(V, 0, sizeof *V); V->start = V->cstart = 0; V->cend = V->end = l2_dn; V->parent = V->first_child = V->last_child = V->next_sib = -1;
+    for (int i = 0; i < n; i++) { g_sg[i].parent = g_sg[i].first_child = g_sg[i].last_child = g_sg[i].next_sib = -1; }
+    int sp = 0;
+    for (int k = 0; k < n; k++) {
+        int gi = ord[k]; StkGrp* g = &g_sg[gi];
+        while (sp && g_sg[stk[sp - 1]].end <= g->start) sp--;
+        if (sp && g->end > g_sg[stk[sp - 1]].end) { g->bad = 1; continue; }              /* диапазоны пересекаются — не трогаем */
+        int pi = sp ? stk[sp - 1] : n; g->parent = pi; StkGrp* P = &g_sg[pi];
+        if (P->last_child >= 0) g_sg[P->last_child].next_sib = gi; else P->first_child = gi; P->last_child = gi;
+        stk[sp++] = gi; g->detach = (g->z != 0 || g->lift);
+    }
+    /* глубина стека отсечений и снимки активных C_CLIP перед началом переносимых диапазонов */
+    int cap = 64, depth = 0; int* cs = malloc((size_t)cap * sizeof(int)); int p = 0; int ok = cs != NULL;
+    for (int i = 0; ok && i <= l2_dn; i++) {
+        while (p < n && g_sg[ord[p]].start == i) {
+            StkGrp* g = &g_sg[ord[p]]; g->cdepth_s = depth; g->cdepth_c = depth + (g->has_clip ? 1 : 0);
+            if (g->detach && depth > 0) { g->snap = malloc((size_t)depth * sizeof(int)); if (g->snap) memcpy(g->snap, cs, (size_t)depth * sizeof(int)); else g->detach = 0; }
+            else if (g->detach) g->snap = NULL;
+            p++;
+        }
+        if (i == l2_dn) break;
+        const Cmd* c = &l2_dl[i];
+        if (c->t == C_CLIP) { if (depth == cap) { int* t = realloc(cs, (size_t)(cap * 2) * sizeof(int)); if (!t) { ok = 0; break; } cs = t; cap *= 2; } cs[depth++] = i; }
+        else if (c->t == C_UNCLIP && depth > 0) depth--;
+    }
+    free(cs);
+    if (ok) {
+        V->cdepth_s = V->cdepth_c = 0; so_out = NULL; so_n = so_cap = 0;
+        so_emit(n);
+        if (so_out && so_n >= l2_dn) { free(l2_dl); l2_dl = so_out; l2_dn = so_n; g_dcap = so_cap; } else free(so_out);
+        so_out = NULL; so_n = so_cap = 0;
+    }
+    for (int i = 0; i < n; i++) { free(g_sg[i].snap); g_sg[i].snap = NULL; }
+    free(ord); free(stk);
+}
+
+/* ══════════════ прокрутка внутри элементов (overflow:auto|scroll) ══════════════ */
+typedef struct { float x, y, mx, my, sw, sh, cw, ch; uint8_t is; } ScSt;
+static ScSt* g_scr; static int g_scrn; static DOMNode* g_scr_head;
+static float sc_clamp(float v, float mx) { return v < 0 ? 0 : v > mx ? mx : v; }
+static void sc_prepare(DOMNode* head, int n) {
+    if (head != g_scr_head) { free(g_scr); g_scr = NULL; g_scrn = 0; g_scr_head = head; }
+    if (n > g_scrn) { ScSt* nv = calloc((size_t)n, sizeof(ScSt)); if (nv) { if (g_scr) memcpy(nv, g_scr, (size_t)g_scrn * sizeof(ScSt)); free(g_scr); g_scr = nv; g_scrn = n; } }
+    for (int i = 0; i < g_scrn; i++) { g_scr[i].mx = g_scr[i].my = g_scr[i].sw = g_scr[i].sh = g_scr[i].cw = g_scr[i].ch = 0; g_scr[i].is = 0; }
+}
+/* заполняет таблицу по готовому display list (после patch_h и переноса диапазонов) */
+static void sc_commit(void) {
+    for (int i = 0; i < l2_dn; i++) {
+        const Cmd* c = &l2_dl[i];
+        if (c->t != C_CLIP || !(c->flags & (CF_SCROLL_X | CF_SCROLL_Y)) || !c->node) continue;
+        int k = c->node->idx; if (k < 0 || k >= g_scrn) continue;
+        ScSt* e = &g_scr[k]; e->is = 1; e->sw = c->ex[0]; e->sh = c->ex[1]; e->cw = c->w; e->ch = c->h; e->mx = c->ex[2]; e->my = c->ex[3];
+    }
+}
+int l2_scroll_get(const DOMNode* n, float* x, float* y) {
+    if (x) *x = 0;
+    if (y) *y = 0;
+    if (!n || !g_scr || n->idx < 0 || n->idx >= g_scrn) return 0;
+    const ScSt* e = &g_scr[n->idx]; if (!e->is) return 0;
+    if (x) *x = sc_clamp(e->x, e->mx); if (y) *y = sc_clamp(e->y, e->my); return 1;
+}
+int l2_scroll_max(const DOMNode* n, float* mx, float* my) {
+    if (mx) *mx = 0;
+    if (my) *my = 0;
+    if (!n || !g_scr || n->idx < 0 || n->idx >= g_scrn || !g_scr[n->idx].is) return 0;
+    if (mx) *mx = g_scr[n->idx].mx; if (my) *my = g_scr[n->idx].my; return 1;
+}
+int l2_scroll_size(const DOMNode* n, float* sw, float* sh, float* cw, float* ch) {
+    if (!n || !g_scr || n->idx < 0 || n->idx >= g_scrn || !g_scr[n->idx].is) return 0;
+    const ScSt* e = &g_scr[n->idx]; if (sw) *sw = e->sw; if (sh) *sh = e->sh; if (cw) *cw = e->cw; if (ch) *ch = e->ch; return 1;
+}
+void l2_scroll_set(const DOMNode* n, float x, float y) {
+    if (!n || !g_scr || n->idx < 0 || n->idx >= g_scrn) return;
+    ScSt* e = &g_scr[n->idx]; e->x = x < 0 ? 0 : x; e->y = y < 0 ? 0 : y;
+}
+void l2_scroll_offset_of_ancestors(const DOMNode* n, float* ox, float* oy) {
+    *ox = *oy = 0; if (!n || !g_scr) return;
+    int guard = 0;
+    for (int p = n->parent; p >= 0 && p < NVN && p < g_scrn && guard < 4096; p = NV[p]->parent, guard++) {
+        if (!g_scr[p].is) continue;
+        *ox += sc_clamp(g_scr[p].x, g_scr[p].mx); *oy += sc_clamp(g_scr[p].y, g_scr[p].my);
+    }
+}
 
 /* ══════════════ боксы ══════════════ */
 enum { K_BLOCK = 1, K_INLINE, K_TEXT, K_ATOM, K_BR };
 enum { R_NONE, R_IMG, R_CTRL, R_PLACE, R_CANVAS };
-typedef struct { TTFFont* f; int size, style, asc, desc; float lh; } FM;
+typedef struct { TTFFont* f; int size, style, asc, desc; float lh; int weight, ital; } FM;
 typedef struct Box Box;
 typedef struct AbsRef { Box* b; float sx, sy; struct AbsRef* next; } AbsRef;
+typedef struct StkRef { int slot; DOMNode* node; struct StkRef* next; } StkRef;   /* sticky-потомок: слот C_STK, в который родитель допишет границы контейнера */
 struct Box {
     DOMNode* n; const NodeStyle* st; Box *parent, *first, *last, *next;
     uint8_t kind, anon, repl, oof, flt, skipbg, mforce, ic_ok;
     DOMNode* click; const char* text; FM* fm;
     float x, y, w, h, fb;
     float mt, mr, mb, ml, pt, pr, pb, pl, bt, br, bb, bl; uint8_t mla, mra; float fml, fmr;
-    int slot, clipslot; AbsRef *abs, *abs_tail;
+    int slot, clipslot; AbsRef *abs, *abs_tail; StkRef* stk;
     ImgPix* img; float nat_w, nat_h; float ic_min, ic_max;
 };
 typedef struct { float x0, y0, x1, y1; } FRect;
@@ -86,10 +249,15 @@ static FM* fm_of(Box* b) {
     if (b->fm) return b->fm;
     FM* m = la(sizeof(FM)); const NodeStyle* st = b->st;
     const char* fam = fam_of(b);
-    m->f = font_manager_get(fam); if (!m->f) m->f = g_ttf_font;
-    int real_bold = font_manager_get_styled(fam, 700, 0) != font_manager_get_styled(fam, 400, 0);
+    /* Начертание выбирается по (семейство, насыщенность, курсив): у веб-шрифта может быть несколько @font-face
+       (Font Awesome: regular 400 / solid 900). Синтетические bold/italic включаются, только если настоящего начертания нет. */
+    int weight = st->weight ? st->weight : (st->bold ? 700 : 400), ital = st->italic ? 1 : 0;
+    m->weight = weight; m->ital = ital;
+    m->f = font_manager_get_styled(fam, weight, ital); if (!m->f) m->f = g_ttf_font;
+    TTFFont* f_norm = font_manager_get_styled(fam, 400, ital), * f_noital = font_manager_get_styled(fam, weight, 0);
+    int real_bold = m->f != f_norm, real_ital = m->f != f_noital;
     m->size = (int)(st->font_size + 0.5f); if (m->size < 1) m->size = 1; if (m->size > 400) m->size = 400;
-    m->style = ((st->bold && !real_bold) ? TTF_BOLD : 0) | (st->italic ? TTF_ITALIC : 0);
+    m->style = ((st->bold && !real_bold) ? TTF_BOLD : 0) | ((st->italic && !real_ital) ? TTF_ITALIC : 0);
     m->asc = m->f ? ttf_font_ascent(m->f, m->size) : (int)(m->size * 0.93f);
     m->desc = m->f ? ttf_font_descent(m->f, m->size) : (int)(m->size * 0.24f);
     m->lh = st->lh_px > 0 ? st->lh_px : st->lh_mult > 0 ? st->lh_mult * st->font_size : (float)(m->asc + m->desc);
@@ -171,6 +339,7 @@ static void build_elem(Box* parent, DOMNode* n, DOMNode* click, const PseudoBox*
     if (n->type == TAG_IMG) repl = R_IMG;
     else if (ctrl_kind(n)) repl = R_CTRL;
     else if (!strcmp(n->tag, "canvas")) { repl = R_CANVAS; snprintf(n->src, sizeof n->src, "canvas:%d", n->idx); }   /* см. images.c: webpage_image_inject — сюда JS кладёт пиксели через D.canvasCommit */
+    else if (!strcmp(n->tag, "svg") && n->src[0]) repl = R_IMG;           /* встроенный svg: разметка сохранена в кэш (html.c), рисуется как картинка */
     else if (!strcmp(n->tag, "iframe") || !strcmp(n->tag, "svg") || !strcmp(n->tag, "video") || !strcmp(n->tag, "audio") ||
              !strcmp(n->tag, "object") || !strcmp(n->tag, "embed")) repl = R_PLACE;
     b->repl = (uint8_t)repl;
@@ -517,7 +686,7 @@ static float layout_inline(Box* c, float x, float y, float w, LS* ls) {
                 if (rb->st->vertical_align == VA_TOP) ty = cy - (m->lh - (m->asc + m->desc)) / 2 * 0 ; \
                 char* sbuf = sa(rl + 1); memcpy(sbuf, rbuf, rl); sbuf[rl] = 0; \
                 Cmd cm; memset(&cm, 0, sizeof cm); cm.t = C_TEXT; cm.x = rx; cm.y = ty; cm.w = cx - rx; cm.h = (float)(m->asc + m->desc); cm.node = rb->n; cm.s = sbuf; cm.fam = fam_of(rb); \
-                cm.size = m->size; cm.color = rb->st->color; cm.tstyle = (uint8_t)m->style; cm.deco = rb->st->deco; cm.opacity = rb->st->opacity; \
+                cm.size = m->size; cm.color = rb->st->color; cm.tstyle = (uint8_t)m->style; cm.weight = (uint16_t)m->weight; cm.ital = (uint8_t)m->ital; cm.deco = rb->st->deco; cm.opacity = rb->st->opacity; \
                 if (rb->st->visibility == 0) dl_add(cm); \
                 if (rb->click) { Cmd h; memset(&h, 0, sizeof h); h.t = C_HIT; h.x = rx; h.y = ty; h.w = cx - rx; h.h = cm.h; h.node = rb->click; dl_add(h); } \
                 } rl = 0; rb = NULL; } while (0)
@@ -634,7 +803,10 @@ static float layout_flow(Box* b, float cx, float cy, float cw, float ch, LS* ls)
 
 static void patch_h(Box* b, float nh) {
     if (b->slot >= 0) l2_dl[b->slot].h = nh;
-    if (b->clipslot >= 0) l2_dl[b->clipslot].h = nh - b->bt - b->bb;
+    if (b->clipslot >= 0) {
+        Cmd* cc = &l2_dl[b->clipslot]; cc->h = nh - b->bt - b->bb;
+        if (cc->flags & CF_SCROLL_Y) cc->ex[3] = cc->ex[1] > cc->h ? cc->ex[1] - cc->h : 0;     /* клиентская высота изменилась */
+    }
     b->h = nh;
 }
 
@@ -687,6 +859,8 @@ static void process_abs(Box* b, float px, float py, float pw, float ph, int fixe
 
 static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float forced_h, float ch_def, LS* ls) {
     const NodeStyle* s = b->st; int start = l2_dn;
+    int stkslot = -1;                                   /* position:sticky: границы блока для смещения при отрисовке */
+    if (s->sticky && !b->anon && b->n && b->kind != K_INLINE && !b->oof) { Cmd sc0; memset(&sc0, 0, sizeof sc0); sc0.t = C_STK; sc0.node = b->n; stkslot = dl_add(sc0); }
     int markslot = -1; if (!b->anon && b->n && b->n->v2) { Cmd mc; memset(&mc, 0, sizeof mc); mc.t = C_MARK; mc.node = b->n; markslot = dl_add(mc); }
     edges(b, avail_w);
     int shrink = forced_w < 0 && (b->kind == K_ATOM || b->flt || b->oof || (b->n && !b->anon && s->display == DSP_TABLE)) && !s->width.set;
@@ -725,6 +899,7 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
     int clip = -1;
     if (s->overflow_hidden && !b->anon) { Cmd c; memset(&c, 0, sizeof c); c.t = C_CLIP; clip = dl_add(c); }
     b->clipslot = clip;
+    int cstart = l2_dn;                                  /* начало содержимого блока (для переноса дочерних стекинг-контекстов) */
     if (b->click && !b->anon && b->n && b->kind != K_INLINE && (b->n->type == TAG_A || b->n->onclick[0] || b->n->type == TAG_BUTTON)) { }
 
     float fh = -1;                                                                     /* явная высота контента */
@@ -758,6 +933,10 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
     }
     b->x = bx; b->y = y; b->w = bw; b->h = bh;
     if (markslot >= 0) { Cmd* mc = &l2_dl[markslot]; mc->x = bx; mc->y = y; mc->w = bw; mc->h = bh; }
+    for (StkRef* r = b->stk; r; r = r->next)             /* sticky-потомки: контейнер = content-box этого блока */
+        if (r->slot >= 0 && r->slot < l2_dn && l2_dl[r->slot].t == C_STK && l2_dl[r->slot].node == r->node) {
+            l2_dl[r->slot].ex[1] = y + b->bt + b->pt; l2_dl[r->slot].ex[2] = y + bh - b->bb - b->pb;
+        }
     if (slot >= 0) { Cmd* c = &l2_dl[slot]; c->x = bx; c->y = y; c->w = bw; c->h = bh; }
     if (bgslot >= 0) { Cmd* c = &l2_dl[bgslot]; c->x = bx; c->y = y; c->w = bw; c->h = bh; }
     if (clip >= 0) { Cmd* c = &l2_dl[clip]; c->x = bx + b->bl; c->y = y + b->bt; c->w = bw - b->bl - b->br; c->h = bh - b->bt - b->bb; }
@@ -772,6 +951,27 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
         if (b->n->idx == 0) { px = 0; py = 0; pw = VW; ph = VH; }
         process_abs(b, px, py, pw, ph, 0);
     }
+    int cend = l2_dn;                                    /* конец содержимого (до закрытия отсечения) */
+    if (clip >= 0 && (s->sc_x || s->sc_y) && b->n && b->n->idx > 0 && b->n->idx < NVN && NV[b->n->idx] == b->n && strcmp(b->n->tag, "body") != 0) {
+        /* прокручиваемый контейнер: считаем границы содержимого, вложенные отсечения учитываем их собственной рамкой */
+        Cmd* cc = &l2_dl[clip]; float px0 = cc->x, py0 = cc->y, pw = cc->w, ph = cc->h;
+        float mr = px0 + pw, mbm = py0 + ph; int depth = 0;
+        for (int i = cstart; i < cend; i++) {
+            const Cmd* q = &l2_dl[i];
+            if (q->t == C_CLIP) { if (depth == 0 && !q->fixed) { if (q->x + q->w > mr) mr = q->x + q->w; if (q->y + q->h > mbm) mbm = q->y + q->h; } depth++; continue; }
+            if (q->t == C_UNCLIP) { if (depth > 0) depth--; continue; }
+            if (depth > 0 || q->fixed) continue;
+            if (q->t != C_BOX && q->t != C_TEXT && q->t != C_IMG && q->t != C_RECT && q->t != C_CTRL && q->t != C_BGIMG && q->t != C_MARK) continue;
+            if (q->w <= 0 && q->h <= 0) continue;
+            if (q->x + q->w > mr) mr = q->x + q->w; if (q->y + q->h > mbm) mbm = q->y + q->h;
+        }
+        float sw = mr + b->pr - px0, sh = mbm + b->pb - py0; if (sw < pw) sw = pw; if (sh < ph) sh = ph; if (sw > 1e6f) sw = 1e6f; if (sh > 1e6f) sh = 1e6f;
+        cc->node = b->n; cc->flags = (uint8_t)((s->sc_y ? CF_SCROLL_Y : 0) | (s->sc_x ? CF_SCROLL_X : 0));
+        cc->ex[0] = sw; cc->ex[1] = sh; cc->ex[2] = s->sc_x && sw > pw ? sw - pw : 0; cc->ex[3] = s->sc_y && sh > ph ? sh - ph : 0;
+        /* sticky-дети самого контейнера ограничены не его высотой, а всей прокручиваемой областью */
+        for (StkRef* r = b->stk; r; r = r->next)
+            if (r->slot >= 0 && r->slot < l2_dn && l2_dl[r->slot].t == C_STK && l2_dl[r->slot].node == r->node && l2_dl[r->slot].ex[2] < py0 + sh - b->pb) l2_dl[r->slot].ex[2] = py0 + sh - b->pb;
+    }
     if (clip >= 0) { Cmd c; memset(&c, 0, sizeof c); c.t = C_UNCLIP; dl_add(c); }
     if (b->click && !b->anon && b->n && (b->kind != K_INLINE) && !b->repl && (b->n->type == TAG_A || b->n->onclick[0] || b->n->type == TAG_BUTTON)) {
         Cmd h; memset(&h, 0, sizeof h); h.t = C_HIT; h.x = bx; h.y = y; h.w = bw; h.h = bh; h.node = b->n; dl_add(h);
@@ -784,7 +984,7 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
             Cmd c; memset(&c, 0, sizeof c); c.color = s->color; c.opacity = s->opacity; float sz = m->size * 0.32f;
             if (s->list_style == LS_DECIMAL) {
                 char* t = sa(24); snprintf(t, 24, "%d.", idx); float tw = text_w(m, t, (int)strlen(t));
-                c.t = C_TEXT; c.s = t; c.x = cx - tw - 6; c.y = base - m->asc; c.w = tw; c.h = (float)(m->asc + m->desc); c.fam = fam_of(b); c.size = m->size; c.tstyle = (uint8_t)m->style; dl_add(c);
+                c.t = C_TEXT; c.s = t; c.x = cx - tw - 6; c.y = base - m->asc; c.w = tw; c.h = (float)(m->asc + m->desc); c.fam = fam_of(b); c.size = m->size; c.tstyle = (uint8_t)m->style; c.weight = (uint16_t)m->weight; c.ital = (uint8_t)m->ital; dl_add(c);
             } else {
                 c.t = C_RECT; c.w = c.h = sz + 1; c.x = cx - sz - 12; c.y = base - m->size * 0.36f - sz / 2; c.rad = s->list_style == LS_SQUARE ? 0 : c.w / 2;
                 if (s->list_style == LS_CIRCLE) { c.color = s->color; c.rad = c.w / 2; c.flags = 1; }
@@ -792,11 +992,26 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
             }
         }
     }
-    if (s->position == POS_RELATIVE && !b->anon) {
+    if (s->position == POS_RELATIVE && !b->anon && !s->sticky) {
         float dx = 0, dy = 0;
         if (s->inset[3].set) dx = lenpx(&s->inset[3], avail_w); else if (s->inset[1].set) dx = -lenpx(&s->inset[1], avail_w);
         if (s->inset[0].set) dy = lenpx(&s->inset[0], ch_def >= 0 ? ch_def : 0); else if (s->inset[2].set) dy = -lenpx(&s->inset[2], ch_def >= 0 ? ch_def : 0);
         if (dx != 0 || dy != 0) { dl_shift(start, l2_dn, dx, dy); b->x += dx; b->y += dy; if (b->fb > -1e8f) b->fb += dy; }
+    }
+    if (stkslot >= 0) {                                  /* sticky: итоговый border-box + смещения top/bottom; контейнер допишет родитель */
+        Cmd* sk = &l2_dl[stkslot]; sk->x = b->x; sk->y = b->y; sk->w = b->w; sk->h = b->h; sk->flags = 0;
+        if (s->inset[0].set) { sk->flags |= SF_TOP; sk->ex[0] = lenpx(&s->inset[0], VH); }
+        if (s->inset[2].set) { sk->flags |= SF_BOTTOM; sk->ex[3] = lenpx(&s->inset[2], VH); }
+        sk->ex[1] = 0; sk->ex[2] = 1e9f;
+        Box* sp = b->parent; while (sp && (sp->anon || !sp->n)) sp = sp->parent;
+        if (sp) { StkRef* r = la(sizeof(StkRef)); if (r) { r->slot = stkslot; r->node = b->n; r->next = sp->stk; sp->stk = r; } }
+        Cmd e; memset(&e, 0, sizeof e); e.t = C_ENDSTK; dl_add(e);
+    }
+    if (!b->anon && b->n) {                              /* стекинг-контекст */
+        int is_ctx = 0, zg = 0; int item = b->parent && is_flex_box(b->parent);
+        if (s->has_z && (s->position != POS_STATIC || item)) { zg = s->z_index; is_ctx = 1; }
+        else if (s->position == POS_FIXED || b->n->idx == 0 || s->sticky) is_ctx = 1;
+        if (is_ctx) grp_record(start, cstart, cend, l2_dn, zg, clip >= 0, s->sticky && b->n->idx != 0);
     }
 }
 
@@ -833,11 +1048,12 @@ static void process_abs(Box* b, float px, float py, float pw, float ph, int fixe
 
 /* ══════════════ вход ══════════════ */
 void l2_layout(DOMNode* head, int vw, int vh) {
-    l2_release(); la_reset(); sa_reset(); pa_reset(); g_fixed = 0;
+    l2_release(); la_reset(); sa_reset(); pa_reset(); g_fixed = 0; g_sgn = 0;
     VW = (float)vw; VH = (float)vh; l2_canvas_bg = 0xFFFFFFFFu; l2_doc_w = VW; l2_doc_h = 0;
     int n = 0; for (DOMNode* p = head; p; p = p->next) n++;
     free(NV); NV = malloc((size_t)(n ? n : 1) * sizeof(DOMNode*)); NVN = n;
     { int i = 0; for (DOMNode* p = head; p; p = p->next) NV[i++] = p; }
+    sc_prepare(head, n);
     if (!n || !head->v2) return;
     /* фон холста: html, иначе body */
     DOMNode* html = NV[0]; DOMNode* body = NULL;
@@ -852,6 +1068,8 @@ void l2_layout(DOMNode* head, int vw, int vh) {
     LS ls; FCtx fc; memset(&fc, 0, sizeof fc); ls.fc = &fc; ls.owner = root;
     float mt = mt_eff(root, VW);
     lbb(root, 0, mt, VW, -1, -1, VH, &ls);
+    stk_reorder();                                                  /* порядок рисования по z-index */
+    sc_commit();                                                    /* размеры прокручиваемых контейнеров */
     l2_doc_h = root->y + root->h + mb_eff(root, VW); if (l2_doc_h < 1) l2_doc_h = 1;
     if (root->w > l2_doc_w) l2_doc_w = root->w;
     for (int i = 0; i < l2_dn; i++) { Cmd* c = &l2_dl[i]; if (c->fixed) continue; if ((c->t == C_BOX || c->t == C_TEXT || c->t == C_IMG) && c->y + c->h > l2_doc_h && c->y + c->h < 60000 && c->y >= 0) l2_doc_h = c->y + c->h; }

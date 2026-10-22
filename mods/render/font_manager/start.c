@@ -53,9 +53,22 @@ static char* dup_n(const char* s, size_t n) {
 static void normalize_family(const char* src, size_t len, char* dst, size_t dst_sz) {
     while (len && (isspace((unsigned char)*src) || *src == '"' || *src == '\'')) { src++; len--; }
     while (len && (isspace((unsigned char)src[len - 1]) || src[len - 1] == '"' || src[len - 1] == '\'')) len--;
-    if (len >= dst_sz) len = dst_sz - 1;
-    memcpy(dst, src, len);
-    dst[len] = '\0';
+    /* CSS-экранирование в идентификаторах: «Font\ Awesome\ 7» (бэкслеш+пробел), «\66 oo» (hex-код символа) → обычные символы */
+    size_t o = 0;
+    for (size_t i = 0; i < len && o + 5 < dst_sz; i++) {
+        if (src[i] != '\\' || i + 1 >= len) { dst[o++] = src[i]; continue; }
+        i++;
+        if (isxdigit((unsigned char)src[i])) {
+            unsigned cp = 0; int nd = 0;
+            while (i < len && nd < 6 && isxdigit((unsigned char)src[i])) { cp = cp * 16 + (unsigned)(isdigit((unsigned char)src[i]) ? src[i] - '0' : (tolower((unsigned char)src[i]) - 'a' + 10)); i++; nd++; }
+            if (i < len && isspace((unsigned char)src[i])) i++; i--;                    /* пробел после hex-escape поглощается */
+            if (cp < 0x80) dst[o++] = (char)cp;
+            else if (cp < 0x800) { dst[o++] = (char)(0xC0 | (cp >> 6)); dst[o++] = (char)(0x80 | (cp & 63)); }
+            else if (cp < 0x10000) { dst[o++] = (char)(0xE0 | (cp >> 12)); dst[o++] = (char)(0x80 | ((cp >> 6) & 63)); dst[o++] = (char)(0x80 | (cp & 63)); }
+            else { dst[o++] = (char)(0xF0 | (cp >> 18)); dst[o++] = (char)(0x80 | ((cp >> 12) & 63)); dst[o++] = (char)(0x80 | ((cp >> 6) & 63)); dst[o++] = (char)(0x80 | (cp & 63)); }
+        } else dst[o++] = src[i];                                                      /* \<символ> → символ */
+    }
+    dst[o] = '\0';
 }
 
 static int is_generic_family(const char* n) {
@@ -82,6 +95,7 @@ typedef struct {
     int      italic;
     TTFFont* font;        /* лениво загружается */
     int      failed;      /* загрузка не удалась — больше не пытаемся */
+    int      chained;     /* группа начертаний (семейство+вес+курсив) уже связана цепочкой fallback */
 } FontEntry;
 
 #define MAX_FONT_ENTRIES 256
@@ -122,14 +136,9 @@ void font_manager_register_face(const char* family, const char* path, int weight
 
     for (int i = 0; i < g_font_count; i++) {
         FontEntry* e = &g_fonts[i];
-        if (e->weight == weight && e->italic == italic && eq_nocase(e->family, fam)) {
-            if (strcmp(e->path, path) == 0) return;
-            release_entry_font(e);
-            snprintf(e->path, sizeof e->path, "%s", path);
-            e->failed = 0;
-            lookup_cache_reset();
-            return;
-        }
+        /* то же семейство/вес/курсив, но другой файл — не замена, а соседнее начертание: Google Fonts отдаёт один шрифт
+           кусками по unicode-range (latin, cyrillic, …). Они связываются цепочкой fallback в link_group(). */
+        if (e->weight == weight && e->italic == italic && eq_nocase(e->family, fam) && strcmp(e->path, path) == 0) return;
     }
     if (g_font_count >= MAX_FONT_ENTRIES) {
         gal_log("WARN", "Font registry full, ignoring '%s'", fam);
@@ -170,7 +179,7 @@ static int pick_entry(const char* family, int weight, int italic) {
     return best;
 }
 
-static TTFFont* ensure_loaded(int i) {
+static TTFFont* load_one(int i) {
     FontEntry* e = &g_fonts[i];
     if (e->font) return e->font;
     if (e->failed) return NULL;
@@ -182,6 +191,25 @@ static TTFFont* ensure_loaded(int i) {
     }
     ttf_set_fallback(e->font, g_ttf_font);     /* глифы, которых нет в веб-шрифте, берём из дефолтного */
     return e->font;
+}
+/* Начертания с одним ключом (семейство+вес+курсив) — части одного шрифта (подмножества по unicode-range). Связываем их цепочкой
+   fallback в порядке регистрации: глиф берётся из первой части, где он есть, затем из дефолтного шрифта. */
+static void link_group(int i) {
+    FontEntry* e = &g_fonts[i]; if (e->chained) return;
+    TTFFont* prev = NULL; int n = 0;
+    for (int j = 0; j < g_font_count; j++) {
+        FontEntry* g = &g_fonts[j];
+        if (g->weight != e->weight || g->italic != e->italic || !eq_nocase(g->family, e->family)) continue;
+        g->chained = 1; n++;
+        TTFFont* f = load_one(j); if (!f) continue;
+        if (prev) ttf_set_fallback(prev, f);
+        prev = f;
+    }
+    if (prev && n > 1) ttf_set_fallback(prev, g_ttf_font);
+}
+static TTFFont* ensure_loaded(int i) {
+    link_group(i);
+    return load_one(i);
 }
 
 TTFFont* font_manager_get_styled(const char* family_list, int weight, int italic) {
@@ -263,7 +291,7 @@ static int parse_italic(const char* v) {
 static int rank_by_format(const char* fmt) {
     if (eq_nocase(fmt, "truetype") || eq_nocase(fmt, "truetype-variations") || eq_nocase(fmt, "collection")) return 3;
     if (eq_nocase(fmt, "opentype") || eq_nocase(fmt, "opentype-variations")) return 2;
-    if (starts_nocase(fmt, "woff2")) return 0;
+    if (starts_nocase(fmt, "woff2")) return ttf_supports_woff2() ? 2 : 0;
     if (starts_nocase(fmt, "woff")) return ttf_supports_woff() ? 2 : 0;
     if (eq_nocase(fmt, "embedded-opentype") || starts_nocase(fmt, "svg")) return 0;
     return 1;
@@ -281,7 +309,7 @@ static int rank_by_extension(const char* url, size_t len) {
     memcpy(ext, dot, el);
     if (eq_nocase(ext, ".ttf") || eq_nocase(ext, ".ttc")) return 3;
     if (eq_nocase(ext, ".otf")) return 2;
-    if (eq_nocase(ext, ".woff2")) return 0;
+    if (eq_nocase(ext, ".woff2")) return ttf_supports_woff2() ? 2 : 0;
     if (eq_nocase(ext, ".woff")) return ttf_supports_woff() ? 2 : 0;
     if (eq_nocase(ext, ".eot") || eq_nocase(ext, ".svg")) return 0;
     return 1;
@@ -294,7 +322,7 @@ static int rank_by_mime(const char* mime, size_t len) {
     if (eq_nocase(m, "font/ttf") || eq_nocase(m, "font/truetype") || eq_nocase(m, "application/x-font-ttf") ||
         eq_nocase(m, "application/x-font-truetype") || eq_nocase(m, "application/font-sfnt")) return 3;
     if (eq_nocase(m, "font/otf") || eq_nocase(m, "application/x-font-opentype") || eq_nocase(m, "application/vnd.ms-opentype")) return 2;
-    if (eq_nocase(m, "font/woff2") || eq_nocase(m, "application/font-woff2")) return 0;
+    if (eq_nocase(m, "font/woff2") || eq_nocase(m, "application/font-woff2")) return ttf_supports_woff2() ? 2 : 0;
     if (eq_nocase(m, "font/woff") || eq_nocase(m, "application/font-woff") || eq_nocase(m, "application/x-font-woff"))
         return ttf_supports_woff() ? 2 : 0;
     return 1;                                       /* application/octet-stream и т.п. — пробуем */
@@ -500,7 +528,8 @@ void font_manager_add_face(const char* family, const char* src,
         } else {
             snprintf(cache_path, sizeof cache_path, "cache/font_%016llx.font", fnv1a64(abs_url));
             if (!file_exists_nonempty(cache_path)) {
-                if (g_font_offline || g_font_downloads >= 12) { free(abs_url); free(chosen); return; }
+                if (g_font_offline || g_font_downloads >= 40) { free(abs_url); free(chosen); return; }
+                if (nal_mixed_content_blocked(page_url, abs_url)) { gal_log("WARN", "Mixed Content: шрифт %s заблокирован (страница %s)", abs_url, page_url); free(abs_url); free(chosen); return; }
                 g_font_downloads++;
                 gal_log("INFO", "Downloading font %s from %s", fam, abs_url);
                 if (!nal_download_file(abs_url, cache_path) || !looks_like_font(cache_path)) {

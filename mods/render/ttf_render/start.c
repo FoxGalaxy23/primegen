@@ -1,5 +1,7 @@
 #include "ttf_render.h"
 #include "gal.h"
+#include "woff2.h"
+#include "cff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -257,8 +259,49 @@ bad:
     return 0;
 }
 
+/* ── CFF-контуры: кубические кривые приводятся к квадратичным (формат Outline — TrueType) ── */
+typedef struct { Outline* o; float cx, cy; int start; int ok; } CffCtx;
+static int cc_add(CffCtx* c, float x, float y, int on) {
+    Outline* o = c->o; if (!ol_reserve(o, 1, 0)) { c->ok = 0; return 0; }
+    o->x[o->n] = x; o->y[o->n] = y; o->on[o->n] = (uint8_t)on; o->n++; return 1;
+}
+static void cc_close(void* u) {
+    CffCtx* c = u; Outline* o = c->o; int cnt = o->n - c->start;
+    if (cnt >= 3) {                                                           /* направление меняем на «по часовой» как у TrueType (нужно синтетическому bold) */
+        for (int i = 0; i < cnt / 2; i++) { int a = c->start + i, b = o->n - 1 - i; float tx = o->x[a], ty = o->y[a]; uint8_t tn = o->on[a]; o->x[a] = o->x[b]; o->y[a] = o->y[b]; o->on[a] = o->on[b]; o->x[b] = tx; o->y[b] = ty; o->on[b] = tn; }
+        if (ol_reserve(o, 0, 1)) o->ends[o->nc++] = o->n - 1; else c->ok = 0;
+    } else o->n = c->start;                                                   /* вырожденный контур выбрасываем */
+    c->start = o->n;
+}
+static void cc_move(void* u, float x, float y) { CffCtx* c = u; c->start = c->o->n; cc_add(c, x, y, 1); c->cx = x; c->cy = y; }
+static void cc_line(void* u, float x, float y) { CffCtx* c = u; cc_add(c, x, y, 1); c->cx = x; c->cy = y; }
+static void cc_curve(void* u, float x1, float y1, float x2, float y2, float x3, float y3) {
+    CffCtx* c = u; float x0 = c->cx, y0 = c->cy;
+    float dx = x3 - 3 * x2 + 3 * x1 - x0, dy = y3 - 3 * y2 + 3 * y1 - y0;
+    float err = 0.0481f * sqrtf(dx * dx + dy * dy);                          /* sqrt(3)/36 · |P3−3P2+3P1−P0| — ошибка одной квадратичной */
+    int n = (int)ceilf(cbrtf(err / 0.25f)); if (n < 1) n = 1; if (n > 16) n = 16;
+    float ax = x0, ay = y0, bx = x1, by = y1, cx2 = x2, cy2 = y2, ex = x3, ey = y3;                  /* текущий остаток кривой P(t), t∈[t0,1] */
+    for (int i = 0; i < n; i++) {
+        /* отрезок [i/n, (i+1)/n]: делим остаток в точке s = 1/(n-i) */
+        float s = 1.0f / (float)(n - i);
+        float p01x = ax + (bx - ax) * s, p01y = ay + (by - ay) * s, p12x = bx + (cx2 - bx) * s, p12y = by + (cy2 - by) * s, p23x = cx2 + (ex - cx2) * s, p23y = cy2 + (ey - cy2) * s;
+        float p012x = p01x + (p12x - p01x) * s, p012y = p01y + (p12y - p01y) * s, p123x = p12x + (p23x - p12x) * s, p123y = p12y + (p23y - p12y) * s;
+        float mx = p012x + (p123x - p012x) * s, my = p012y + (p123y - p012y) * s;             /* конец отрезка */
+        float qx = (3 * (p01x + p012x) - (ax + mx)) / 4, qy = (3 * (p01y + p012y) - (ay + my)) / 4;      /* управляющая точка квадратичной */
+        cc_add(c, qx, qy, 0); cc_add(c, mx, my, 1);
+        ax = mx; ay = my; bx = p123x; by = p123y; /* остаток: от M до P3 с контрольными p123, p23 */ cx2 = p23x; cy2 = p23y;
+    }
+    c->cx = x3; c->cy = y3;
+}
+static int cff_outline(const TTFFont* f, int gid, Outline* out) {
+    CffCtx c = {out, 0, 0, out->n, 1}; CffSink s = {cc_move, cc_line, cc_curve, cc_close, &c};
+    if (!cff_glyph(f->cff, gid, &s)) return 1;                                  /* битый глиф — пустой, остальной текст рисуется */
+    return c.ok;
+}
+
 static int outline_load(const TTFFont* f, int gid, Outline* out, int depth) {
     uint32_t p, end;
+    if (f->cff) return cff_outline(f, gid, out);
     if (depth > 6) return 0;
     if (!glyph_range(f, gid, &p, &end)) return 1;          /* пустой глиф — не ошибка */
     if (end - p < 10) return 1;
@@ -739,6 +782,7 @@ static void parse_gpos_kern(TTFFont* f) {
    Загрузка
    ══════════════════════════════════════════════════════════════════ */
 static void font_destroy(TTFFont* f) {
+    if (f) cff_close(f->cff);
     if (!f) return;
     for (int i = 0; i < TTF_NUM_STRIKES; i++) strike_clear(&f->strikes[i]);
     free(f->data);
@@ -757,9 +801,11 @@ TTFFont* ttf_load_memory(uint8_t* data, size_t len, const char* name) {
         data = sfnt; len = sl;
     }
 #endif
-    if (len >= 4 && memcmp(data, "wOF2", 4) == 0) {
-        gal_log("WARN", "Font %s: WOFF2 is not supported", label);
-        free(data); return NULL;
+    if (len >= 4 && memcmp(data, "wOF2", 4) == 0) {                         /* WOFF2: Brotli + обратное преобразование glyf/loca/hmtx (woff2.c) */
+        size_t sl = 0; uint8_t* sfnt = woff2_to_sfnt(data, len, &sl);
+        free(data);
+        if (!sfnt) { gal_log("WARN", "Font %s: invalid or unsupported WOFF2", label); return NULL; }
+        data = sfnt; len = sl;
     }
 
     TTFFont* f = calloc(1, sizeof *f);
@@ -770,16 +816,13 @@ TTFFont* ttf_load_memory(uint8_t* data, size_t len, const char* name) {
     uint32_t base = 0, tag = rd32(f, 0);
     if (tag == TAG('t', 't', 'c', 'f')) base = rd32(f, 12);       /* первый шрифт коллекции */
     tag = rd32(f, base);
-    if (tag == TAG('O', 'T', 'T', 'O')) {
-        gal_log("WARN", "Font %s: CFF outlines are not supported", label);
-        font_destroy(f); return NULL;
-    }
-    if (tag != 0x00010000 && tag != TAG('t', 'r', 'u', 'e')) {
+    int is_otto = tag == TAG('O', 'T', 'T', 'O');
+    if (!is_otto && tag != 0x00010000 && tag != TAG('t', 'r', 'u', 'e')) {
         gal_log("WARN", "Font %s: not a TrueType font", label);
         font_destroy(f); return NULL;
     }
 
-    uint32_t head = 0, maxp = 0, cmap = 0, hhea = 0;
+    uint32_t head = 0, maxp = 0, cmap = 0, hhea = 0, cff_off = 0, cff_len = 0;
     int nt = rd16(f, base + 4);
     for (int i = 0; i < nt; i++) {
         uint32_t rec = base + 12 + i * 16, t = rd32(f, rec), off = rd32(f, rec + 8), ln = rd32(f, rec + 12);
@@ -791,10 +834,16 @@ TTFFont* ttf_load_memory(uint8_t* data, size_t len, const char* name) {
             case TAG('h', 'h', 'e', 'a'): hhea = off; if (ln < 36) hhea = 0; break;
             case TAG('l', 'o', 'c', 'a'): f->loca_off = off; f->loca_len = ln; break;
             case TAG('g', 'l', 'y', 'f'): f->glyf_off = off; f->glyf_len = ln; break;
+            case TAG('C', 'F', 'F', ' '): cff_off = off; cff_len = ln; break;
             case TAG('h', 'm', 't', 'x'): f->hmtx_off = off; f->hmtx_len = ln; break;
             case TAG('G', 'P', 'O', 'S'): f->gpos_off = off; break;
             case TAG('k', 'e', 'r', 'n'): f->kern_off = off; break;
         }
+    }
+    if (is_otto || (!f->glyf_off && cff_off)) {                                  /* PostScript-контуры */
+        f->cff = cff_off ? cff_open(f->data + cff_off, cff_len) : NULL;
+        if (!f->cff) { gal_log("WARN", "Font %s: unsupported CFF data (CFF2/variable or broken)", label); font_destroy(f); return NULL; }
+        f->loca_off = f->glyf_off = 1;                                              /* признак «таблицы контуров есть» для проверки ниже */
     }
     if (!head || !maxp || !cmap || !hhea || !f->loca_off || !f->glyf_off || !f->hmtx_off) {
         gal_log("WARN", "Font %s: required TrueType tables are missing", label);
@@ -809,8 +858,8 @@ TTFFont* ttf_load_memory(uint8_t* data, size_t len, const char* name) {
     f->line_gap = rds16(f, hhea + 8);
     f->num_hmetrics = rd16(f, hhea + 34);
 
-    int loca_entries = (int)(f->loca_len / (f->loca_format ? 4 : 2));
-    if (f->num_glyphs > loca_entries - 1) f->num_glyphs = loca_entries - 1;
+    if (f->cff) { if (f->num_glyphs > cff_num_glyphs(f->cff)) f->num_glyphs = cff_num_glyphs(f->cff); }
+    else { int loca_entries = (int)(f->loca_len / (f->loca_format ? 4 : 2)); if (f->num_glyphs > loca_entries - 1) f->num_glyphs = loca_entries - 1; }
     if ((uint32_t)f->num_hmetrics * 4 > f->hmtx_len) f->num_hmetrics = (int)(f->hmtx_len / 4);
     if (f->units_per_em < 16 || f->units_per_em > 16384 || f->num_glyphs < 1 || f->num_hmetrics < 1) {
         gal_log("WARN", "Font %s: invalid head/maxp/hhea data", label);
@@ -851,6 +900,8 @@ TTFFont* ttf_load(const char* path) {
 }
 
 void ttf_free(TTFFont* font) { font_destroy(font); }
+
+int ttf_supports_woff2(void) { return 1; }
 
 int ttf_supports_woff(void) {
 #ifdef TTF_HAVE_WOFF

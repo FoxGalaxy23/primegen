@@ -16,6 +16,9 @@ int nal_init(void) {
     return (hSession != NULL);
 }
 
+void nal_cache_policy(int policy) { (void)policy; }      /* HTTP-кэш пока только в Linux-клиенте */
+void nal_cache_clear(void) {}
+
 void nal_close(void) {
     if (hSession) {
         WinHttpCloseHandle(hSession);
@@ -169,6 +172,11 @@ int nal_download_file(const char* url, const char* dest_path) {
    результат готовым к первому poll(). Хуже, чем настоящий async, но интерфейс для JS-слоя тот же,
    и при появлении WinHTTP-асинхронных хэндлов это можно заменить без изменений в js.c. */
 typedef struct { char* body; char* headers; int status; } WinAsyncResult;
+
+int nal_async_start_ex(const char* method, const char* url, const char* headers_raw, const char* body, size_t body_len, const NalFetchOpts* opts, NalAsyncReq* out) {
+    (void)opts;                                                          /* SOP/CORS на Windows пока не реализованы (WinHTTP-путь) */
+    return nal_async_start(method, url, headers_raw, body, body_len, out);
+}
 
 int nal_async_start(const char* method, const char* url, const char* headers_raw, const char* body, size_t body_len, NalAsyncReq* out) {
     (void)headers_raw; (void)body; (void)body_len;

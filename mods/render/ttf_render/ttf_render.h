@@ -67,6 +67,7 @@ typedef struct TTFFont {
     uint32_t loca_off, loca_len, glyf_off, glyf_len;
     uint32_t hmtx_off, hmtx_len;
     uint32_t gpos_off, kern_off;
+    struct CffFont* cff;      /* OpenType с PostScript-контурами («CFF »); для TrueType-контуров NULL */
     int      loca_format;
     int      num_glyphs;
     int      num_hmetrics;
@@ -133,6 +134,7 @@ int   ttf_text_offsets_ex(TTFFont* font, const char* text, int font_size, int st
 
 /* Собран ли рендерер с поддержкой WOFF1 (нужен zlib). */
 int ttf_supports_woff(void);
+int ttf_supports_woff2(void);          /* WOFF2: собственный Brotli + реконструкция glyf/loca/hmtx (woff2.c, brotli.c) */
 
 /* Освободить шрифт. */
 void ttf_free(TTFFont* font);

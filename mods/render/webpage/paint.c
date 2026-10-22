@@ -15,7 +15,6 @@ extern TTFFont* g_ttf_font;
 static DOMNode* g_head; static DOMNode* g_last_head; static uint64_t g_fp; static int g_lw = -1, g_lh = -1;
 static int g_top, g_sx, g_sy; static char g_url[600];
 static int cl_x0, cl_y0, cl_x1, cl_y1;
-static struct { int x0, y0, x1, y1; } cl_stack[24]; static int cl_n;
 
 /* ══════════════ примитивы ══════════════ */
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -179,7 +178,7 @@ static int sel_rect(int* sx, int* sy, int* sw, int* sh) {
 static int rect_hit(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) { return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by; }
 
 static void paint_text(const Cmd* c, int dx, int dy) {
-    TTFFont* f = font_manager_get(c->fam); if (!f) return;
+    TTFFont* f = font_manager_get_styled(c->fam, c->weight ? c->weight : 400, c->ital); if (!f) return;
     int x = (int)floorf(c->x + dx + 0.5f), y = (int)floorf(c->y + dy + 0.5f);
     int sx, sy, sw, sh;
     if (sel_rect(&sx, &sy, &sw, &sh) && rect_hit(x, y, (int)c->w + 1, (int)c->h, sx, sy, sw, sh)) {
@@ -238,6 +237,7 @@ static void blit_img(ImgPix* im, int x, int y, int w, int h, const float rad[4],
 }
 
 static void paint_bgimg(const Cmd* c, int dx, int dy) {
+    webpage_image_set_color(0xFF000000u);                                       /* у SVG-фона currentColor — чёрный (нет контекста элемента) */
     const NodeStyle* st = &c->node->st; ImgPix* src = webpage_image_get(c->s); if (!src) return;
     int x0 = (int)floorf(c->x + dx + 0.5f), y0 = (int)floorf(c->y + dy + 0.5f), w = (int)floorf(c->w + 0.5f), h = (int)floorf(c->h + 0.5f);
     x0 += (int)st->border_w[3]; y0 += (int)st->border_w[0]; w -= (int)(st->border_w[1] + st->border_w[3]); h -= (int)(st->border_w[0] + st->border_w[2]);
@@ -329,22 +329,99 @@ static void paint_ctrl(const Cmd* c, int dx, int dy) {
 }
 
 /* ══════════════ основной проход ══════════════ */
-static void clip_push(int x0, int y0, int x1, int y1) {
-    if (cl_n < 24) { cl_stack[cl_n].x0 = cl_x0; cl_stack[cl_n].y0 = cl_y0; cl_stack[cl_n].x1 = cl_x1; cl_stack[cl_n].y1 = cl_y1; cl_n++; }
-    if (x0 > cl_x0) cl_x0 = x0; if (y0 > cl_y0) cl_y0 = y0; if (x1 < cl_x1) cl_x1 = x1; if (y1 < cl_y1) cl_y1 = y1;
-    if (cl_x1 < cl_x0) cl_x1 = cl_x0; if (cl_y1 < cl_y0) cl_y1 = cl_y0;
+/* ── «Кадр» состояния обхода display list ──
+   Один и тот же автомат используется для рисования, hit-test и прокрутки колесом, чтобы они видели страницу одинаково:
+   отсечение (overflow), прокрутка внутри элементов (overflow:auto|scroll) и position:sticky меняют смещение dx/dy
+   и область отсечения между командами C_CLIP/C_UNCLIP и C_STK/C_ENDSTK. Для обычных и fixed-команд кадры раздельные. */
+#define FR_MAX 64
+typedef struct {
+    int cx0, cy0, cx1, cy1; float dx, dy, ry0, ry1; unsigned char kind;      /* сохранённое состояние до входа */
+    float bx0, by0, bx1, by1, sw, sh, ox, oy; unsigned char fl;               /* для скроллбара: рамка контейнера (экран), размеры, смещения, флаги */
+    const DOMNode* node;
+} FrSave;
+typedef struct {
+    int pass; int cx0, cy0, cx1, cy1; float dx, dy, ry0, ry1;
+    FrSave st[FR_MAX]; int sp;
+    int popped; FrSave pop;                                                    /* только что закрытый прокручиваемый контейнер */
+    const DOMNode* scroller; unsigned char scroller_fl; float s_ox, s_oy, s_mx, s_my;   /* только что открытый прокручиваемый контейнер (для колеса) */
+} Frame;
+
+static void fr_init(Frame* f, int pass, int x0, int y0, int x1, int y1) {
+    memset(f, 0, sizeof *f); f->pass = pass; f->cx0 = x0; f->cy0 = y0; f->cx1 = x1; f->cy1 = y1;
+    f->dx = pass ? 0.0f : (float)-g_sx; f->dy = pass ? (float)g_top : (float)(g_top - g_sy); f->ry0 = (float)y0; f->ry1 = (float)y1;
 }
-static void clip_pop(void) { if (cl_n > 0) { cl_n--; cl_x0 = cl_stack[cl_n].x0; cl_y0 = cl_stack[cl_n].y0; cl_x1 = cl_stack[cl_n].x1; cl_y1 = cl_stack[cl_n].y1; } }
+static void fr_sync(const Frame* f) { cl_x0 = f->cx0; cl_y0 = f->cy0; cl_x1 = f->cx1; cl_y1 = f->cy1; }
+static void fr_push(Frame* f, unsigned char kind, FrSave** out) {
+    FrSave* s = f->sp < FR_MAX ? &f->st[f->sp] : NULL;
+    if (s) { memset(s, 0, sizeof *s); s->cx0 = f->cx0; s->cy0 = f->cy0; s->cx1 = f->cx1; s->cy1 = f->cy1; s->dx = f->dx; s->dy = f->dy; s->ry0 = f->ry0; s->ry1 = f->ry1; s->kind = kind; }
+    f->sp++; *out = s;
+}
+static int fr_is_ctl(const Cmd* c) { return c->t == C_CLIP || c->t == C_UNCLIP || c->t == C_STK || c->t == C_ENDSTK; }
+/* применяет команду-«скобку» к кадру; для команд чужого прохода (fixed/не fixed) ничего не делает */
+static void fr_ctl(Frame* f, const Cmd* c) {
+    f->popped = 0; f->scroller = NULL;
+    if (c->fixed != f->pass) return;
+    FrSave* s = NULL;
+    switch (c->t) {
+    case C_CLIP: {
+        int x0 = (int)floorf(c->x + f->dx + 0.5f), y0 = (int)floorf(c->y + f->dy + 0.5f), x1 = (int)floorf(c->x + c->w + f->dx + 0.5f), y1 = (int)floorf(c->y + c->h + f->dy + 0.5f);
+        fr_push(f, 0, &s);
+        if (s) { s->bx0 = (float)x0; s->by0 = (float)y0; s->bx1 = (float)x1; s->by1 = (float)y1; }
+        if (x0 > f->cx0) f->cx0 = x0; if (y0 > f->cy0) f->cy0 = y0; if (x1 < f->cx1) f->cx1 = x1; if (y1 < f->cy1) f->cy1 = y1;
+        if (f->cx1 < f->cx0) f->cx1 = f->cx0; if (f->cy1 < f->cy0) f->cy1 = f->cy0;
+        if ((c->flags & (CF_SCROLL_X | CF_SCROLL_Y)) && c->node) {
+            float ox = 0, oy = 0; l2_scroll_get(c->node, &ox, &oy);
+            if (!(c->flags & CF_SCROLL_X)) ox = 0; if (!(c->flags & CF_SCROLL_Y)) oy = 0;
+            if (s) { s->kind = 1; s->node = c->node; s->fl = c->flags; s->sw = c->ex[0]; s->sh = c->ex[1]; s->ox = ox; s->oy = oy; }
+            f->scroller = c->node; f->scroller_fl = c->flags; f->s_ox = ox; f->s_oy = oy; f->s_mx = c->ex[2]; f->s_my = c->ex[3];
+            f->dx -= ox; f->dy -= oy; f->ry0 = (float)y0; f->ry1 = (float)y1;
+        }
+        break; }
+    case C_UNCLIP: {
+        if (f->sp > 0 && f->sp <= FR_MAX && f->st[f->sp - 1].kind == 2) return;      /* закрытие не того типа — игнорируем */
+        if (f->sp > 0) { f->sp--; if (f->sp < FR_MAX) { FrSave* p = &f->st[f->sp]; if (p->kind == 1) { f->popped = 1; f->pop = *p; }
+            f->cx0 = p->cx0; f->cy0 = p->cy0; f->cx1 = p->cx1; f->cy1 = p->cy1; f->dx = p->dx; f->dy = p->dy; f->ry0 = p->ry0; f->ry1 = p->ry1; } }
+        break; }
+    case C_STK: {
+        fr_push(f, 2, &s);
+        float ys = c->y + f->dy, shift = 0;
+        if ((c->flags & SF_TOP) && f->ry0 + c->ex[0] > ys) {
+            shift = f->ry0 + c->ex[0] - ys; float room = (c->ex[2] + f->dy) - c->h - ys; if (shift > room) shift = room; if (shift < 0) shift = 0;
+        }
+        if ((c->flags & SF_BOTTOM) && shift == 0 && f->ry1 - c->ex[3] - c->h < ys) {
+            shift = f->ry1 - c->ex[3] - c->h - ys; float room = (c->ex[1] + f->dy) - ys; if (shift < room) shift = room; if (shift > 0) shift = 0;
+        }
+        f->dy += shift; break; }
+    case C_ENDSTK: {
+        if (f->sp > 0 && (f->sp > FR_MAX || f->st[f->sp - 1].kind == 2)) { f->sp--; if (f->sp < FR_MAX) { FrSave* p = &f->st[f->sp]; f->dy = p->dy; f->dx = p->dx; } }
+        break; }
+    default: break;
+    }
+}
+
+/* полосы прокрутки (оверлейные, без места в раскладке) поверх закрытого прокручиваемого контейнера */
+static void draw_elem_scrollbars(const FrSave* p) {
+    float w = p->bx1 - p->bx0, h = p->by1 - p->by0; if (w < 20 || h < 20) return;
+    float r4[4] = {3, 3, 3, 3};
+    if ((p->fl & CF_SCROLL_Y) && p->sh > h + 0.5f) {
+        float maxy = p->sh - h, th = h * h / p->sh; if (th < 24) th = 24; if (th > h) th = h;
+        float ty = p->by0 + (h - th) * (maxy > 0 ? p->oy / maxy : 0);
+        fill_rrect((int)(p->bx1 - 9), (int)ty, (int)(p->bx1 - 3), (int)(ty + th), r4, 0xFF8B8F98u, 0.75f);
+    }
+    if ((p->fl & CF_SCROLL_X) && p->sw > w + 0.5f) {
+        float maxx = p->sw - w, tw = w * w / p->sw; if (tw < 24) tw = 24; if (tw > w) tw = w;
+        float tx = p->bx0 + (w - tw) * (maxx > 0 ? p->ox / maxx : 0);
+        fill_rrect((int)tx, (int)(p->by1 - 9), (int)(tx + tw), (int)(p->by1 - 3), r4, 0xFF8B8F98u, 0.75f);
+    }
+}
 
 static void paint_pass(int fixed_pass, int base_x0, int base_y0, int base_x1, int base_y1) {
-    cl_x0 = base_x0; cl_y0 = base_y0; cl_x1 = base_x1; cl_y1 = base_y1; cl_n = 0;
-    int dx = fixed_pass ? 0 : -g_sx, dy = fixed_pass ? g_top : g_top - g_sy;
+    Frame f; fr_init(&f, fixed_pass, base_x0, base_y0, base_x1, base_y1); fr_sync(&f);
     for (int i = 0; i < l2_dn; i++) {
         const Cmd* c = &l2_dl[i];
-        if (c->t == C_CLIP) { if (c->fixed != fixed_pass && !(c->fixed == 0 && fixed_pass == 0)) continue; }
-        if (c->t != C_CLIP && c->t != C_UNCLIP && c->fixed != fixed_pass) continue;
-        if (c->t == C_UNCLIP) { if (fixed_pass) continue; clip_pop(); continue; }
-        if (c->t == C_CLIP) { if (fixed_pass) continue; clip_push((int)floorf(c->x + dx + 0.5f), (int)floorf(c->y + dy + 0.5f), (int)floorf(c->x + c->w + dx + 0.5f), (int)floorf(c->y + c->h + dy + 0.5f)); continue; }
+        if (fr_is_ctl(c)) { fr_ctl(&f, c); fr_sync(&f); if (f.popped) draw_elem_scrollbars(&f.pop); continue; }
+        if (c->fixed != fixed_pass) continue;
+        int dx = (int)floorf(f.dx + 0.5f), dy = (int)floorf(f.dy + 0.5f);
         /* быстрый отказ: вне экрана */
         float sy0 = c->y + dy, sy1 = c->y + c->h + dy, sx0 = c->x + dx, sx1 = c->x + c->w + dx;
         if (c->t != C_HIT && (sy1 < cl_y0 - 40 || sy0 > cl_y1 + 40 || sx1 < cl_x0 - 40 || sx0 > cl_x1 + 40)) { if (c->t != C_BOX || (sy1 < cl_y0 - 400 || sy0 > cl_y1 + 400)) continue; }
@@ -370,6 +447,7 @@ static void paint_pass(int fixed_pass, int base_x0, int base_y0, int base_x1, in
         case C_TEXT: paint_text(c, dx, dy); break;
         case C_IMG: {
             int x0 = (int)floorf(c->x + dx + 0.5f), y0 = (int)floorf(c->y + dy + 0.5f), w = (int)floorf(c->w + 0.5f), h = (int)floorf(c->h + 0.5f); if (w < 1 || h < 1) break;
+            webpage_image_set_color(!strcmp(c->node->tag, "svg") ? c->node->st.color : 0xFF000000u);        /* currentColor встроенного svg = CSS color элемента */
             ImgPix* im = webpage_image_scaled(c->s, w, h); float rad[4]; resolve_radii(&c->node->st, (float)w, (float)h, rad);
             if (!im) im = webpage_image_get(c->s);
             blit_img(im, x0, y0, im ? (im->w < w ? im->w : w) : w, im ? (im->h < h ? im->h : h) : h, rad, c->opacity); break; }
@@ -403,23 +481,31 @@ void webpage_render(DOMNode* head, int top_offset, const char* page_url, int scr
 
 /* ══════════════ взаимодействие ══════════════ */
 DOMNode* webpage_hit_test(DOMNode* head, int mx, int my) {
-    (void)head;
-    for (int i = l2_dn - 1; i >= 0; i--) {
-        const Cmd* c = &l2_dl[i]; if (c->t != C_HIT) continue;
-        float x = c->fixed ? (float)mx : (float)(mx + g_sx), y = c->fixed ? (float)(my - g_top) : (float)(my - g_top + g_sy);
-        if (x >= c->x && x < c->x + c->w && y >= c->y && y < c->y + c->h && my >= g_top) return c->node;
+    (void)head; if (!l2_dl || my < g_top) return NULL;
+    Frame fr[2]; fr_init(&fr[0], 0, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT); fr_init(&fr[1], 1, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
+    DOMNode* best[2] = {NULL, NULL};
+    for (int i = 0; i < l2_dn; i++) {                       /* проход вперёд: побеждает команда, нарисованная позже (выше); fixed — выше обычных */
+        const Cmd* c = &l2_dl[i]; int k = c->fixed ? 1 : 0; Frame* f = &fr[k];
+        if (fr_is_ctl(c)) { fr_ctl(f, c); continue; }
+        if (c->t != C_HIT) continue;
+        if (mx < f->cx0 || mx >= f->cx1 || my < f->cy0 || my >= f->cy1) continue;     /* скрыто отсечением overflow */
+        float x0 = c->x + f->dx, y0 = c->y + f->dy;
+        if (mx >= x0 && mx < x0 + c->w && my >= y0 && my < y0 + c->h) best[k] = c->node;
     }
-    return NULL;
+    return best[1] ? best[1] : best[0];
 }
 
 int webpage_copy_selection(char* out, int cap) {
     int sx, sy, sw, sh; if (!sel_rect(&sx, &sy, &sw, &sh) || cap < 2) return 0;
     int o = 0; float last_y = -1e9f; int any = 0;
+    Frame fr; fr_init(&fr, 0, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
     for (int i = 0; i < l2_dn; i++) {
-        const Cmd* c = &l2_dl[i]; if (c->t != C_TEXT || c->fixed) continue;
-        int x = (int)(c->x - g_sx + 0.5f), y = (int)(c->y - g_sy + g_top + 0.5f);
+        const Cmd* c = &l2_dl[i]; if (fr_is_ctl(c)) { fr_ctl(&fr, c); continue; }
+        if (c->t != C_TEXT || c->fixed) continue;
+        int x = (int)(c->x + fr.dx + 0.5f), y = (int)(c->y + fr.dy + 0.5f);
+        if (y + (int)c->h <= fr.cy0 || y >= fr.cy1 || x + (int)c->w <= fr.cx0 || x >= fr.cx1) continue;      /* скрытое отсечением */
         if (!rect_hit(x, y, (int)c->w + 1, (int)c->h, sx, sy, sw, sh)) continue;
-        TTFFont* f = font_manager_get(c->fam); if (!f) continue;
+        TTFFont* f = font_manager_get_styled(c->fam, c->weight ? c->weight : 400, c->ital); if (!f) continue;
         size_t n = strlen(c->s); int* offs = malloc((n + 1) * sizeof(int)); if (!offs) continue;
         ttf_text_offsets_ex(f, c->s, c->size, c->tstyle, offs, (int)n + 1);
         int started = 0;
@@ -517,7 +603,7 @@ void webpage_force_layout(void) {
 void webpage_get_scroll(int* x, int* y, int* vw, int* vh) { *x = g_sx; *y = g_sy; *vw = SCREEN_WIDTH - 10; *vh = SCREEN_HEIGHT - g_top; }
 
 /* border-box элемента в координатах документа; для inline-элементов — объединение текстовых фрагментов */
-int webpage_node_rect(DOMNode* n, float* out) {
+static int node_rect_raw(DOMNode* n, float* out) {
     if (!n || !l2_dl) return 0;
     if (l2_rects && n->idx >= 0 && n->idx < l2_nrects) { const float* r = &l2_rects[n->idx * 4]; if (r[2] > 0 || r[3] > 0) { memcpy(out, r, 4 * sizeof(float)); return 1; } }
     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; int any = 0;
@@ -530,16 +616,54 @@ int webpage_node_rect(DOMNode* n, float* out) {
     out[0] = x0; out[1] = y0; out[2] = x1 - x0; out[3] = y1 - y0; return 1;
 }
 
+int webpage_node_rect(DOMNode* n, float* out) {
+    if (!node_rect_raw(n, out)) return 0;
+    float ox, oy; l2_scroll_offset_of_ancestors(n, &ox, &oy); out[0] -= ox; out[1] -= oy;   /* прокрутка внутри предков-контейнеров */
+    return 1;
+}
+
 /* Самый глубокий элемент под курсором (цель события для JS), не только кликабельный. */
 DOMNode* webpage_hit_element(DOMNode* head, int mx, int my) {
     if (!head || !l2_dl || my < g_top) return NULL;
-    for (int i = l2_dn - 1; i >= 0; i--) {
-        const Cmd* c = &l2_dl[i];
+    Frame fr[2]; fr_init(&fr[0], 0, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT); fr_init(&fr[1], 1, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
+    const Cmd* best[2] = {NULL, NULL};
+    for (int i = 0; i < l2_dn; i++) {
+        const Cmd* c = &l2_dl[i]; int k = c->fixed ? 1 : 0; Frame* f = &fr[k];
+        if (fr_is_ctl(c)) { fr_ctl(f, c); continue; }
         if (c->t != C_MARK && c->t != C_TEXT && c->t != C_IMG && c->t != C_CTRL) continue;
-        float x = c->fixed ? (float)mx : (float)(mx + g_sx), y = c->fixed ? (float)(my - g_top) : (float)(my - g_top + g_sy);
-        if (!(x >= c->x && x < c->x + c->w && y >= c->y && y < c->y + c->h) || !c->node) continue;
-        if (c->t == C_TEXT) { int par = c->node->parent; if (par < 0) continue; DOMNode* q = head; for (int k = 0; k < par && q; k++) q = q->next; return q; }
-        return c->node;
+        if (!c->node || (c->t == C_TEXT && c->node->parent < 0)) continue;
+        if (mx < f->cx0 || mx >= f->cx1 || my < f->cy0 || my >= f->cy1) continue;
+        float x0 = c->x + f->dx, y0 = c->y + f->dy;
+        if (mx >= x0 && mx < x0 + c->w && my >= y0 && my < y0 + c->h) best[k] = c;
     }
-    return NULL;
+    const Cmd* c = best[1] ? best[1] : best[0]; if (!c) return NULL;
+    if (c->t == C_TEXT) { int par = c->node->parent; DOMNode* q = head; for (int k = 0; k < par && q; k++) q = q->next; return q; }
+    return c->node;
 }
+
+/* Колесо мыши над прокручиваемым контейнером: прокручиваем самый вложенный контейнер под курсором, который ещё может
+   двигаться в этом направлении (иначе событие уходит наружу — к предку или к странице). 1 — прокрутка выполнена. */
+int webpage_scroll_at(int mx, int my, int dx, int dy) {
+    if (!l2_dl || my < g_top || (!dx && !dy)) return 0;
+    Frame fr[2]; fr_init(&fr[0], 0, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT); fr_init(&fr[1], 1, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
+    struct { const DOMNode* n; unsigned char fl; } cand[2][64]; int nc[2] = {0, 0};
+    for (int i = 0; i < l2_dn; i++) {
+        const Cmd* c = &l2_dl[i]; if (!fr_is_ctl(c)) continue;
+        int k = c->fixed ? 1 : 0; Frame* f = &fr[k]; fr_ctl(f, c);
+        if (f->scroller && nc[k] < 64 && mx >= f->cx0 && mx < f->cx1 && my >= f->cy0 && my < f->cy1) { cand[k][nc[k]].n = f->scroller; cand[k][nc[k]].fl = f->scroller_fl; nc[k]++; }
+    }
+    for (int pass = 1; pass >= 0; pass--) for (int j = nc[pass] - 1; j >= 0; j--) {
+        const DOMNode* n = cand[pass][j].n; unsigned fl = cand[pass][j].fl; float x, y, mxs, mys; l2_scroll_get(n, &x, &y); l2_scroll_max(n, &mxs, &mys);
+        float nx = x, ny = y; int moved = 0;
+        if (dy && (fl & CF_SCROLL_Y) && mys > 0) { float t = y + (float)dy; if (t < 0) t = 0; if (t > mys) t = mys; if (t != y) { ny = t; moved = 1; } }
+        if (dx && (fl & CF_SCROLL_X) && mxs > 0) { float t = x + (float)dx; if (t < 0) t = 0; if (t > mxs) t = mxs; if (t != x) { nx = t; moved = 1; } }
+        if (moved) { l2_scroll_set(n, nx, ny); return 1; }
+    }
+    return 0;
+}
+
+/* Для JS: scrollTop/scrollLeft/scrollHeight/clientHeight элементов-контейнеров */
+int  webpage_elem_scroll_get(DOMNode* n, float* x, float* y, float* sw, float* sh, float* cw, float* ch) {
+    if (!l2_scroll_get(n, x, y)) return 0; l2_scroll_size(n, sw, sh, cw, ch); return 1;
+}
+void webpage_elem_scroll_set(DOMNode* n, float x, float y) { l2_scroll_set(n, x, y); }

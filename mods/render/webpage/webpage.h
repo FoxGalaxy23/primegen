@@ -42,6 +42,9 @@ void        webpage_invalidate_layout(void);
 void        webpage_force_layout(void);
 void        webpage_get_scroll(int* x, int* y, int* vw, int* vh);
 int         webpage_node_rect(DOMNode* n, float* out4);          /* border-box в координатах документа */
+int         webpage_scroll_at(int mx, int my, int dx, int dy);   /* колесо над прокручиваемым контейнером: 1 — прокрутка выполнена */
+int         webpage_elem_scroll_get(DOMNode* n, float* x, float* y, float* sw, float* sh, float* cw, float* ch);   /* 1 — элемент прокручиваемый */
+void        webpage_elem_scroll_set(DOMNode* n, float x, float y);
 void        font_manager_set_offline(int off);
 
 /* ── JavaScript (QuickJS + DOM-примитивы), см. js.c ── */
@@ -61,6 +64,8 @@ const char* webpage_js_take_title(void* page);
 DOMNode* html_build(const char* utf8, const char* base_url, SheetList* sheets);
 void     style_apply(DOMNode* head, SheetList* sheets, const char* base_url);
 int      webpage_attr_get(const DOMNode* n, const char* name, char* out, size_t cap);
+void     webpage_set_doc_url(const char* url);          /* текущий документ — для проверок безопасности ресурсов */
+int      webpage_mixed_blocked(const char* url);        /* 1 — https-страница не должна грузить этот http-ресурс (смешанное содержимое) */
 void     webpage_resolve_url(const char* base, const char* rel, char* out, size_t cap);
 int      webpage_is_utf8(const char* s);
 
@@ -72,5 +77,7 @@ ImgPix*  webpage_image_get(const char* abs_url);                   /* декод
 ImgPix*  webpage_image_scaled(const char* abs_url, int w, int h);  /* масштабированная копия (кэш) или NULL */
 void     webpage_image_inject(const char* key, const uint32_t* argb, int w, int h);   /* для canvas 2D: подменить/создать запись кэша по синтетическому ключу */
 void     webpage_image_cache_clear(void);
+void     webpage_image_set_color(uint32_t argb);                          /* currentColor для следующих webpage_image_scaled (встроенный <svg>) */
+int      webpage_data_uri_to_file(const char* uri, size_t len, char* out, size_t cap);   /* data: → файл кэша, 1 — ok */
 
 #endif

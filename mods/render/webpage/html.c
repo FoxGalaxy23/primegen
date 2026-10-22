@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <strings.h>
+#include <sys/stat.h>
 
 /* ══════════════ утилиты ══════════════ */
 static int ci_prefix(const char* s, const char* pre) {
@@ -349,7 +350,10 @@ static void apply_attrs(PB* pb, DOMNode* n, Attr* a, int na) {
         else if (!strcmp(k, "cols")) n->cols = atoi(v);
         else if (!strcmp(k, "href") && n->type != TAG_LINK && n->type != TAG_OTHER) webpage_resolve_url(pb->base, v, n->href, sizeof n->href);
         else if (!strcmp(k, "href")) webpage_resolve_url(pb->base, v, n->href, sizeof n->href);
-        else if (!strcmp(k, "src")) { if (!ci_prefix(v, "data:")) webpage_resolve_url(pb->base, v, n->src, sizeof n->src); }
+        else if (!strcmp(k, "src")) {
+            if (!ci_prefix(v, "data:")) webpage_resolve_url(pb->base, v, n->src, sizeof n->src);
+            else { char dp[200]; if (webpage_data_uri_to_file(v, strlen(v), dp, sizeof dp)) put_str(n->src, sizeof n->src, dp, strlen(dp)); }      /* data: → локальный файл кэша */
+        }
         else if (!strcmp(k, "data-src") || !strcmp(k, "data-lazy-src") || !strcmp(k, "data-original")) { if (!n->src[0] && !strcmp(tag, "img")) webpage_resolve_url(pb->base, v, n->src, sizeof n->src); }
         else if (!strcmp(k, "srcset") && !strcmp(tag, "img") && !n->src[0]) {   /* берём первый URL из srcset */
             char first[512]; size_t l = strcspn(v, " ,"); put_str(first, sizeof first, v, l);
@@ -446,6 +450,42 @@ static void close_p_if_open(PB* pb) {
     if (i >= 0) pop_to(pb, i);
 }
 
+/* Встроенный <svg>: разбор HTML содержимое выбрасывает, поэтому собираем разметку заново (корневой тег по атрибутам + тело),
+   кладём в файл кэша по хэшу содержимого и записываем путь в n->src — дальше узел обрабатывается как заменяемый элемент-картинка
+   (растеризация в images.c/svg.c; цвет currentColor берётся из CSS `color` элемента в момент отрисовки). */
+static int mem_has_ci(const char* s, size_t len, const char* needle) {         /* поиск без учёта регистра в пределах len байт */
+    size_t nl = strlen(needle); if (nl > len) return 0;
+    for (size_t i = 0; i + nl <= len; i++) if (!strncasecmp(s + i, needle, nl)) return 1;
+    return 0;
+}
+static void svg_capture(const char* base, DOMNode* n, const Attr* a, int na, const char* inner, size_t len) {
+    if (len == 0 || len > (4u << 20)) return;
+    size_t cap = len + 64; for (int i = 0; i < na; i++) cap += strlen(a[i].name) + (a[i].val ? strlen(a[i].val) * 6 : 0) + 8;
+    char* m = malloc(cap); if (!m) return; size_t o = 0;
+    /* спрайты: хэш origin страницы связывает svg с <use> и svg с <symbol> */
+    char oh[24]; { const char* q = base ? strstr(base, "://") : NULL; size_t ol = q ? (size_t)(strchr(q + 3, '/') ? strchr(q + 3, '/') - base : (long)strlen(base)) : (base ? strlen(base) : 0);
+        unsigned long long hh = 1469598103934665603ULL; for (size_t i = 0; i < ol && base; i++) { hh ^= (unsigned char)base[i]; hh *= 1099511628211ULL; } snprintf(oh, sizeof oh, "%016llx", hh); }
+    int has_symbol = mem_has_ci(inner, len, "<symbol"), has_use = mem_has_ci(inner, len, "<use");
+    o += (size_t)snprintf(m + o, cap - o, "<!--mlinline-->");
+    if (has_use) o += (size_t)snprintf(m + o, cap - o, "<!--mlsprite:%s-->", oh);
+    o += (size_t)snprintf(m + o, cap - o, "<svg");
+    for (int i = 0; i < na; i++) {
+        o += (size_t)snprintf(m + o, cap - o, " %s=\"", a[i].name);
+        for (const char* v = a[i].val ? a[i].val : ""; *v && o + 8 < cap; v++) { if (*v == '"') { memcpy(m + o, "&quot;", 6); o += 6; } else m[o++] = *v; }
+        m[o++] = '"';
+    }
+    m[o++] = '>'; memcpy(m + o, inner, len); o += len; memcpy(m + o, "</svg>", 6); o += 6; m[o] = 0;
+    unsigned long long h = 1469598103934665603ULL; for (size_t i = 0; i < o; i++) { h ^= (unsigned char)m[i]; h *= 1099511628211ULL; }
+    char path[64]; snprintf(path, sizeof path, "cache/svg_%016llx.svg", h);
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size == 0) { mkdir("cache", 0777); FILE* f = fopen(path, "wb"); if (f) { fwrite(m, 1, o, f); fclose(f); } }
+    if (has_symbol) {                                                  /* спрайт-лист: запоминаем отдельно, чтобы <use href="#id"> из других svg находили символы */
+        char sp[96]; snprintf(sp, sizeof sp, "cache/sprite_%s_%016llx.svg", oh, h);
+        if (stat(sp, &st) != 0 || st.st_size == 0) { FILE* f = fopen(sp, "wb"); if (f) { fwrite(m, 1, o, f); fclose(f); } }
+    }
+    put_str(n->src, sizeof n->src, path, strlen(path)); free(m);
+}
+
 static void start_tag(PB* pb, const char* name, Attr* a, int na, int selfclose, const char** pp) {
     DOMNode* n;
     if (!strcmp(name, "html")) { n = pb->v[0]; apply_attrs(pb, n, a, na); return; }
@@ -511,6 +551,8 @@ static void start_tag(PB* pb, const char* name, Attr* a, int na, int selfclose, 
                 char t2[8], t3[8], t4[8]; bundle_add_script(text, n->src[0] ? strdup(n->src) : NULL, !strcasecmp(ty, "module"), webpage_attr_get(n, "async", t2, sizeof t2), webpage_attr_get(n, "defer", t3, sizeof t3), n->idx); (void)t4;
             }
             if (len > 0 && len < 511) put_str(n->text, sizeof n->text, p, len);   /* для старого кода; движок JS берёт полный текст из бандла */
+        } else if (!strcmp(name, "svg")) {
+            svg_capture(pb->base, n, a, na, p, len);
         } else if (rc) {
             char* tmp = malloc(len + 1);
             if (tmp) {
@@ -546,6 +588,7 @@ DOMNode* html_build(const char* html, const char* base_url, SheetList* sheets) {
     PB pb; memset(&pb, 0, sizeof pb);
     pb.sheets = sheets; pb.head = pb.body = -1; pb.mode_head = 1;
     put_str(pb.base, sizeof pb.base, base_url ? base_url : "", base_url ? strlen(base_url) : 0);
+    webpage_set_doc_url(base_url);
     DOMNode* root = mk(&pb, -1, "html"); if (!root) return NULL;
     DOMNode* hd = mk(&pb, 0, "head"); pb.head = hd ? hd->idx : 0;
 
@@ -610,9 +653,19 @@ DOMNode* html_build(const char* html, const char* base_url, SheetList* sheets) {
     return head;
 }
 
+/* URL текущего документа — для проверок безопасности ресурсов (смешанное содержимое). Выставляется при разборе (процесс загрузки),
+   при каскаде стилей и при создании JS-страницы (основной процесс). */
+static char g_doc_url[1100];
+void webpage_set_doc_url(const char* u) { snprintf(g_doc_url, sizeof g_doc_url, "%s", u ? u : ""); }
+int webpage_mixed_blocked(const char* url) {
+    if (!nal_mixed_content_blocked(g_doc_url, url)) return 0;
+    gal_log("WARN", "Mixed Content: заблокирован небезопасный ресурс %s на странице %s", url, g_doc_url); return 1;
+}
+
 /* Текст ресурса: http(s) через NAL, иначе локальный файл. */
 char* webpage_fetch_text(const char* url) {
     if (!url) return NULL;
+    if (webpage_mixed_blocked(url)) return NULL;
     if (ci_prefix(url, "http://") || ci_prefix(url, "https://")) return nal_http_get(url);
     const char* path = ci_prefix(url, "file://") ? url + 7 : url;
     FILE* f = fopen(path, "rb"); if (!f) return NULL;
@@ -640,7 +693,7 @@ int webpage_bundle_prefetch_css(void) {
     int got = 0, budget = 10;
     for (int i = 0; i < g_bundle.nsheets && budget > 0; i++) {
         SheetSrc* s = &g_bundle.sheets[i];
-        if (!s->css && s->href && !strncmp(s->href, "http", 4)) {
+        if (!s->css && s->href && !strncmp(s->href, "http", 4) && !webpage_mixed_blocked(s->href)) {
             s->css = nal_http_get(s->href);
             budget--; if (s->css) got++;
         }

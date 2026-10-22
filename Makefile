@@ -41,13 +41,13 @@ else ifeq ($(CROSS),win32)
     ARCHIVE = mlbrowser-$(VERSION)-win64.zip
 else ifeq ($(PLATFORM),wayland)
     CFLAGS += $(shell pkg-config --cflags wayland-client xkbcommon)
-    LIBS += $(shell pkg-config --libs wayland-client xkbcommon)
+    LIBS += $(shell pkg-config --libs wayland-client xkbcommon) -ldl
     TARGET = my_browser
     PACKAGE_DIR = $(COMPILE_DIR)/linux
     ARCHIVE = mlbrowser-$(VERSION)-linux-wayland.tar.gz
 else
     PLATFORM = x11
-    LIBS += -lX11
+    LIBS += -lX11 -ldl
     TARGET = my_browser
     PACKAGE_DIR = $(COMPILE_DIR)/linux
     ARCHIVE = mlbrowser-$(VERSION)-linux-x11.tar.gz

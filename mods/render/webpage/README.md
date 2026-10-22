@@ -15,8 +15,24 @@
 
 Запуск с URL: `./my_browser https://pypi.org/` или `./my_browser /path/to/page.html`.
 
-Не поддерживается: JavaScript-управляемая вёрстка, SVG/WebP-картинки, CFF/WOFF2-шрифты, `::before/::after`,
-`z-index`-стекинг, градиенты (берётся первый цвет), анимации, `position:sticky` (ведёт себя как relative).
+Не поддерживается: JavaScript-управляемая вёрстка, анимации, `transition`. (Шрифты: WOFF/WOFF2/CFF — см. `../ttf_render/README.md`;
+псевдоэлементы `::before/::after` и `var()` работают; `font-weight` учитывается по начертаниям веб-шрифта.)
+
+### Стекинг, прокрутка внутри элементов, sticky
+
+- **`z-index`**: контексты (позиционированные блоки и flex-элементы с `z-index`, `position:fixed`, корень) записывают диапазон
+  команд display list; после раскладки `z<0` переносится в начало содержимого охватывающего контекста, `z>0` — в конец
+  (`stk_reorder` в `layout2.c`). Вокруг перенесённого диапазона восстанавливаются `C_CLIP/C_UNCLIP`, поэтому отсечение и прокрутка сохраняются.
+  Ограничение: `fixed`-команды рисуются отдельным проходом поверх обычных независимо от `z-index`.
+- **`overflow:auto|scroll`** (по осям): `C_CLIP` несёт `flags` (`CF_SCROLL_X/Y`), `node` и `ex[]` (размеры содержимого, максимум прокрутки).
+  Смещения хранятся по `idx` узла (`l2_scroll_*`), переживают перерасчёт раскладки. Колесо идёт в самый вложенный контейнер под курсором
+  (`webpage_scroll_at`), на границе событие уходит наружу. Оверлейные полосы рисуются при закрытии контейнера. В column-flex элементы
+  с overflow сжимаются по `flex-shrink`, в row-flex растянутые элементы ограничиваются высотой строки — иначе прокрутки не возникает.
+- **`position:sticky`** (`top`/`bottom`): блок обёрнут в `C_STK/C_ENDSTK`; смещение считается при отрисовке относительно ближайшего
+  прокручиваемого предка (или окна) и ограничено content-box родителя (для контейнера-скроллера — всей прокручиваемой областью).
+  Горизонтальный sticky (`left/right`) не поддерживается.
+- Единый автомат `Frame` (`paint.c`) используется для рисования, hit-test, выделения и колеса — все видят страницу одинаково.
+- JS: `scrollTop/scrollLeft/scrollHeight/scrollWidth/clientHeight/clientWidth`, `scrollTo/scrollBy/scrollIntoView` у элементов-контейнеров.
 
 ## JavaScript
 
@@ -36,3 +52,21 @@
 Ограничения: `fetch/XHR` — только GET и синхронный (блокирует UI на время запроса), нет Web Workers/WebSocket/`Intl`/canvas,
 `localStorage` не переживает переход на другую страницу, `MutationObserver` — заглушка, `IntersectionObserver` срабатывает сразу.
 Пример: `./my_browser examples/js-demo/index.html`.
+
+### SVG (`svg.c`)
+
+Собственный растеризатор (подмножество SVG 1.1), подключён к общему конвейеру картинок (`images.c`), поэтому работают:
+встроенный `<svg>`, `<img src="*.svg">`, `background-image:url(*.svg)`, а также `data:`-URI (SVG и обычные картинки, base64 и %-кодирование).
+
+- **Фигуры и контуры:** `path` (все команды, дуги), `rect` (rx/ry), `circle`, `ellipse`, `line`, `polyline`, `polygon`; `g`, `a`, `switch`,
+  `use`/`symbol`/`defs`, вложенный `svg` с `viewBox` и `preserveAspectRatio`; `transform` (matrix/translate/scale/rotate/skew).
+- **Закраска:** цвета (имена, `#rgb[a]`, `rgb()/rgba()/hsl()`), `currentColor`, `linearGradient`/`radialGradient` (units, transform, spread, href-наследование),
+  `fill-rule`, `opacity`/`fill-opacity`/`stroke-opacity`. **Обводка:** ширина, `linecap`, `linejoin`, `miterlimit`, `dasharray`/`dashoffset`.
+- **Стили:** атрибуты представления, `style="..."`, `<style>` с простыми селекторами (тег, `.класс`, `#id`, составные, списки).
+- **Антиалиасинг:** накопление знаковой площади (как в font-rs); вектор перерисовывается под нужный размер, а не растягивается.
+- **Встроенный `<svg>`:** парсер HTML выбрасывает его содержимое, поэтому `html.c` собирает разметку и сохраняет в `cache/svg_<хэш>.svg`
+  (путь — в `n->src`); узел становится заменяемым элементом-картинкой. `currentColor` берётся из CSS `color` элемента при отрисовке.
+  Спрайты: svg с `<symbol>` сохраняются как `cache/sprite_<хэш origin>_*.svg`, и `<use href="#id">` из других svg страницы их находит.
+- **Не поддерживается:** `text`, `image`, `filter`, `mask`, `clip-path`, `pattern`, `marker`, анимации; CSS-правила страницы (`.icon path{fill:red}`)
+  внутрь встроенного svg не проникают; содержимое svg статично (DOM-изменения из JS не перерисовывают).
+- Проверка: `python3 tests/svg/check.py` (15 сверок пикселей); фаззинг под ASAN/UBSan прошёл 4500 входов, включая патологические.

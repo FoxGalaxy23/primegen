@@ -3,10 +3,12 @@
 #define _GNU_SOURCE
 #include "webpage.h"
 #include "nal.h"
+#include "svg.h"
 #include "gal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -51,15 +53,47 @@ static unsigned char* load_webp(const char* path, int* w, int* h) {
 int webpage_image_path(const char* url, char* out, size_t cap) {
     if (!url || !*url) return 0;
     if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) { snprintf(out, cap, "cache/img_%016llx.bin", fnv(url)); return 1; }
-    if (strncmp(url, "data:", 5) == 0) return 0;
+    if (strncmp(url, "data:", 5) == 0) return webpage_data_uri_to_file(url, strlen(url), out, cap);
     snprintf(out, cap, "%s", url); return 1;                                   /* локальный файл */
 }
 
 static int looks_like_image(const char* path) {
     FILE* f = fopen(path, "rb"); if (!f) return 0;
-    unsigned char m[12] = {0}; size_t n = fread(m, 1, 12, f); fclose(f);
+    unsigned char m[4096] = {0}; size_t n = fread(m, 1, sizeof m, f); fclose(f);
     if (n < 4) return 0;
-    return (m[0] == 0x89 && m[1] == 'P') || (m[0] == 0xFF && m[1] == 0xD8) || !memcmp(m, "GIF8", 4) || (m[0] == 'B' && m[1] == 'M') || is_webp(m, n);
+    return (m[0] == 0x89 && m[1] == 'P') || (m[0] == 0xFF && m[1] == 0xD8) || !memcmp(m, "GIF8", 4) || (m[0] == 'B' && m[1] == 'M') || is_webp(m, n) || svg_looks_like((const char*)m, n);
+}
+
+/* ── data: URI → файл кэша ──
+   Поддерживаются «data:[<mime>][;base64],<данные>» (base64 и %-кодирование, а также «сырой» текст — типично для SVG).
+   Длинные data-URI не помещаются в поля узлов (src[512], bg_url[192]), поэтому декодируем сразу в файл и дальше
+   работаем с обычным локальным путём. */
+static int b64v(int c) { if (c >= 'A' && c <= 'Z') return c - 'A'; if (c >= 'a' && c <= 'z') return c - 'a' + 26; if (c >= '0' && c <= '9') return c - '0' + 52; if (c == '+' || c == '-') return 62; if (c == '/' || c == '_') return 63; return -1; }
+int webpage_data_uri_to_file(const char* uri, size_t len, char* out, size_t cap) {
+    if (len < 6 || strncasecmp(uri, "data:", 5) != 0) return 0;
+    const char* comma = memchr(uri, ',', len); if (!comma) return 0;
+    size_t hl = (size_t)(comma - uri); int b64 = 0;
+    for (size_t i = 5; i + 6 <= hl; i++) if (!strncasecmp(uri + i, "base64", 6)) { b64 = 1; break; }
+    const char* d = comma + 1; size_t dl = len - hl - 1;
+    unsigned long long h = 1469598103934665603ULL; for (size_t i = 0; i < len; i++) { h ^= (unsigned char)uri[i]; h *= 1099511628211ULL; }
+    snprintf(out, cap, "cache/data_%016llx.bin", h);
+    struct stat st; if (stat(out, &st) == 0 && st.st_size > 0) return 1;
+    unsigned char* buf = malloc(dl + 1); if (!buf) return 0; size_t o = 0;
+    if (b64) { unsigned acc = 0; int bits = 0; for (size_t i = 0; i < dl; i++) { int v = b64v((unsigned char)d[i]); if (v < 0) { if (d[i] == '%' && i + 2 < dl) { /* %-кодированный base64 (+, /, =) */ } continue; } acc = (acc << 6) | (unsigned)v; bits += 6; if (bits >= 8) { bits -= 8; buf[o++] = (unsigned char)((acc >> bits) & 255); } } }
+    else for (size_t i = 0; i < dl; i++) {
+        if (d[i] == '%' && i + 2 < dl + 0 && isxdigit((unsigned char)d[i + 1]) && isxdigit((unsigned char)d[i + 2])) { char hx[3] = {d[i + 1], d[i + 2], 0}; buf[o++] = (unsigned char)strtol(hx, NULL, 16); i += 2; }
+        else buf[o++] = (unsigned char)d[i];
+    }
+    mkdir("cache", 0777);
+    FILE* f = fopen(out, "wb"); if (!f) { free(buf); return 0; }
+    fwrite(buf, 1, o, f); fclose(f); free(buf); return o > 0;
+}
+static char* read_file_cap(const char* path, size_t cap, size_t* len) {
+    FILE* f = fopen(path, "rb"); if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || (size_t)sz > cap) { fclose(f); return NULL; }
+    char* b = malloc((size_t)sz + 1); if (!b) { fclose(f); return NULL; }
+    size_t rd = fread(b, 1, (size_t)sz, f); fclose(f); b[rd] = 0; *len = rd; return b;
 }
 
 void webpage_prefetch_images(DOMNode* head) {
@@ -92,7 +126,12 @@ void webpage_prefetch_images(DOMNode* head) {
 
 /* ══════════════ кэш декодированных картинок ══════════════ */
 #define IC_MAX 96
-typedef struct { char url[512]; ImgPix pix; int w2, h2; int fail; unsigned stamp; } ICEntry;   /* w2,h2 > 0 — масштабированная копия */
+typedef struct { char url[512]; ImgPix pix; int w2, h2; int fail; unsigned stamp; int svg; uint32_t cc; } ICEntry;   /* w2,h2 > 0 — масштабированная копия; svg — векторная картинка, cc — цвет currentColor, с которым она растеризована */
+static uint32_t g_cc = 0xFF000000u;
+/* Цвет для currentColor следующих запросов webpage_image_scaled (встроенный <svg> берёт его из CSS `color` элемента) */
+void webpage_image_set_color(uint32_t argb) { g_cc = argb; }
+/* длинные ключи (data-URI и т.п.) укорачиваем с хэшем, чтобы записи кэша не склеивались по общему префиксу */
+static const char* ic_key(const char* url, char* buf, size_t cap) { if (strlen(url) < 500) return url; snprintf(buf, cap, "%.200s#%016llx", url, fnv(url)); return buf; }
 static ICEntry g_ic[IC_MAX]; static unsigned g_stamp = 0; static size_t g_bytes = 0;
 
 static void ic_drop(ICEntry* e) { if (e->pix.px) { g_bytes -= (size_t)e->pix.w * e->pix.h * 4; free(e->pix.px); } memset(e, 0, sizeof *e); }
@@ -110,13 +149,23 @@ static void ic_trim(void) {
 
 ImgPix* webpage_image_get(const char* url) {
     if (!url || !*url) return NULL;
-    for (int i = 0; i < IC_MAX; i++) if (!g_ic[i].w2 && g_ic[i].url[0] && !strcmp(g_ic[i].url, url)) { g_ic[i].stamp = ++g_stamp; return g_ic[i].fail ? NULL : &g_ic[i].pix; }
+    char kb[600]; const char* key = ic_key(url, kb, sizeof kb);
+    for (int i = 0; i < IC_MAX; i++) if (!g_ic[i].w2 && g_ic[i].url[0] && !strcmp(g_ic[i].url, key)) { g_ic[i].stamp = ++g_stamp; return g_ic[i].fail ? NULL : &g_ic[i].pix; }
     ICEntry* e = ic_slot(); memset(e, 0, sizeof *e);
-    snprintf(e->url, sizeof e->url, "%s", url); e->stamp = ++g_stamp;
+    snprintf(e->url, sizeof e->url, "%s", key); e->stamp = ++g_stamp;
     char path[600]; int w = 0, h = 0, n; unsigned char* d = NULL; int is_wp = 0;
     if (webpage_image_path(url, path, sizeof path)) {
-        FILE* pf = fopen(path, "rb");
-        if (pf) { unsigned char m[12] = {0}; size_t rn = fread(m, 1, 12, pf); fclose(pf); is_wp = is_webp(m, rn); }
+        FILE* pf = fopen(path, "rb"); int is_svg = 0;
+        if (pf) { unsigned char m[4096] = {0}; size_t rn = fread(m, 1, sizeof m, pf); fclose(pf); is_wp = is_webp(m, rn); is_svg = svg_looks_like((const char*)m, rn); }
+        if (is_svg) {                                                       /* вектор: растеризуем в собственный размер (масштабированные копии — векторно, см. webpage_image_scaled) */
+            size_t sl = 0; char* src = read_file_cap(path, 8u << 20, &sl); float fw = 0, fh = 0;
+            if (src && svg_intrinsic(src, sl, &fw, &fh)) {
+                w = (int)(fw + 0.5f); h = (int)(fh + 0.5f); if (w < 1) w = 1; if (h < 1) h = 1; if (w > 4096) { h = h * 4096 / w; w = 4096; } if (h > 4096) { w = w * 4096 / h; h = 4096; } if (w < 1) w = 1; if (h < 1) h = 1;
+                uint32_t* px = svg_render(src, sl, w, h, 0xFF000000u);
+                if (px) { free(src); e->pix.px = px; e->pix.w = w; e->pix.h = h; e->svg = 1; e->cc = 0xFF000000u; g_bytes += (size_t)w * h * 4; ic_trim(); return &e->pix; }
+            }
+            free(src); e->fail = 1; return NULL;
+        }
 #ifdef HAVE_WEBP
         if (is_wp) d = load_webp(path, &w, &h);
         else
@@ -150,8 +199,20 @@ void webpage_image_inject(const char* key, const uint32_t* argb, int w, int h) {
 
 ImgPix* webpage_image_scaled(const char* url, int w, int h) {
     if (w < 1 || h < 1 || w > 8192 || h > 8192) return NULL;
-    for (int i = 0; i < IC_MAX; i++) if (g_ic[i].w2 == w && g_ic[i].h2 == h && !strcmp(g_ic[i].url, url)) { g_ic[i].stamp = ++g_stamp; return &g_ic[i].pix; }
+    char kb[600]; const char* key = ic_key(url, kb, sizeof kb);
+    for (int i = 0; i < IC_MAX; i++) if (g_ic[i].w2 == w && g_ic[i].h2 == h && !strcmp(g_ic[i].url, key) && (!g_ic[i].svg || g_ic[i].cc == g_cc)) { g_ic[i].stamp = ++g_stamp; return &g_ic[i].pix; }
     ImgPix* src = webpage_image_get(url); if (!src) return NULL;
+    int src_svg = 0; for (int i = 0; i < IC_MAX; i++) if (&g_ic[i].pix == src) { src_svg = g_ic[i].svg; break; }
+    if (src_svg) {                                                          /* вектор: перерисовываем сразу в нужный размер и нужным цветом currentColor */
+        if (src->w == w && src->h == h && g_cc == 0xFF000000u) return src;
+        char path[600]; size_t sl = 0; char* text = webpage_image_path(url, path, sizeof path) ? read_file_cap(path, 8u << 20, &sl) : NULL;
+        uint32_t* px = text ? svg_render(text, sl, w, h, g_cc) : NULL; free(text);
+        if (!px) return src;
+        ICEntry* e = ic_slot(); memset(e, 0, sizeof *e);
+        snprintf(e->url, sizeof e->url, "%s", key); e->w2 = w; e->h2 = h; e->stamp = ++g_stamp; e->svg = 1; e->cc = g_cc;
+        e->pix.px = px; e->pix.w = w; e->pix.h = h; g_bytes += (size_t)w * h * 4; ic_trim();
+        return &e->pix;
+    }
     if (src->w == w && src->h == h) return src;
     uint32_t* out = malloc((size_t)w * h * 4); if (!out) return NULL;
     for (int y = 0; y < h; y++) {
@@ -176,7 +237,7 @@ ImgPix* webpage_image_scaled(const char* url, int w, int h) {
         }
     }
     ICEntry* e = ic_slot(); memset(e, 0, sizeof *e);
-    snprintf(e->url, sizeof e->url, "%s", url); e->w2 = w; e->h2 = h; e->stamp = ++g_stamp;
+    snprintf(e->url, sizeof e->url, "%s", key); e->w2 = w; e->h2 = h; e->stamp = ++g_stamp;
     e->pix.px = out; e->pix.w = w; e->pix.h = h; g_bytes += (size_t)w * h * 4; ic_trim();
     return &e->pix;
 }

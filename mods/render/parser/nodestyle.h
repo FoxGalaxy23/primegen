@@ -23,9 +23,11 @@ enum { BS_NONE, BS_SOLID, BS_DASHED, BS_DOTTED };
 typedef struct NodeStyle {
     uint8_t display, position, float_, clear, visibility, overflow_hidden, text_align, white_space;
     uint8_t deco, bold, italic, vertical_align, box_sizing, list_style, text_transform;
+    uint16_t weight;                            /* font-weight 100..900 (0 — не задан: bold ? 700 : 400); bold = weight >= 600 */
     uint8_t flex_dir, flex_wrap, justify, align_items, align_self, break_word, pointer, no_ring, center_blocks;
     uint8_t border_style[4];
     uint8_t has_z; int16_t z_index;
+    uint8_t sticky, sc_x, sc_y;                 /* position:sticky; overflow-x/y: auto|scroll (прокручиваемый контейнер) */
     float font_size, lh_px, lh_mult;
     float flex_grow, flex_shrink; Len flex_basis;
     Len width, height, min_w, max_w, min_h, max_h;

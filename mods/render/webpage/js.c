@@ -380,6 +380,17 @@ FN(d_rect) {
     if (n->idx >= 0) webpage_node_rect(n, r);
     JSValue a = JS_NewArray(c); JS_SetPropertyUint32(c, a, 0, JS_NewFloat64(c, r[0] - sx)); JS_SetPropertyUint32(c, a, 1, JS_NewFloat64(c, r[1] - sy)); JS_SetPropertyUint32(c, a, 2, JS_NewFloat64(c, r[2])); JS_SetPropertyUint32(c, a, 3, JS_NewFloat64(c, r[3])); return a;
 }
+/* прокрутка внутри элемента: [x, y, scrollW, scrollH, clientW, clientH] или [] для непрокручиваемого */
+FN(d_getScroll) {
+    Page* p = P(c); NODE(0); flush_all(p); JSValue a = JS_NewArray(c); float v[6];
+    if (n->idx >= 0 && webpage_elem_scroll_get(n, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5])) for (int i = 0; i < 6; i++) JS_SetPropertyUint32(c, a, (uint32_t)i, JS_NewFloat64(c, v[i]));
+    return a;
+}
+FN(d_setScroll) {
+    Page* p = P(c); NODE(0); flush_all(p); double x = 0, y = 0; JS_ToFloat64(c, &x, argv[1]); JS_ToFloat64(c, &y, argv[2]);
+    if (n->idx >= 0) { webpage_elem_scroll_set(n, (float)x, (float)y); mark_dirty(p); }
+    return JS_UNDEFINED;
+}
 static void css_color(char* out, size_t cap, uint32_t c) { unsigned a = c >> 24; if (a == 255) snprintf(out, cap, "rgb(%u, %u, %u)", (c >> 16) & 255, (c >> 8) & 255, c & 255); else snprintf(out, cap, "rgba(%u, %u, %u, %.3g)", (c >> 16) & 255, (c >> 8) & 255, c & 255, a / 255.0); }
 FN(d_computed) {
     Page* p = P(c); NODE(0); flush_all(p); const char* k = JS_ToCString(c, argv[1]); if (!k) return JS_EXCEPTION; const NodeStyle* st = &n->st; char v[128] = ""; float r[4] = {0, 0, 0, 0};
@@ -436,7 +447,11 @@ FN(d_fetchStart) {
     if (!method || !url) { if (method) JS_FreeCString(c, method); if (url) JS_FreeCString(c, url); if (headers) JS_FreeCString(c, headers); if (body) JS_FreeCString(c, body); return JS_NewInt32(c, -1); }
     char ab[1100]; webpage_resolve_url(p->url, url, ab, sizeof ab);
     int ok = 0; NalAsyncReq nr;
-    { const char* col = strchr(ab, ':'); const char* sl = strchr(ab, '/'); if (!(col && (!sl || col < sl) && strncmp(ab, "http", 4) != 0)) ok = nal_async_start(method, ab, headers, body, blen, &nr); }
+    /* политика одного источника и CORS: страница-инициатор, режим credentials (0 omit / 1 same-origin / 2 include) и mode (0 cors / 1 no-cors / 2 same-origin) от fetch/XHR */
+    NalFetchOpts fo; fo.page_url = p->url; fo.credentials = 1; fo.mode = 0;
+    if (argc > 4 && !JS_IsUndefined(argv[4])) fo.credentials = arg_int(c, argv[4]);
+    if (argc > 5 && !JS_IsUndefined(argv[5])) fo.mode = arg_int(c, argv[5]);
+    { const char* col = strchr(ab, ':'); const char* sl = strchr(ab, '/'); if (!(col && (!sl || col < sl) && strncmp(ab, "http", 4) != 0)) ok = nal_async_start_ex(method, ab, headers, body, blen, &fo, &nr); }
     JS_FreeCString(c, method); JS_FreeCString(c, url); if (headers) JS_FreeCString(c, headers); if (body) JS_FreeCString(c, body);
     if (!ok) return JS_NewInt32(c, -1);
     AReq* a = calloc(1, sizeof *a); a->id = ++p->next_areq; a->used = 1; a->nr = nr; a->next = p->areqs; p->areqs = a;
@@ -482,7 +497,7 @@ FN(d_lsClear) { Page* p = P(c); char origin[512]; page_origin(p, origin, sizeof 
 /* ── WebSocket (только ws://; wss:// отдаёт событие ошибки — нет TLS) ── */
 FN(d_wsConnect) {
     Page* p = P(c); const char* u = JS_ToCString(c, argv[0]); if (!u) return JS_NewInt32(c, -1);
-    WsConn wc; int ok = ws_start(u, &wc); JS_FreeCString(c, u);
+    WsConn wc; int ok = ws_start(u, P(c)->url, &wc); JS_FreeCString(c, u);
     if (!ok) return JS_NewInt32(c, -1);
     WConn* w = calloc(1, sizeof *w); w->id = ++p->next_wconn; w->used = 1; w->ws = wc; w->next = p->wconns; p->wconns = w;
     return JS_NewInt32(c, w->id);
@@ -644,7 +659,7 @@ FN(d_timerClear) {
 static const struct { const char* name; JSCFunction* fn; } DOMFN[] = {
     DEF(tag), DEF(type), DEF(parent), DEF(first), DEF(last), DEF(next), DEF(prev), DEF(children), DEF(create), DEF(createText), DEF(clone), DEF(insertBefore), DEF(remove),
     DEF(text), DEF(setText), DEF(innerHTML), DEF(outerHTML), DEF(setInnerHTML), DEF(insertHTML), DEF(attr), DEF(setAttr), DEF(removeAttr), DEF(attrNames), DEF(prop), DEF(setProp),
-    DEF(query), DEF(matches), DEF(closest), DEF(byId), DEF(root), DEF(special), DEF(rect), DEF(computed), DEF(mediaMatches), DEF(viewport), DEF(scrollTo),
+    DEF(query), DEF(matches), DEF(closest), DEF(byId), DEF(root), DEF(special), DEF(rect), DEF(computed), DEF(mediaMatches), DEF(viewport), DEF(scrollTo), DEF(getScroll), DEF(setScroll),
     DEF(title), DEF(setTitle), DEF(url), DEF(nav), DEF(setUrl), DEF(fetch), DEF(log), DEF(now), DEF(submit), DEF(focus), DEF(active), DEF(curScript), DEF(timerAdd), DEF(timerClear),
     DEF(fetchStart), DEF(fetchPoll), DEF(fetchCancel), DEF(lsList), DEF(lsSet), DEF(lsRemove), DEF(lsClear),
     DEF(wsConnect), DEF(wsPoll), DEF(wsSend), DEF(wsClose),
@@ -678,7 +693,7 @@ void* webpage_js_attach(DOMNode* head, const char* url, PageBundle* bundle) {
         JS_SetMemoryLimit(g_rt, 512u * 1024 * 1024); JS_SetMaxStackSize(g_rt, 2u * 1024 * 1024);
         JS_SetInterruptHandler(g_rt, interrupt_cb, NULL); JS_SetHostPromiseRejectionTracker(g_rt, rejection_cb, NULL); JS_SetModuleLoaderFunc(g_rt, mod_normalize, mod_load, NULL);
     }
-    Page* p = calloc(1, sizeof *p); p->head = head; p->bundle = bundle; snprintf(p->url, sizeof p->url, "%s", url ? url : ""); p->focus_id = p->active = -1;
+    Page* p = calloc(1, sizeof *p); p->head = head; p->bundle = bundle; snprintf(p->url, sizeof p->url, "%s", url ? url : ""); webpage_set_doc_url(p->url); p->focus_id = p->active = -1;
     p->ctx = JS_NewContext(g_rt); JS_SetContextOpaque(p->ctx, p);
     for (DOMNode* q = head; q; q = q->next) new_id(p, q);
     for (int i = 0; i < p->nn; i++) { DOMNode* q = p->nodes[i]; int par = q->parent; if (par >= 0 && par < p->nn) link_before(p, par, i, -1); }

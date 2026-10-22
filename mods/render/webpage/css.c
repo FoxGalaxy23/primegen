@@ -595,7 +595,7 @@ void css_parse_sheet(Arena* a, RuleSet* rs, const char* css, const char* sheet_u
                     char media[128] = ""; size_t ml = (size_t)(semi - q); if (ml > 127) ml = 127; memcpy(media, q, ml); media[ml] = 0;
                     if (url[0] && css_media_matches(media)) {
                         char abs[1200]; webpage_resolve_url(sheet_url, url, abs, sizeof abs);
-                        if (!strncmp(abs, "http", 4)) {
+                        if (!strncmp(abs, "http", 4) && !webpage_mixed_blocked(abs)) {
                             css_fetch_budget--; char* sub = nal_http_get(abs);
                             if (sub) { css_parse_sheet(a, rs, sub, abs, origin, depth + 1); free(sub); }
                         }

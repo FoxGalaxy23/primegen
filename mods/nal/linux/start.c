@@ -1,6 +1,10 @@
 #include "nal.h"
 #include "gal.h"
 #include "db.h"
+#include "nhttp.h"
+#include "ncors.h"
+#include "ntls.h"
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,17 +15,83 @@
 #include <fcntl.h>
 #include <signal.h>
 
+/* ── Сетевой слой ──
+   По умолчанию используется собственный HTTP/1.1-клиент (nhttp.c) и TLS через системный OpenSSL (ntls_openssl.c):
+   без запуска curl, с keep-alive, gzip/deflate, куки по RFC 6265 и проверкой сертификатов.
+   Старый путь через curl сохранён как запасной: он включается, если TLS-библиотека не найдена (для https)
+   либо задана переменная окружения MLBROWSER_NET=curl. */
+static int use_native(const char* url) {
+    const char* m = getenv("MLBROWSER_NET");
+    if (m && !strcmp(m, "curl")) return 0;
+    if (!strncasecmp(url, "http://", 7)) return 1;
+    if (!strncasecmp(url, "https://", 8)) return ntls_available();
+    return 0;
+}
+
+/* Куки профиля: БД → Netscape-файл → jar в памяти. После запроса в БД возвращаются только изменённые. */
+static NJar* jar_from_db(void) {
+    NJar* jar = njar_new(); if (!jar) return NULL;
+    mkdir("cache", 0777);
+    char tpl[] = "cache/cookies_in_XXXXXX"; int fd = mkstemp(tpl);
+    if (fd >= 0) { close(fd); db_export_cookies_to_file(active_profile_id, tpl); njar_load_netscape(jar, tpl); unlink(tpl); }
+    return jar;
+}
+static void jar_to_db(NJar* jar) {
+    mkdir("cache", 0777);
+    char tpl[] = "cache/cookies_out_XXXXXX"; int fd = mkstemp(tpl);
+    if (fd < 0) return;
+    close(fd);
+    if (njar_save_changed(jar, tpl) > 0) db_import_cookies_from_file(active_profile_id, tpl);
+    unlink(tpl);
+}
+
 int nal_init(void) {
-    // На Linux обычно ничего не нужно инициализировать для curl через system
+    if (!getenv("MLBROWSER_NO_CACHE")) nhttp_cache_config("cache/http", (size_t)256 << 20);       /* HTTP-кэш на диске, до 256 МиБ (LRU) */
     return 1;
 }
 
+void nal_cache_policy(int policy) { nhttp_cache_policy(policy); }
+void nal_cache_clear(void) { nhttp_cache_clear(); }
+
 void nal_close(void) {
-    // Ничего не требуется
+    nhttp_pool_clear();
 }
 
+static char* curl_http_get(const char* url);
+static int curl_download_file(const char* url, const char* dest_path);
+
 char* nal_http_get(const char* url) {
-    gal_log("INFO", "NAL: fetching URL (Linux): '%s'", url);
+    if (!use_native(url)) return curl_http_get(url);
+    gal_log("INFO", "NAL: fetching URL (native): '%s'", url);
+    NJar* jar = jar_from_db();
+    NHttpReq rq; memset(&rq, 0, sizeof rq); rq.url = url; rq.jar = jar;
+    NHttpResp rs;
+    if (!nhttp_perform(&rq, &rs)) {
+        gal_log("ERROR", "NAL: request failed: %s (%s)", rs.err, url);
+        nhttp_resp_free(&rs); njar_free(jar); return NULL;
+    }
+    if (rs.from_cache) gal_log("INFO", "NAL: %s из кэша: '%s'", rs.from_cache == 1 ? "свежая запись" : "подтверждено (304)", url);
+    if (jar) { jar_to_db(jar); njar_free(jar); }
+    char* body = (char*)rs.body; rs.body = NULL;               /* владение переходит вызывающему; тело всегда завершено '\0' */
+    nhttp_resp_free(&rs);
+    return body;
+}
+
+int nal_download_file(const char* url, const char* dest_path) {
+    if (!use_native(url)) return curl_download_file(url, dest_path);
+    gal_log("INFO", "NAL: downloading file (native): '%s' -> '%s'", url, dest_path);
+    FILE* f = fopen(dest_path, "wb"); if (!f) return 0;
+    NHttpReq rq; memset(&rq, 0, sizeof rq); rq.url = url; rq.sink = f; rq.timeout_ms = 120000;
+    NHttpResp rs; int ok = nhttp_perform(&rq, &rs);
+    fclose(f);
+    int good = ok && rs.status >= 200 && rs.status < 300;
+    if (!good) { gal_log("WARN", "NAL: download failed (%s): %s", url, ok ? "HTTP-статус не 2xx" : rs.err); unlink(dest_path); }
+    nhttp_resp_free(&rs);
+    return good;
+}
+
+static char* curl_http_get(const char* url) {
+    gal_log("INFO", "NAL: fetching URL (curl): '%s'", url);
 
     mkdir("cache", 0777);
 
@@ -97,8 +167,8 @@ char* nal_http_get(const char* url) {
     return buffer;
 }
 
-int nal_download_file(const char* url, const char* dest_path) {
-    gal_log("INFO", "NAL: downloading file (Linux): '%s' -> '%s'", url, dest_path);
+static int curl_download_file(const char* url, const char* dest_path) {
+    gal_log("INFO", "NAL: downloading file (curl): '%s' -> '%s'", url, dest_path);
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), "curl -s -L -A \"Mozilla/5.0\" -o \"%s\" \"%s\"", dest_path, url);
     int ret = system(cmd);
@@ -120,8 +190,36 @@ static void split_headers(const char* raw, char** argv, int* argc, int max) {
     free(save);
 }
 
+/* Тело потомка для асинхронного запроса (после fork): весь сетевой обмен делаем нативным клиентом и пишем результат в те же файлы,
+   что раньше писал curl. В файл заголовков идёт только финальный блок (редиректы уже пройдены), так что статус разбирается верно. */
+static int native_async_child(const char* method, const char* url, const char* headers_raw, const char* req_path,
+                              const char* cin, const char* cout, const char* hdr_path, const char* body_path, const NalFetchOpts* opts) {
+    unsigned char* body = NULL; size_t blen = 0;
+    if (req_path && req_path[0]) {
+        FILE* rf = fopen(req_path, "rb");
+        if (rf) { fseek(rf, 0, SEEK_END); long sz = ftell(rf); fseek(rf, 0, SEEK_SET); if (sz > 0) { body = malloc((size_t)sz); if (body) blen = fread(body, 1, (size_t)sz, rf); } fclose(rf); }
+    }
+    NJar* jar = njar_new(); if (jar && cin) njar_load_netscape(jar, cin);
+    NCorsReq cr; memset(&cr, 0, sizeof cr); cr.method = method; cr.url = url; cr.headers = headers_raw; cr.body = body; cr.body_len = blen; cr.jar = jar; cr.timeout_ms = 60000;
+    if (opts && opts->page_url) { cr.page_url = opts->page_url; cr.credentials = opts->credentials; cr.mode = opts->mode; }     /* запрос скрипта: SOP/CORS */
+    NHttpResp rs; int ok = ncors_fetch(&cr, &rs);
+    if (!ok && opts && opts->page_url) gal_log("WARN", "fetch заблокирован/не удался (%s → %s): %s", opts->page_url, url, rs.err);
+    if (ok) {
+        FILE* hf = fopen(hdr_path, "wb"); if (hf) { if (rs.headers) fputs(rs.headers, hf); fputs("\r\n", hf); fclose(hf); }
+        FILE* bf = fopen(body_path, "wb"); if (bf) { if (rs.body_len) fwrite(rs.body, 1, rs.body_len, bf); fclose(bf); }
+        if (jar && cout && cr.jar_used) njar_save_changed(jar, cout);                 /* куки сохраняем, только если политика разрешила их использовать */
+    }
+    nhttp_resp_free(&rs); njar_free(jar); free(body);
+    return ok ? 0 : 1;
+}
+
 int nal_async_start(const char* method, const char* url, const char* headers_raw, const char* body, size_t body_len, NalAsyncReq* out) {
+    return nal_async_start_ex(method, url, headers_raw, body, body_len, NULL, out);
+}
+
+int nal_async_start_ex(const char* method, const char* url, const char* headers_raw, const char* body, size_t body_len, const NalFetchOpts* opts, NalAsyncReq* out) {
     memset(out, 0, sizeof *out);
+    if (opts && opts->page_url && !use_native(url)) return 0;            /* политику CORS обеспечивает только собственный клиент — запасной curl для запросов скриптов не используем */
     mkdir("cache", 0777);
     char body_tpl[] = "cache/areq_b_XXXXXX", hdr_tpl[] = "cache/areq_h_XXXXXX", cin_tpl[] = "cache/areq_ci_XXXXXX", cout_tpl[] = "cache/areq_co_XXXXXX", req_tpl[] = "cache/areq_rq_XXXXXX";
     int bf = mkstemp(body_tpl); int hf = mkstemp(hdr_tpl); int cif = mkstemp(cin_tpl); int cof = mkstemp(cout_tpl);
@@ -136,6 +234,7 @@ int nal_async_start(const char* method, const char* url, const char* headers_raw
     if (pid < 0) { unlink(body_tpl); unlink(hdr_tpl); unlink(cin_tpl); unlink(cout_tpl); if (req_fd >= 0) unlink(req_tpl); return 0; }
     if (pid == 0) {
         int devnull = open("/dev/null", O_WRONLY); if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        if (use_native(url)) _exit(native_async_child(method, url, headers_raw, req_fd >= 0 ? req_tpl : NULL, cin_tpl, cout_tpl, hdr_tpl, body_tpl, opts));
         char* argv[64]; int ac = 0;
         argv[ac++] = "curl"; argv[ac++] = "-s"; argv[ac++] = "-L";
         argv[ac++] = "-A"; argv[ac++] = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";

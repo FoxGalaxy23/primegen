@@ -600,7 +600,9 @@ void execute_onclick(const char* cmd) {
     }
     else if (strcmp(cmd, "Browser.reload()") == 0) {
         if (active_tab_idx >= 0) {
+            nal_cache_policy(NAL_CACHE_RELOAD);              /* «Обновить» — страница и ресурсы проверяются заново, а не берутся из кэша */
             clean_and_load_url(active_tab_idx, tabs[active_tab_idx].url, 0);
+            nal_cache_policy(NAL_CACHE_NORMAL);
         }
     }
     else if (strcmp(cmd, "Browser.newTab()") == 0) {
@@ -1129,10 +1131,14 @@ int main(int argc, char** argv) {
             else if (ev.type == GAL_EVENT_MOUSE_SCROLL) {
 #ifdef HAVE_UI
                 if (ev.mouse_y >= top_offset) {
-                    page_scroll_x += ev.scroll_x;
-                    page_scroll_y += ev.scroll_y;
-                    clamp_page_scroll(top_offset);
-                    needs_redraw = 1;
+                    /* сначала пробуем прокрутить контейнер под курсором (overflow:auto|scroll); если он упёрся в край — страница */
+                    if (webpage_scroll_at(ev.mouse_x, ev.mouse_y, ev.scroll_x, ev.scroll_y)) { needs_redraw = 1; }
+                    else {
+                        page_scroll_x += ev.scroll_x;
+                        page_scroll_y += ev.scroll_y;
+                        clamp_page_scroll(top_offset);
+                        needs_redraw = 1;
+                    }
                 }
 #endif
             }

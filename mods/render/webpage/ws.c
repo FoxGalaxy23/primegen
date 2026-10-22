@@ -2,6 +2,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
+
+/* origin страницы-инициатора для заголовка Origin рукопожатия (задаётся в ws_start до fork) */
+static char g_ws_origin[320] = "null";
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -83,7 +88,7 @@ static void child_main(const char* url, int rfd_child_write, int wfd_child_read)
     unsigned char keyraw[16]; srand((unsigned)(time(NULL) ^ getpid())); for (int i = 0; i < 16; i++) keyraw[i] = (unsigned char)rand();
     char key[32]; b64_encode(keyraw, 16, key);
     char req[2048];
-    snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nOrigin: null\r\nUser-Agent: MeetlookersBrowser/1.0\r\n\r\n", path, host, key);
+    snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nOrigin: %s\r\nUser-Agent: MeetlookersBrowser/1.0\r\n\r\n", path, host, key, g_ws_origin);
     if (write(sock, req, strlen(req)) < 0) { close(sock); emit(rfd_child_write, 'E', NULL, 0); _exit(0); }
 
     char resp[4096]; size_t rn = 0; int handshake_ok = 0;
@@ -141,8 +146,18 @@ static void child_main(const char* url, int rfd_child_write, int wfd_child_read)
     close(sock); free(acc); _exit(0);
 }
 
-int ws_start(const char* url, WsConn* out) {
+/* origin страницы-инициатора для заголовка Origin рукопожатия ("null" для file:// и неизвестных схем) */
+static void ws_origin_of(const char* page, char* out, size_t cap) {
+    snprintf(out, cap, "null"); if (!page) return;
+    int https = !strncasecmp(page, "https://", 8); if (!https && strncasecmp(page, "http://", 7) != 0) return;
+    const char* h = page + (https ? 8 : 7); size_t n = strcspn(h, "/?#"); const char* at = memchr(h, '@', n); if (at) { n -= (size_t)(at + 1 - h); h = at + 1; }
+    if (!n || n + 12 > cap) return; snprintf(out, cap, "%s://%.*s", https ? "https" : "http", (int)n, h);
+    for (char* q = out; *q; q++) *q = (char)tolower((unsigned char)*q);
+}
+int ws_start(const char* url, const char* page_url, WsConn* out) {
     memset(out, 0, sizeof *out);
+    if (page_url && !strncasecmp(page_url, "https://", 8) && !strncasecmp(url, "ws://", 5) && strncasecmp(url + 5, "localhost", 9) && strncmp(url + 5, "127.", 4)) return 0;     /* смешанное содержимое */
+    ws_origin_of(page_url, g_ws_origin, sizeof g_ws_origin);
     int p2c[2], c2p[2];                                              /* p2c: родитель->ребёнок (команды); c2p: ребёнок->родитель (события) */
     if (pipe(p2c) < 0) return 0;
     if (pipe(c2p) < 0) { close(p2c[0]); close(p2c[1]); return 0; }

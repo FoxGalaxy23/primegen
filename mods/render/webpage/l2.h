@@ -6,11 +6,17 @@
 
 /* Раскладка порождает список команд отрисовки (display list) в координатах документа.
    Отрисовка (paint.c) применяет прокрутку и отсечение и не пересчитывает раскладку. */
-enum { C_BOX, C_RECT, C_TEXT, C_IMG, C_BGIMG, C_CTRL, C_CLIP, C_UNCLIP, C_HIT, C_MARK };
+enum { C_BOX, C_RECT, C_TEXT, C_IMG, C_BGIMG, C_CTRL, C_CLIP, C_UNCLIP, C_HIT, C_MARK,
+       C_STK, C_ENDSTK };   /* C_STK/C_ENDSTK — границы position:sticky-блока: между ними смещение считается при отрисовке */
+/* C_CLIP.flags: бит 1 — прокрутка по Y, бит 2 — по X (overflow:auto|scroll); ex = {scrollW, scrollH, maxX, maxY}, node = прокручиваемый элемент.
+   C_STK.flags: бит 1 — задан top, бит 2 — задан bottom; x,y,w,h — border-box элемента;
+   ex = {top, y_верха_контейнера, y_низа_контейнера, bottom} в координатах документа (контейнер — content-box родителя). */
+enum { CF_SCROLL_Y = 1, CF_SCROLL_X = 2, SF_TOP = 1, SF_BOTTOM = 2 };
 enum { F_NOLEFT = 1, F_NORIGHT = 2 };
 
 typedef struct {
-    uint8_t  t, fixed, flags, tstyle, deco;
+    uint8_t  t, fixed, flags, tstyle, deco, ital;
+    uint16_t weight;                /* C_TEXT: насыщенность и курсивность для выбора начертания веб-шрифта */
     float    x, y, w, h;
     DOMNode* node;          /* C_BOX/C_CTRL/C_IMG/C_HIT: узел; C_TEXT: владелец (для ссылок) */
     const char* s;          /* C_TEXT: строка; C_IMG/C_BGIMG: URL */
@@ -19,6 +25,7 @@ typedef struct {
     uint32_t color;         /* C_TEXT/C_RECT */
     float    rad;           /* C_RECT: радиус; C_IMG: см. node->st.radius */
     float    opacity;
+    float    ex[4];         /* доп. параметры для C_CLIP (прокрутка) и C_STK (sticky), см. выше */
 } Cmd;
 
 extern Cmd*  l2_dl;
@@ -30,6 +37,14 @@ extern int   l2_nrects;
 
 void l2_layout(DOMNode* head, int vw, int vh);   /* строит l2_dl */
 void l2_release(void);
+
+/* ── прокрутка внутри элементов (overflow:auto|scroll) ──
+   Состояние хранится по idx узла и переживает перерасчёт раскладки (пока не сменился документ). */
+int  l2_scroll_get(const DOMNode* n, float* x, float* y);            /* текущее (обрезанное по максимуму) смещение; 1 — элемент прокручиваемый */
+int  l2_scroll_max(const DOMNode* n, float* mx, float* my);          /* максимальное смещение по осям */
+int  l2_scroll_size(const DOMNode* n, float* sw, float* sh, float* cw, float* ch);   /* scrollWidth/Height и clientWidth/Height */
+void l2_scroll_set(const DOMNode* n, float x, float y);              /* абсолютное смещение (обрезается при применении) */
+void l2_scroll_offset_of_ancestors(const DOMNode* n, float* ox, float* oy);   /* сумма смещений прокручиваемых предков (без самого узла) */
 
 int  webpage_ctrl_default_size(DOMNode* n, float* w, float* h);   /* размер контента формы (для layout) */
 
