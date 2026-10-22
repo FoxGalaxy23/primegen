@@ -1,13 +1,12 @@
-# Meetlookers Browser Engine
+# Primegen Web Browser
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
 
-**Meetlookers** is a lightweight, modular browser engine written in C, designed with a microservices-like architecture. It features its own rendering pipeline, JavaScript execution environment, and platform abstraction layers.
+**Primegen** is a lightweight, modular browser engine written in C. It features its own rendering pipeline, JavaScript execution environment, and platform abstraction layers.
 
 ## 🚀 Key Features
 
-- **Microservices-inspired Architecture**: Every component is a self-contained module with its own manifest and build logic.
 - **Universal Build System**: Supports native Linux (X11/Wayland) and cross-compilation for Windows.
 - **Modular Abstraction Layers**:
   - **GAL (Graphic Abstraction Layer)**: Pluggable backends for X11, Wayland, and Win32.
