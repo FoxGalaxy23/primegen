@@ -285,6 +285,9 @@ static void add_sheet(PB* pb, char* css, char* href, const char* media) {
 
 int webpage_attr_get(const DOMNode* n, const char* name, char* out, size_t cap) {
     out[0] = 0;
+    /* Responsive image attributes may exceed the compact selector-attribute table. */
+    if (!strcmp(name, "srcset") && n->srcset[0]) { put_str(out, cap, n->srcset, strlen(n->srcset)); return 1; }
+    if (!strcmp(name, "sizes") && n->sizes[0]) { put_str(out, cap, n->sizes, strlen(n->sizes)); return 1; }
     size_t nl = strlen(name);
     const char* p = n->attrs;
     while (*p) {
@@ -355,10 +358,10 @@ static void apply_attrs(PB* pb, DOMNode* n, Attr* a, int na) {
             else { char dp[200]; if (webpage_data_uri_to_file(v, strlen(v), dp, sizeof dp)) put_str(n->src, sizeof n->src, dp, strlen(dp)); }      /* data: → локальный файл кэша */
         }
         else if (!strcmp(k, "data-src") || !strcmp(k, "data-lazy-src") || !strcmp(k, "data-original")) { if (!n->src[0] && !strcmp(tag, "img")) webpage_resolve_url(pb->base, v, n->src, sizeof n->src); }
-        else if (!strcmp(k, "srcset") && !strcmp(tag, "img") && !n->src[0]) {   /* берём первый URL из srcset */
-            char first[512]; size_t l = strcspn(v, " ,"); put_str(first, sizeof first, v, l);
-            webpage_resolve_url(pb->base, first, n->src, sizeof n->src);
-        }
+        else if (!strcmp(k, "srcset") && (!strcmp(tag, "img") || !strcmp(tag, "source")))
+            put_str(n->srcset, sizeof n->srcset, v, vl);
+        else if (!strcmp(k, "sizes") && (!strcmp(tag, "img") || !strcmp(tag, "source")))
+            put_str(n->sizes, sizeof n->sizes, v, vl);
         /* презентационные атрибуты */
         else if (!strcmp(k, "width")) { if (!is_cell || 1) pres_dim(n, "width", v); if (isdigit((unsigned char)*v) && !strchr(v, '%')) n->attr_w = atoi(v); }
         else if (!strcmp(k, "height")) { pres_dim(n, "height", v); if (isdigit((unsigned char)*v) && !strchr(v, '%')) n->attr_h = atoi(v); }
@@ -584,6 +587,234 @@ static void end_tag(PB* pb, const char* name) {
     else if (!strcmp(name, "form") || !strcmp(name, "p")) { /* пустой </p> игнорируем */ }
 }
 
+/* ── Responsive images: srcset/sizes/picture ─────────────────────────────── */
+typedef struct { char url[512]; float value; char unit; } SrcCandidate;
+
+static float viewport_width_px(void) { return SCREEN_WIDTH > 0 ? (float)SCREEN_WIDTH : 1024.0f; }
+static float viewport_height_px(void) { return SCREEN_HEIGHT > 0 ? (float)SCREEN_HEIGHT : 768.0f; }
+
+static int media_matches(const char *media) {
+    if (!media || !*media) return 1;
+    if (find_ci(media, "not all")) return 0;
+    if (find_ci(media, "print") && !find_ci(media, "screen")) return 0;
+    const char *p = media;
+    while ((p = strchr(p, '(')) != NULL) {
+        const char *end = strchr(p + 1, ')'); if (!end) break;
+        char q[128]; size_t n = (size_t)(end - p - 1); if (n >= sizeof q) n = sizeof q - 1;
+        memcpy(q, p + 1, n); q[n] = 0;
+        char *colon = strchr(q, ':');
+        if (colon) {
+            *colon++ = 0;
+            while (isspace((unsigned char)*q)) memmove(q, q + 1, strlen(q));
+            for (char *c = q; *c; ++c) *c = (char)tolower((unsigned char)*c);
+            while (isspace((unsigned char)*colon)) ++colon;
+            char *ep = NULL; double v = strtod(colon, &ep);
+            if (ep != colon) {
+                double px = v;
+                while (isspace((unsigned char)*ep)) ++ep;
+                if (!strncasecmp(ep, "em", 2) || !strncasecmp(ep, "rem", 3)) px = v * 16.0;
+                else if (!strncasecmp(ep, "vw", 2)) px = v * viewport_width_px() / 100.0;
+                else if (!strncasecmp(ep, "vh", 2)) px = v * viewport_height_px() / 100.0;
+                if (!strcmp(q, "min-width") && viewport_width_px() < px) return 0;
+                if (!strcmp(q, "max-width") && viewport_width_px() > px) return 0;
+                if (!strcmp(q, "min-height") && viewport_height_px() < px) return 0;
+                if (!strcmp(q, "max-height") && viewport_height_px() > px) return 0;
+            }
+            if (!strcmp(q, "orientation")) {
+                int landscape = viewport_width_px() >= viewport_height_px();
+                if (!strcasecmp(colon, "portrait") && landscape) return 0;
+                if (!strcasecmp(colon, "landscape") && !landscape) return 0;
+            }
+        }
+        p = end + 1;
+    }
+    return 1;
+}
+
+static int image_type_supported(const char *type) {
+    if (!type || !*type) return 1;
+    while (isspace((unsigned char)*type)) ++type;
+    char t[96]; snprintf(t, sizeof t, "%s", type);
+    char *semi = strchr(t, ';'); if (semi) *semi = 0;
+    for (char *c = t; *c; ++c) *c = (char)tolower((unsigned char)*c);
+    if (!strcmp(t, "image/avif")) {
+#ifdef HAVE_AVIF
+        return 1;
+#else
+        return 0;
+#endif
+    }
+    if (!strcmp(t, "image/webp")) {
+#ifdef HAVE_WEBP
+        return 1;
+#else
+        return 0;
+#endif
+    }
+    return !strcmp(t, "image/png") || !strcmp(t, "image/jpeg") || !strcmp(t, "image/jpg") ||
+           !strcmp(t, "image/gif") || !strcmp(t, "image/bmp") || !strcmp(t, "image/svg+xml");
+}
+
+static int image_url_supported(const char *url) {
+    if (!url || !*url) return 0;
+    if (!strncasecmp(url, "data:image/avif", 15)) {
+#ifdef HAVE_AVIF
+        return 1;
+#else
+        return 0;
+#endif
+    }
+    if (!strncasecmp(url, "data:image/webp", 15)) {
+#ifdef HAVE_WEBP
+        return 1;
+#else
+        return 0;
+#endif
+    }
+    if (!strncasecmp(url, "data:", 5)) return 1;
+    const char *end = url + strcspn(url, "?#");
+    const char *dot = end; while (dot > url && dot[-1] != '.' && dot[-1] != '/') --dot;
+    if (dot > url && dot[-1] == '.') {
+        size_t n = (size_t)(end - dot);
+        if ((n == 4 && !strncasecmp(dot, "avif", n))) {
+#ifdef HAVE_AVIF
+            return 1;
+#else
+            return 0;
+#endif
+        }
+        if (n == 4 && !strncasecmp(dot, "webp", n)) {
+#ifdef HAVE_WEBP
+            return 1;
+#else
+            return 0;
+#endif
+        }
+    }
+    return 1; /* неизвестный URL может получить формат по фактической сигнатуре файла */
+}
+
+static float css_length_px(const char *s, float fallback) {
+    while (isspace((unsigned char)*s)) ++s;
+    if (!*s) return fallback;
+    char *end = NULL; float v = strtof(s, &end); if (end == s || v <= 0) return fallback;
+    while (isspace((unsigned char)*end)) ++end;
+    if (!strncasecmp(end, "vw", 2)) return v * viewport_width_px() / 100.0f;
+    if (!strncasecmp(end, "vh", 2)) return v * viewport_height_px() / 100.0f;
+    if (!strncasecmp(end, "rem", 3) || !strncasecmp(end, "em", 2)) return v * 16.0f;
+    if (!*end || !strncasecmp(end, "px", 2)) return v;
+    return fallback;
+}
+
+static float sizes_slot_px(const char *sizes) {
+    if (!sizes || !*sizes) return viewport_width_px(); /* HTML default: 100vw */
+    const char *p = sizes;
+    while (*p) {
+        const char *comma = strchr(p, ','); size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len > 0 && len < 256) {
+            char item[256]; memcpy(item, p, len); item[len] = 0;
+            /* The final whitespace-delimited token is the slot length; preceding text is a media query. */
+            char *tail = item + strlen(item); while (tail > item && isspace((unsigned char)tail[-1])) --tail; *tail = 0;
+            char *lenstart = tail; while (lenstart > item && !isspace((unsigned char)lenstart[-1])) --lenstart;
+            if (lenstart > item) {
+                char *media_end = lenstart - 1; while (media_end > item && isspace((unsigned char)media_end[-1])) --media_end; *media_end = 0;
+                if (media_matches(item)) return css_length_px(lenstart, viewport_width_px());
+            } else return css_length_px(item, viewport_width_px());
+        }
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return viewport_width_px();
+}
+
+/* Parse the HTML srcset token pattern: URL, optional descriptor, comma. Keeping the URL token
+   intact until whitespace lets data: URLs retain their embedded comma. */
+static int srcset_parse(const char *srcset, SrcCandidate *out, int cap) {
+    int count = 0; const char *p = srcset;
+    while (p && *p && count < cap) {
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) ++p;
+        if (!*p) break;
+        const char *u = p; while (*p && !isspace((unsigned char)*p)) ++p;
+        const char *ue = p; while (ue > u && ue[-1] == ',') --ue;
+        if (ue == u) continue;
+        int trailing_comma = ue < p;
+        size_t un = (size_t)(ue - u); if (un >= sizeof out[count].url) { while (*p && *p != ',') ++p; if (*p) ++p; continue; }
+        memcpy(out[count].url, u, un); out[count].url[un] = 0;
+        out[count].value = 1.0f; out[count].unit = 'x';
+        if (trailing_comma) { /* URL ended with a delimiter; next token starts a new candidate. */
+            ++count; continue;
+        }
+        while (isspace((unsigned char)*p)) ++p;
+        const char *d = p; while (*p && *p != ',') ++p;
+        const char *de = p; while (de > d && isspace((unsigned char)de[-1])) --de;
+        if (de > d) {
+            char desc[64]; size_t dn = (size_t)(de - d); if (dn >= sizeof desc) dn = sizeof desc - 1;
+            memcpy(desc, d, dn); desc[dn] = 0;
+            char *ep = NULL; float val = strtof(desc, &ep);
+            if (ep != desc && val > 0 && (*ep == 'w' || *ep == 'x') && ep[1] == 0) { out[count].value = val; out[count].unit = *ep; }
+            else { while (isspace((unsigned char)*p)) ++p; if (*p == ',') ++p; continue; }
+        }
+        ++count;
+        if (*p == ',') ++p;
+    }
+    return count;
+}
+
+static int choose_srcset(const char *srcset, const char *sizes, char *out, size_t cap) {
+    SrcCandidate c[64]; int n = srcset_parse(srcset, c, (int)(sizeof c / sizeof c[0]));
+    if (n <= 0) return 0;
+    float slot = sizes_slot_px(sizes); if (slot < 1.0f) slot = viewport_width_px();
+    int best_above_idx = -1, max_idx = -1; float best_above = 1e30f, highest = -1.0f;
+    for (int i = 0; i < n; ++i) {
+        if (!image_url_supported(c[i].url)) continue;
+        float density = c[i].unit == 'w' ? c[i].value / slot : c[i].value;
+        if (density > highest) { highest = density; max_idx = i; }
+        if (density >= 1.0f && density < best_above) { best_above = density; best_above_idx = i; }
+    }
+    int best = best_above_idx >= 0 ? best_above_idx : max_idx;
+    if (best < 0) return 0;
+    snprintf(out, cap, "%s", c[best].url); return 1;
+}
+
+static void resolve_image_candidate(const char *base, const char *raw, char *out, size_t cap) {
+    out[0] = 0;
+    if (!raw || !*raw) return;
+    if (!strncasecmp(raw, "data:", 5)) {
+        char path[512]; if (webpage_data_uri_to_file(raw, strlen(raw), path, sizeof path)) snprintf(out, cap, "%s", path);
+    } else webpage_resolve_url(base, raw, out, cap);
+}
+
+static void select_responsive_images(PB *pb) {
+    for (int i = 0; i < pb->n; ++i) {
+        DOMNode *img = pb->v[i]; if (img->type != TAG_IMG) continue;
+        int selected = 0;
+        if (img->parent >= 0 && img->parent < pb->n && !strcmp(pb->v[img->parent]->tag, "picture")) {
+            int parent = img->parent;
+            for (int j = parent + 1; j < i; ++j) {
+                DOMNode *src = pb->v[j]; if (src->parent != parent || src->type != TAG_SOURCE) continue;
+                char media[160] = "", type[96] = "";
+                webpage_attr_get(src, "media", media, sizeof media);
+                webpage_attr_get(src, "type", type, sizeof type);
+                if (!media_matches(media) || !image_type_supported(type)) continue;
+                char raw[512] = "";
+                if (src->srcset[0]) choose_srcset(src->srcset, src->sizes, raw, sizeof raw);
+                if (!raw[0] && src->src[0]) snprintf(raw, sizeof raw, "%s", src->src);
+                if (!raw[0] || !image_url_supported(raw)) continue;
+                resolve_image_candidate(pb->base, raw, img->src, sizeof img->src);
+                if (img->src[0]) { selected = 1; break; }
+            }
+        }
+        if (selected) continue;
+        if (img->srcset[0]) {
+            char raw[512] = "";
+            if (choose_srcset(img->srcset, img->sizes, raw, sizeof raw)) {
+                char resolved[512]; resolve_image_candidate(pb->base, raw, resolved, sizeof resolved);
+                if (resolved[0]) snprintf(img->src, sizeof img->src, "%s", resolved);
+            }
+        }
+    }
+}
+
 DOMNode* html_build(const char* html, const char* base_url, SheetList* sheets) {
     PB pb; memset(&pb, 0, sizeof pb);
     pb.sheets = sheets; pb.head = pb.body = -1; pb.mode_head = 1;
@@ -645,9 +876,10 @@ DOMNode* html_build(const char* html, const char* base_url, SheetList* sheets) {
     }
     ensure_body(&pb);
 
-    /* связываем список, считаем subtree_end */
+    /* связываем список, считаем subtree_end и выбираем responsive-кандидаты до предзагрузки. */
     for (int i = 0; i + 1 < pb.n; i++) pb.v[i]->next = pb.v[i + 1];
     for (int i = pb.n - 1; i > 0; i--) { int par = pb.v[i]->parent; if (par >= 0 && pb.v[i]->subtree_end > pb.v[par]->subtree_end) pb.v[par]->subtree_end = pb.v[i]->subtree_end; }
+    select_responsive_images(&pb);
     DOMNode* head = pb.v[0];
     free(pb.v);
     return head;

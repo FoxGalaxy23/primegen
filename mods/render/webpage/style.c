@@ -2,6 +2,8 @@
 #include "css_int.h"
 #include "nal.h"
 #include "gal.h"
+#include "fx.h"
+#include "layout.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -43,6 +45,23 @@ static const char* UA_CSS =
 "fieldset{margin:0 2px;padding:.35em .75em .625em;border:2px groove #c0c0c0}legend{padding:0 2px}"
 "img{}iframe{border:2px inset #767676}"
 "noscript,[hidden]{display:none}";
+
+
+/* ══════════════ :hover / :active / :focus ══════════════ */
+static DOMNode* g_hover; static DOMNode* g_active; static int g_dyn_pending, g_uses_dyn;
+int webpage_uses_dyn(void) { return g_uses_dyn; }
+void webpage_set_hover(DOMNode* n) { if (n == g_hover) return; g_hover = n; if (g_uses_dyn) g_dyn_pending = 1; }
+void webpage_set_active(DOMNode* n) { if (n == g_active) return; g_active = n; if (g_uses_dyn) g_dyn_pending = 1; }
+DOMNode* webpage_hover_node(void) { return g_hover; }
+DOMNode* webpage_active_node(void) { return g_active; }
+int  webpage_dyn_pending(void) { return g_dyn_pending; }
+void webpage_dyn_clear_pending(void) { g_dyn_pending = 0; }
+int webpage_dyn_match(int kind, const DOMNode* n) {
+    const DOMNode* t = kind == PC_HOVER ? g_hover : kind == PC_ACTIVE ? g_active : focused_node;
+    if (!t || t->idx < 0) return 0;
+    if (kind == PC_FOCUS) return t == n;
+    return n->idx <= t->idx && t->idx <= n->subtree_end;
+}
 
 /* ══════════════ индекс правил ══════════════ */
 typedef struct HB { char* key; Rule** v; int n, cap; struct HB* next; } HB;
@@ -154,6 +173,7 @@ static int match_simple(Doc* d, DOMNode* n, Simple* s) {
             case PC_CHECKED: ok = n->checked || n->selected; break;
             case PC_DISABLED: ok = n->disabled; break;
             case PC_ENABLED: ok = !n->disabled && (n->type == TAG_INPUT || n->type == TAG_BUTTON || n->type == TAG_SELECT || n->type == TAG_TEXTAREA); break;
+            case PC_HOVER: case PC_ACTIVE: case PC_FOCUS: case PC_FOCUS_WITHIN: ok = webpage_dyn_match(s->pc[i], n); break;
             default: ok = 0; break;
         }
         if (!ok) return 0;
@@ -341,18 +361,7 @@ static void parse_bg(Cx* c, NodeStyle* st, const char* v, int full) {
     if (st->bg_w.set || st->bg_h.set) st->bg_size_mode = 3;
 }
 
-/* transform: translate()/translateX()/translateY() — остальное (rotate/scale/matrix) не поддерживается */
-static void set_transform(Cx* c, NodeStyle* st, const char* val) {
-    st->tr_x.set = st->tr_y.set = 0;
-    const char* p = strcasestr(val, "translate"); if (!p) return;
-    const char* op = strchr(p, '('); if (!op) return;
-    char args[128]; const char* q = op + 1; size_t k = 0; while (*q && *q != ')' && k < 127) args[k++] = *q++; args[k] = 0;
-    int isX = !strncasecmp(p, "translatex", 10), isY = !strncasecmp(p, "translatey", 10);
-    char* comma = strchr(args, ','); if (comma) *comma = 0;
-    char tkx[64]; const char* pp = args;
-    if (tok_next(&pp, tkx, sizeof tkx)) { Len l; if (len_of(c, tkx, &l)) { if (isY) st->tr_y = l; else st->tr_x = l; } }
-    if (comma && !isX && !isY) { pp = comma + 1; if (tok_next(&pp, tkx, sizeof tkx)) { Len l; if (len_of(c, tkx, &l)) st->tr_y = l; } }
-}
+#include "style_fx.inc"
 
 static void set_family(DOMNode* n, const char* v) { snprintf(n->font_family, sizeof n->font_family, "%s", v); }
 
@@ -587,7 +596,39 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
     case P_BOX_SHADOW: parse_shadow(c, st, val); return;
     case P_BG_CLIP: st->bg_clip_text = strcasestr(val, "text") != NULL; return;
     case P_TEXT_FILL: if (strcasecmp(val, "transparent") && col_of(c, val, &col)) st->color = col; return;
-    case P_TRANSFORM: set_transform(c, st, val); return;
+    case P_TRANSFORM: st->tr_x.set = st->tr_y.set = 0; parse_xform(c, &st->xf, val); return;
+    case P_TRANSFORM_ORIGIN: parse_xform_origin(c, &st->xf, val); return;
+    case P_FILTER: parse_filter_list(c, &st->filter, val); return;
+    case P_BACKDROP_FILTER: parse_filter_list(c, &st->backdrop, val); return;
+    case P_CLIP_PATH: parse_clip_path(c, &st->clip, val); return;
+    case P_MASK: parse_mask_short(c, &st->mask, val); return;
+    case P_MASK_IMAGE: { if (!strncasecmp(val, "none", 4)) { st->mask.kind = MK_NONE; return; } const char* mp = val; char mt[16384]; if (tok_next(&mp, mt, sizeof mt)) { FxMask* m = &st->mask; uint8_t keepk = m->kind; m->kind = MK_NONE; parse_mask_image(c, m, mt); if (!m->kind) m->kind = keepk == MK_NONE ? MK_NONE : keepk; } return; }
+    case P_MASK_SIZE: parse_mask_pos_size(c, &st->mask, val, 1); return;
+    case P_MASK_POS: parse_mask_pos_size(c, &st->mask, val, 0); return;
+    case P_MASK_REPEAT: parse_mask_repeat(&st->mask, val); return;
+    case P_TRANSITION: parse_transition_short(c, st, val); return;
+    case P_TRANSITION_PROPERTY: parse_transition_list(c, st, 0, val); return;
+    case P_TRANSITION_DURATION: parse_transition_list(c, st, 1, val); return;
+    case P_TRANSITION_DELAY: parse_transition_list(c, st, 2, val); return;
+    case P_TRANSITION_TIMING: parse_transition_list(c, st, 3, val); return;
+    case P_ANIMATION: parse_animation_short(c, st, val); return;
+    case P_ANIMATION_NAME: case P_ANIMATION_DURATION: case P_ANIMATION_DELAY: case P_ANIMATION_TIMING: case P_ANIMATION_ITER:
+    case P_ANIMATION_DIR: case P_ANIMATION_FILL: case P_ANIMATION_PLAY: parse_animation_list(c, st, prop, val); return;
+    case P_GRID_ROWS: if (!strncasecmp(val, "none", 4)) st->grid_rows[0] = 0; else copy_trim(st->grid_rows, sizeof st->grid_rows, val); return;
+    case P_GRID_AUTO_ROWS: copy_trim(st->grid_auto_r, sizeof st->grid_auto_r, val); return;
+    case P_GRID_AUTO_COLS: copy_trim(st->grid_auto_c, sizeof st->grid_auto_c, val); return;
+    case P_GRID_AUTO_FLOW: st->grid_flow = (uint8_t)((strcasestr(val, "column") ? 1 : 0) | (strcasestr(val, "dense") ? 2 : 0)); return;
+    case P_GRID_ROW: grid_line_pair(val, st->grid_row_s, sizeof st->grid_row_s, st->grid_row_e, sizeof st->grid_row_e); return;
+    case P_GRID_ROW_START: copy_trim(st->grid_row_s, sizeof st->grid_row_s, val); return;
+    case P_GRID_ROW_END: copy_trim(st->grid_row_e, sizeof st->grid_row_e, val); return;
+    case P_GRID_COL_START: copy_trim(st->grid_col_s, sizeof st->grid_col_s, val); return;
+    case P_GRID_COL_END: copy_trim(st->grid_col_e, sizeof st->grid_col_e, val); return;
+    case P_JUSTIFY_ITEMS: st->justify_items = (uint8_t)ai_of(val, AI_STRETCH); return;
+    case P_JUSTIFY_SELF: st->justify_self = (uint8_t)ai_of(val, AI_AUTO); return;
+    case P_ALIGN_CONTENT: st->align_content = (uint8_t)jc_of(val); return;
+    case P_PLACE_ITEMS: case P_PLACE_SELF: { const char* pp = val; char a1[48], a2[48]; if (!tok_next(&pp, a1, sizeof a1)) return; if (!tok_next(&pp, a2, sizeof a2)) snprintf(a2, sizeof a2, "%s", a1);
+        if (prop == P_PLACE_ITEMS) { st->align_items = (uint8_t)ai_of(a1, AI_STRETCH); st->justify_items = (uint8_t)ai_of(a2, AI_STRETCH); } else { st->align_self = (uint8_t)ai_of(a1, AI_AUTO); st->justify_self = (uint8_t)ai_of(a2, AI_AUTO); } return; }
+    case P_PLACE_CONTENT: { const char* pp = val; char a1[48], a2[48]; if (!tok_next(&pp, a1, sizeof a1)) return; if (!tok_next(&pp, a2, sizeof a2)) snprintf(a2, sizeof a2, "%s", a1); st->align_content = (uint8_t)jc_of(a1); st->justify = (uint8_t)jc_of(a2); return; }
     case P_CONTENT: if (c->content) parse_content(c, val); return;
     case P_LIST_STYLE: case P_LIST_STYLE_TYPE: {
         const char* p = val; while (tok_next(&p, tk, sizeof tk)) {
@@ -618,10 +659,21 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
         if (prop == P_ALIGN_ITEMS) st->align_items = (uint8_t)a; else st->align_self = (uint8_t)a; return; }
     case P_GAP: { const char* p = val; Len a, b; int k = 0; while (k < 2 && tok_next(&p, tk, sizeof tk)) { if (!len_of(c, tk, k ? &b : &a)) return; k++; } if (!k) return; st->gap_r = px_of(&a, 0); st->gap_c = k > 1 ? px_of(&b, 0) : st->gap_r; return; }
     case P_GRID_COLS: if (!strncasecmp(val, "none", 4)) st->grid_cols[0] = 0; else snprintf(st->grid_cols, sizeof st->grid_cols, "%s", val); return;
-    case P_GRID_TEMPLATE: {                                          /* шорткат "строки / колонки"; строки (со списком имён областей в кавычках) идут в grid-template-areas */
+    case P_GRID_TEMPLATE: {                                          /* шорткат «строки / колонки»; строки с именами областей в кавычках идут и в grid-template-areas */
         const char* sl = strrchr(val, '/');
         if (sl) { const char* p2 = sl + 1; while (isspace((unsigned char)*p2)) p2++; snprintf(st->grid_cols, sizeof st->grid_cols, "%s", p2); }
-        if (strchr(val, '\'')) apply(c, n, st, P_GRID_AREAS, val, size_pass);
+        size_t hl = sl ? (size_t)(sl - val) : strlen(val); char head[400]; if (hl > 399) hl = 399; memcpy(head, val, hl); head[hl] = 0;
+        if (strchr(head, '\'') || strchr(head, '"')) {
+            apply(c, n, st, P_GRID_AREAS, head, size_pass);
+            char rows[160]; size_t ro = 0; rows[0] = 0; const char* q = head; int expect = 0;     /* после строки-области может идти размер ряда */
+            while (*q) {
+                while (isspace((unsigned char)*q)) q++; if (!*q) break;
+                if (*q == '\'' || *q == '"') { if (expect && ro + 6 < sizeof rows) { memcpy(rows + ro, "auto ", 5); ro += 5; } char qc = *q++; while (*q && *q != qc) q++; if (*q) q++; expect = 1; continue; }
+                const char* e = q; int d = 0; while (*e && (d > 0 || !isspace((unsigned char)*e)) && *e != '\'' && *e != '"') { if (*e == '(') d++; else if (*e == ')') d--; e++; }
+                size_t tl = (size_t)(e - q); if (tl && ro + tl + 2 < sizeof rows) { memcpy(rows + ro, q, tl); ro += tl; rows[ro++] = ' '; } expect = 0; q = e ? e : q + 1; if (e == q && !*q) break;
+            }
+            if (expect && ro + 5 < sizeof rows) { memcpy(rows + ro, "auto ", 5); ro += 5; } rows[ro] = 0; copy_trim(st->grid_rows, sizeof st->grid_rows, rows);
+        } else if (sl && !strncasecmp(head, "none", 4) == 0) copy_trim(st->grid_rows, sizeof st->grid_rows, head);
         return;
     }
     case P_GRID_AREAS: {                                             /* 'a a' 'b c' -> "a a\nb c" (без кавычек, по одной строке на ряд) */
@@ -638,16 +690,62 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
         }
         return;
     }
-    case P_GRID_AREA: { const char* p2 = val; while (isspace((unsigned char)*p2)) p2++; char* e = st->grid_area_name; size_t i = 0; while (p2[i] && !isspace((unsigned char)p2[i]) && p2[i] != '/' && i < sizeof st->grid_area_name - 1) { e[i] = p2[i]; i++; } e[i] = 0; return; }
+    case P_GRID_AREA: {
+        if (strchr(val, '/')) {                                       /* row-start / col-start / row-end / col-end */
+            char part[4][256]; int k = split_slash4(val, part);
+            copy_trim(st->grid_row_s, sizeof st->grid_row_s, part[0]); copy_trim(st->grid_col_s, sizeof st->grid_col_s, k > 1 ? part[1] : part[0]);
+            copy_trim(st->grid_row_e, sizeof st->grid_row_e, k > 2 ? part[2] : (k > 1 ? "" : part[0])); copy_trim(st->grid_col_e, sizeof st->grid_col_e, k > 3 ? part[3] : (k > 2 ? "" : (k > 1 ? "" : part[0])));
+            return;
+        }
+        const char* p2 = val; while (isspace((unsigned char)*p2)) p2++; char* e = st->grid_area_name; size_t i = 0; while (p2[i] && !isspace((unsigned char)p2[i]) && i < sizeof st->grid_area_name - 1) { e[i] = p2[i]; i++; } e[i] = 0; return; }
     case P_GRID_COLUMN: {
+        grid_line_pair(val, st->grid_col_s, sizeof st->grid_col_s, st->grid_col_e, sizeof st->grid_col_e);
         const char* sp = strcasestr(val, "span");
-        if (sp) { int n = atoi(sp + 4); st->grid_span = (uint8_t)(n > 0 && n < 100 ? n : 1); }
-        else { const char* sl = strchr(val, '/'); if (sl) { int a = atoi(val), b = atoi(sl + 1); st->grid_span = (uint8_t)(b < 0 ? 99 : (b > a ? b - a : 1)); } else st->grid_span = 1; }
+        if (sp) { int n2 = atoi(sp + 4); st->grid_span = (uint8_t)(n2 > 0 && n2 < 100 ? n2 : 1); }
+        else { const char* sl = strchr(val, '/'); if (sl) { int a2 = atoi(val), b2 = atoi(sl + 1); st->grid_span = (uint8_t)(b2 < 0 ? 99 : (b2 > a2 ? b2 - a2 : 1)); } else st->grid_span = 1; }
         return; }
     case P_ROW_GAP: if (len_of(c, val, &l)) st->gap_r = px_of(&l, 0); return; case P_COL_GAP: if (len_of(c, val, &l)) st->gap_c = px_of(&l, 0); return;
     default: return;
     }
     (void)set_margin_auto;
+}
+
+
+/* свойство-декларация → биты анимируемых свойств */
+static uint64_t decl_ap_mask(int prop) {
+    switch (prop) {
+    case P_OPACITY: return APM(AP_OPACITY); case P_COLOR: return APM(AP_COLOR); case P_BG_COLOR: return APM(AP_BG);
+    case P_BACKGROUND: return APM(AP_BG) | APM(AP_GRAD) | APM(AP_BGPOS); case P_BG_IMAGE: return APM(AP_GRAD); case P_BG_POS: return APM(AP_BGPOS);
+    case P_BORDER_COLOR: case P_BORDER: return APM(AP_BC0) | APM(AP_BC1) | APM(AP_BC2) | APM(AP_BC3) | (prop == P_BORDER ? APM(AP_BW0) | APM(AP_BW1) | APM(AP_BW2) | APM(AP_BW3) : 0);
+    case P_BC_T: return APM(AP_BC0); case P_BC_R: return APM(AP_BC1); case P_BC_B: return APM(AP_BC2); case P_BC_L: return APM(AP_BC3);
+    case P_BORDER_T: return APM(AP_BC0) | APM(AP_BW0); case P_BORDER_R: return APM(AP_BC1) | APM(AP_BW1); case P_BORDER_B: return APM(AP_BC2) | APM(AP_BW2); case P_BORDER_L: return APM(AP_BC3) | APM(AP_BW3);
+    case P_BORDER_WIDTH: return APM(AP_BW0) | APM(AP_BW1) | APM(AP_BW2) | APM(AP_BW3);
+    case P_BW_T: return APM(AP_BW0); case P_BW_R: return APM(AP_BW1); case P_BW_B: return APM(AP_BW2); case P_BW_L: return APM(AP_BW3);
+    case P_WIDTH: return APM(AP_WIDTH); case P_HEIGHT: return APM(AP_HEIGHT); case P_MIN_W: return APM(AP_MINW); case P_MAX_W: return APM(AP_MAXW); case P_MIN_H: return APM(AP_MINH); case P_MAX_H: return APM(AP_MAXH);
+    case P_MARGIN: return APM(AP_MG0) | APM(AP_MG1) | APM(AP_MG2) | APM(AP_MG3); case P_MARGIN_T: return APM(AP_MG0); case P_MARGIN_R: return APM(AP_MG1); case P_MARGIN_B: return APM(AP_MG2); case P_MARGIN_L: return APM(AP_MG3);
+    case P_PADDING: return APM(AP_PD0) | APM(AP_PD1) | APM(AP_PD2) | APM(AP_PD3); case P_PADDING_T: return APM(AP_PD0); case P_PADDING_R: return APM(AP_PD1); case P_PADDING_B: return APM(AP_PD2); case P_PADDING_L: return APM(AP_PD3);
+    case P_INSET: return APM(AP_IN0) | APM(AP_IN1) | APM(AP_IN2) | APM(AP_IN3); case P_TOP: return APM(AP_IN0); case P_RIGHT: return APM(AP_IN1); case P_BOTTOM: return APM(AP_IN2); case P_LEFT: return APM(AP_IN3);
+    case P_BORDER_RADIUS: return APM(AP_RAD0) | APM(AP_RAD1) | APM(AP_RAD2) | APM(AP_RAD3); case P_BR_TL: return APM(AP_RAD0); case P_BR_TR: return APM(AP_RAD1); case P_BR_BR: return APM(AP_RAD2); case P_BR_BL: return APM(AP_RAD3);
+    case P_FONT_SIZE: return APM(AP_FONTSZ); case P_LINE_HEIGHT: return APM(AP_LH); case P_BOX_SHADOW: return APM(AP_SHADOW); case P_FLEX_GROW: return APM(AP_FLEXG);
+    case P_GAP: return APM(AP_GAPR) | APM(AP_GAPC); case P_ROW_GAP: return APM(AP_GAPR); case P_COL_GAP: return APM(AP_GAPC);
+    case P_FILTER: return APM(AP_FILTER); case P_BACKDROP_FILTER: return APM(AP_BACKDROP); case P_CLIP_PATH: return APM(AP_CLIP);
+    case P_TRANSFORM: return APM(AP_XFORM); case P_TRANSFORM_ORIGIN: return APM(AP_ORIGIN);
+    default: return 0;
+    }
+}
+
+/* Стиль ключевого кадра: стиль узла + декларации кадра (для анимации) */
+static uint64_t kf_build(void* ctx, DOMNode* n, const Decl* decls, int nd, NodeStyle* out, float root_fs) {
+    Doc* d = ctx; DOMNode* pa = par(d, n); Cx cx; memset(&cx, 0, sizeof cx);
+    cx.parent = pa; cx.pfs = pa ? pa->st.font_size : 16; cx.rem = root_fs; cx.owner = n; CP* cps = d->cps ? d->cps[n->idx] : NULL; char resolved[1024];
+    uint64_t mask = 0;
+    for (int pass = 0; pass < 2; pass++) for (int i = 0; i < nd; i++) {
+        const Decl* dc = &decls[i]; if (pass == 1) mask |= decl_ap_mask(dc->prop); if (dc->prop == P_CUSTOM || dc->prop == P_FONT_FAMILY || dc->prop == P_FONT || dc->prop == P_CONTENT) continue;
+        const char* v = dc->val; if (strstr(v, "var(")) { if (!resolve_vars(cps, v, resolved, sizeof resolved, 0)) continue; v = resolved; }
+        cx.em = pass == 0 ? cx.pfs : out->font_size; cx.cur = out->color;
+        apply(&cx, n, out, dc->prop, v, pass == 0);
+    }
+    return mask;
 }
 
 /* ══════════════ каскад ══════════════ */
@@ -668,7 +766,7 @@ static void init_style(DOMNode* n, DOMNode* pa) {
     for (int i = 0; i < 4; i++) { st->border_w[i] = 3; st->border_c[i] = CUR_COLOR; }
     st->sh_color = 0; st->list_style = LS_DISC; st->align_self = AI_AUTO;
     for (int i = 0; i < 4; i++) { st->margin[i].set = 1; st->padding[i].set = 1; }
-    st->grid_span = 1;
+    st->grid_span = 1; st->justify_self = AI_AUTO; st->xf.ox.pct = st->xf.oy.pct = 50;
     if (pa) {
         const NodeStyle* ps = &pa->st;
         st->color = ps->color; st->font_size = ps->font_size; st->lh_px = ps->lh_px; st->lh_mult = ps->lh_mult; st->bold = ps->bold; st->weight = ps->weight; st->italic = ps->italic;
@@ -741,6 +839,7 @@ static void finish_style(DOMNode* n, DOMNode* pa) {
     }
     if ((st->sh_color & 0xFF000000u) == 0x01000000u) st->sh_color = st->color;
     if (st->bg_url[0] && strncmp(st->bg_url, "data:", 5) != 0 && strncmp(st->bg_url, "cache/data_", 11) != 0) { char ab[512]; webpage_resolve_url(g_base, st->bg_url, ab, sizeof ab); snprintf(st->bg_url, sizeof st->bg_url, "%s", ab); }
+    st->op_own = st->opacity; st->has_fx = (uint8_t)fx_style_has_fx(st);
     if (pa) { st->opacity *= pa->st.opacity; if (st->display == DSP_INLINE_BLOCK || st->float_ || st->position >= POS_ABSOLUTE) st->deco = st->deco & 0; if (pa->st.deco && st->display != DSP_INLINE_BLOCK && !st->float_ && st->position < POS_ABSOLUTE) st->deco |= pa->st.deco; }
 }
 
@@ -773,6 +872,7 @@ static int pseudo_capable(const DOMNode* n) {
 static void cascade_node(Doc* d, RIndex* ix, RuleSet* rs, DOMNode* n, float root_fs) {
     (void)rs;
     DOMNode* pa = par(d, n);
+    anim_before_node(n);
     dom_free_pseudo(n);
     init_style(n, pa);
     d->cps[n->idx] = pa ? d->cps[pa->idx] : NULL;
@@ -798,7 +898,7 @@ void style_apply(DOMNode* head, SheetList* sheets, const char* base_url) {
     Arena A = {0}; RuleSet rs = {0}; RIndex ix; memset(&ix, 0, sizeof ix);
     css_fetch_budget = g_style_offline ? 0 : 12; g_base = base_url; webpage_set_doc_url(base_url);
     css_parse_sheet(&A, &rs, UA_CSS, NULL, 0, 0);
-    int nsheet = 0;
+    css_dyn_seen = 0; int nsheet = 0;
     for (int i = 0; i < sheets->n; i++) {
         SheetSrc* s = &sheets->v[i];
         if (!css_media_matches(s->media)) continue;
@@ -808,7 +908,7 @@ void style_apply(DOMNode* head, SheetList* sheets, const char* base_url) {
         }
         if (s->css) css_parse_sheet(&A, &rs, s->css, s->href ? s->href : base_url, 2, 0);
     }
-    index_rules(&ix, &rs);
+    index_rules(&ix, &rs); g_uses_dyn = css_dyn_seen;
 
     int n = 0; for (DOMNode* p = head; p; p = p->next) n++;
     Doc d; d.n = n; d.nv = malloc((size_t)n * sizeof(DOMNode*)); d.prev = malloc((size_t)n * sizeof(int));
@@ -823,6 +923,9 @@ void style_apply(DOMNode* head, SheetList* sheets, const char* base_url) {
         d.ecnt[p->parent]++; d.eidx[i] = d.ecnt[p->parent];
     }
     free(lastel);
+    if (g_hover && (g_hover->idx < 0 || g_hover->idx >= n || d.nv[g_hover->idx] != g_hover)) g_hover = NULL;
+    if (g_active && (g_active->idx < 0 || g_active->idx >= n || d.nv[g_active->idx] != g_active)) g_active = NULL;
+    anim_cascade_begin(head, n, rs.has_trans);
 
     float root_fs = 16;
     for (int i = 0; i < n;) {
@@ -832,6 +935,7 @@ void style_apply(DOMNode* head, SheetList* sheets, const char* base_url) {
         if (p->type != TAG_TEXT && p->st.display == DSP_NONE) { i = p->subtree_end + 1; continue; }   /* поддерево скрыто */
         i++;
     }
+    anim_cascade_end(d.nv, n, rs.kf, root_fs, kf_build, &d);
     /* освобождаем CP-цепочки (узлы, аллоцированные malloc) */
     for (int i = 0; i < n; i++) {
         CP* c = d.cps[i]; DOMNode* pa = d.nv[i]->parent >= 0 ? d.nv[d.nv[i]->parent] : NULL; CP* stop = pa ? d.cps[pa->idx] : NULL;

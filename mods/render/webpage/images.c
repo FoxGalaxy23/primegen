@@ -1,5 +1,5 @@
-/* Картинки: путь в кэше, параллельная предзагрузка (в дочернем процессе загрузки страницы),
-   декодирование (stb_image: PNG/JPEG/GIF/BMP) и масштабирование с кэшем. */
+/* Картинки: путь в кэше, параллельная предзагрузка, декодирование stb_image +
+   optional libwebp/libavif и масштабирование с кэшем. */
 #define _GNU_SOURCE
 #include "webpage.h"
 #include "nal.h"
@@ -31,12 +31,23 @@
 #ifdef HAVE_WEBP
 #include <webp/decode.h>
 #endif
+#ifdef HAVE_AVIF
+#include <avif/avif.h>
+#endif
 
 static unsigned long long fnv(const char* s) { unsigned long long h = 1469598103934665603ULL; for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; } return h; }
 
 /* stb_image не декодирует WebP; большинство сайтов (в т.ч. Wikipedia) отдают им почти все картинки.
    Раз сигнатура RIFF....WEBP — декодируем через libwebp, возвращаем RGBA-буфер того же вида, что и stbi_load. */
 static int is_webp(const unsigned char* m, size_t n) { return n >= 12 && !memcmp(m, "RIFF", 4) && !memcmp(m + 8, "WEBP", 4); }
+static int is_avif(const unsigned char* m, size_t n) {
+    if (n < 16 || memcmp(m + 4, "ftyp", 4)) return 0;
+    /* ISO BMFF major brand + compatible brands (e.g. avif/avis). */
+    size_t lim = n < 80 ? n : 80;
+    for (size_t i = 8; i + 4 <= lim; i += 4)
+        if (!memcmp(m + i, "avif", 4) || !memcmp(m + i, "avis", 4)) return 1;
+    return 0;
+}
 #ifdef HAVE_WEBP
 static unsigned char* load_webp(const char* path, int* w, int* h) {
     FILE* f = fopen(path, "rb"); if (!f) return NULL;
@@ -50,6 +61,57 @@ static unsigned char* load_webp(const char* path, int* w, int* h) {
 }
 #endif
 
+#ifdef HAVE_AVIF
+/* Возвращает компактный RGBA8-буфер, совместимый с дальнейшим путём обработки stb_image. */
+static unsigned char* load_avif(const char* path, int* w, int* h) {
+    avifDecoder* decoder = avifDecoderCreate();
+    if (!decoder) return NULL;
+    decoder->maxThreads = 2;
+    decoder->imageSizeLimit = 40000000u;
+    decoder->imageDimensionLimit = 16384u;
+    decoder->imageCountLimit = 16u;
+    unsigned char* out = NULL;
+    avifResult rc = avifDecoderSetSource(decoder, AVIF_DECODER_SOURCE_PRIMARY_ITEM);
+    if (rc == AVIF_RESULT_OK) rc = avifDecoderSetIOFile(decoder, path);
+    if (rc == AVIF_RESULT_OK) rc = avifDecoderParse(decoder);
+    if (rc == AVIF_RESULT_OK) rc = avifDecoderNextImage(decoder);
+    avifImage* image = decoder->image;
+    if (rc == AVIF_RESULT_OK && image && image->width && image->height &&
+        (uint64_t)image->width * (uint64_t)image->height <= 40000000ull) {
+        avifRGBImage rgb;
+        avifRGBImageSetDefaults(&rgb, image);
+        rgb.format = AVIF_RGB_FORMAT_RGBA;
+        rgb.depth = 8;
+        rgb.maxThreads = 2;
+        if (avifRGBImageAllocatePixels(&rgb) == AVIF_RESULT_OK &&
+            avifImageYUVToRGB(image, &rgb) == AVIF_RESULT_OK) {
+            size_t row = (size_t)image->width * 4;
+            out = (unsigned char*)malloc(row * image->height);
+            if (out) {
+                for (uint32_t y = 0; y < image->height; ++y)
+                    memcpy(out + (size_t)y * row, rgb.pixels + (size_t)y * rgb.rowBytes, row);
+                *w = (int)image->width; *h = (int)image->height;
+            }
+        }
+        avifRGBImageFreePixels(&rgb);
+    }
+    avifDecoderDestroy(decoder);
+    return out;
+}
+#endif
+
+#ifdef HAVE_WEBP
+static void free_webp(unsigned char* p) { if (p) WebPFree(p); }
+#endif
+static void free_decoder_buffer(unsigned char* p, int kind) {
+#ifdef HAVE_WEBP
+    if (kind == 1) { free_webp(p); return; }
+#else
+    (void)kind;
+#endif
+    free(p);
+}
+
 int webpage_image_path(const char* url, char* out, size_t cap) {
     if (!url || !*url) return 0;
     if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) { snprintf(out, cap, "cache/img_%016llx.bin", fnv(url)); return 1; }
@@ -61,7 +123,7 @@ static int looks_like_image(const char* path) {
     FILE* f = fopen(path, "rb"); if (!f) return 0;
     unsigned char m[4096] = {0}; size_t n = fread(m, 1, sizeof m, f); fclose(f);
     if (n < 4) return 0;
-    return (m[0] == 0x89 && m[1] == 'P') || (m[0] == 0xFF && m[1] == 0xD8) || !memcmp(m, "GIF8", 4) || (m[0] == 'B' && m[1] == 'M') || is_webp(m, n) || svg_looks_like((const char*)m, n);
+    return (m[0] == 0x89 && m[1] == 'P') || (m[0] == 0xFF && m[1] == 0xD8) || !memcmp(m, "GIF8", 4) || (m[0] == 'B' && m[1] == 'M') || is_webp(m, n) || is_avif(m, n) || svg_looks_like((const char*)m, n);
 }
 
 /* ── data: URI → файл кэша ──
@@ -153,10 +215,10 @@ ImgPix* webpage_image_get(const char* url) {
     for (int i = 0; i < IC_MAX; i++) if (!g_ic[i].w2 && g_ic[i].url[0] && !strcmp(g_ic[i].url, key)) { g_ic[i].stamp = ++g_stamp; return g_ic[i].fail ? NULL : &g_ic[i].pix; }
     ICEntry* e = ic_slot(); memset(e, 0, sizeof *e);
     snprintf(e->url, sizeof e->url, "%s", key); e->stamp = ++g_stamp;
-    char path[600]; int w = 0, h = 0, n; unsigned char* d = NULL; int is_wp = 0;
+    char path[600]; int w = 0, h = 0, n = 0; unsigned char* d = NULL; int decoder_kind = 0;
     if (webpage_image_path(url, path, sizeof path)) {
-        FILE* pf = fopen(path, "rb"); int is_svg = 0;
-        if (pf) { unsigned char m[4096] = {0}; size_t rn = fread(m, 1, sizeof m, pf); fclose(pf); is_wp = is_webp(m, rn); is_svg = svg_looks_like((const char*)m, rn); }
+        FILE* pf = fopen(path, "rb"); int is_svg = 0, is_wp = 0, is_av = 0;
+        if (pf) { unsigned char m[4096] = {0}; size_t rn = fread(m, 1, sizeof m, pf); fclose(pf); is_wp = is_webp(m, rn); is_av = is_avif(m, rn); is_svg = svg_looks_like((const char*)m, rn); }
         if (is_svg) {                                                       /* вектор: растеризуем в собственный размер (масштабированные копии — векторно, см. webpage_image_scaled) */
             size_t sl = 0; char* src = read_file_cap(path, 8u << 20, &sl); float fw = 0, fh = 0;
             if (src && svg_intrinsic(src, sl, &fw, &fh)) {
@@ -167,16 +229,23 @@ ImgPix* webpage_image_get(const char* url) {
             free(src); e->fail = 1; return NULL;
         }
 #ifdef HAVE_WEBP
-        if (is_wp) d = load_webp(path, &w, &h);
+        if (is_wp) { d = load_webp(path, &w, &h); decoder_kind = 1; }
         else
 #endif
-        d = stbi_load(path, &w, &h, &n, 4);
+#ifdef HAVE_AVIF
+        if (is_av) { d = load_avif(path, &w, &h); decoder_kind = 2; }
+        else
+#endif
+        if (!is_wp && !is_av) d = stbi_load(path, &w, &h, &n, 4);
     }
-    if (!d || (long)w * h > 40000000L) { if (d) { if (is_wp) free(d); else stbi_image_free(d); } e->fail = 1; return NULL; }
+    if (!d || w < 1 || h < 1 || (uint64_t)w * (uint64_t)h > 40000000ull) {
+        if (d) { if (decoder_kind) free_decoder_buffer(d, decoder_kind); else stbi_image_free(d); }
+        e->fail = 1; return NULL;
+    }
     uint32_t* px = malloc((size_t)w * h * 4);
-    if (!px) { if (is_wp) free(d); else stbi_image_free(d); e->fail = 1; return NULL; }
+    if (!px) { if (decoder_kind) free_decoder_buffer(d, decoder_kind); else stbi_image_free(d); e->fail = 1; return NULL; }
     for (long i = 0; i < (long)w * h; i++) px[i] = ((uint32_t)d[i * 4 + 3] << 24) | ((uint32_t)d[i * 4] << 16) | ((uint32_t)d[i * 4 + 1] << 8) | d[i * 4 + 2];
-    if (is_wp) free(d); else stbi_image_free(d);
+    if (decoder_kind) free_decoder_buffer(d, decoder_kind); else stbi_image_free(d);
     e->pix.px = px; e->pix.w = w; e->pix.h = h; g_bytes += (size_t)w * h * 4; ic_trim();
     return &e->pix;
 }

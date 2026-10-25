@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#ifdef SVG_WITH_TTF
+#include "font_manager.h"
+#include "ttf_render.h"
+#endif
 
 #define SVG_MAX_NODES 40000
 #define SVG_MAX_DEPTH 48
@@ -81,13 +85,13 @@ static int xml_parse(Doc* d, const char* s, size_t n) {
     while (i < n) {
         if (s[i] != '<') {                                                /* текст */
             size_t j = i; while (j < n && s[j] != '<') j++;
-            if (cur && !strcmp(cur->tag, "style")) { char* t = realloc(cur->text, cur->tlen + (j - i) + 1); if (t) { memcpy(t + cur->tlen, s + i, j - i); cur->tlen += j - i; t[cur->tlen] = 0; cur->text = t; } }
+            if (cur && j > i) { size_t add = j - i; char* t = realloc(cur->text, cur->tlen + add + 1); if (t) { memcpy(t + cur->tlen, s + i, add); cur->tlen += add; t[cur->tlen] = 0; cur->text = t; } }
             i = j; continue;
         }
         if (i + 3 < n && !memcmp(s + i, "<!--", 4)) { const char* e = NULL; for (size_t k = i + 4; k + 2 < n; k++) if (!memcmp(s + k, "-->", 3)) { e = s + k + 3; break; } if (!e) return d->root != NULL; i = (size_t)(e - s); continue; }
         if (i + 8 < n && !memcmp(s + i, "<![CDATA[", 9)) {
             size_t k = i + 9; while (k + 2 < n && memcmp(s + k, "]]>", 3)) k++;
-            if (cur && !strcmp(cur->tag, "style")) { char* t = realloc(cur->text, cur->tlen + (k - i - 9) + 1); if (t) { memcpy(t + cur->tlen, s + i + 9, k - i - 9); cur->tlen += k - i - 9; t[cur->tlen] = 0; cur->text = t; } }
+            if (cur && k > i + 9) { size_t add = k - i - 9; char* t = realloc(cur->text, cur->tlen + add + 1); if (t) { memcpy(t + cur->tlen, s + i + 9, add); cur->tlen += add; t[cur->tlen] = 0; cur->text = t; } }
             i = k + 3; continue;
         }
         if (i + 1 < n && (s[i + 1] == '?' || s[i + 1] == '!')) {                /* <?xml ?>, <!DOCTYPE …[…]> */
@@ -271,9 +275,12 @@ typedef struct {
     float fill_op, stroke_op, opacity;                                    /* opacity накапливается вниз по дереву */
     float sw; int cap, join; float miter; float dash[16]; int ndash; float dashoff;
     int evenodd, clip_evenodd, hidden, none; uint32_t color; float stop_op; uint32_t stop_color; int has_stop_color;
+    char filter_url[64], clip_url[64], mask_url[64];
+    char font_family[128]; int font_weight, font_italic, text_anchor; float font_size, letter_spacing;
 } Style;
 static void style_default(Style* s, uint32_t cur) {
     memset(s, 0, sizeof *s); s->fill_kind = 1; s->fill = 0xFF000000u; s->stroke_kind = 0; s->fill_op = s->stroke_op = s->opacity = 1; s->sw = 1; s->miter = 4; s->color = cur; s->stop_op = 1; s->stop_color = 0xFF000000u;
+    snprintf(s->font_family, sizeof s->font_family, "%s", "sans-serif"); s->font_weight = 400; s->font_size = 16.0f;
 }
 
 /* CSS-правила из <style>: простые селекторы (тег, .класс, #id, *, составные тег.класс#id, списки через запятую) */
@@ -346,6 +353,19 @@ static void style_decl(Style* s, const char* name, const char* val) {
     else if (!strcmp(name, "color")) { uint32_t c = 0; url[0] = 0; int k = parse_color(val, &c, s->color, url, sizeof url); if (k == 1) s->color = c; }
     else if (!strcmp(name, "display")) s->none = !strncmp(val, "none", 4);
     else if (!strcmp(name, "visibility")) s->hidden = !strncmp(val, "hidden", 6) || !strncmp(val, "collapse", 8);
+    else if (!strcmp(name, "filter") || !strcmp(name, "clip-path") || !strcmp(name, "mask")) {
+        char id[64] = {0}; const char* p = strstr(val, "url(");
+        if (p) { p += 4; while (isspace((unsigned char)*p) || *p == '\'' || *p == '\"') p++; if (*p == '#') p++; size_t z = 0; while (*p && *p != ')' && *p != '\'' && *p != '\"' && !isspace((unsigned char)*p) && z + 1 < sizeof id) id[z++] = *p++; }
+        if (!strcmp(name, "filter")) snprintf(s->filter_url, sizeof s->filter_url, "%s", id);
+        else if (!strcmp(name, "clip-path")) snprintf(s->clip_url, sizeof s->clip_url, "%s", id);
+        else snprintf(s->mask_url, sizeof s->mask_url, "%s", id);
+    }
+    else if (!strcmp(name, "font-size")) { float v = parse_len(val, s->font_size, -1); if (v > 0 && v <= 4096) s->font_size = v; }
+    else if (!strcmp(name, "font-family")) { while (isspace((unsigned char)*val)) val++; size_t n = strlen(val); while (n && isspace((unsigned char)val[n-1])) n--; if (n >= 2 && ((val[0] == '\'' && val[n-1] == '\'') || (val[0] == '\"' && val[n-1] == '\"'))) { val++; n -= 2; } if (n >= sizeof s->font_family) n = sizeof s->font_family - 1; memcpy(s->font_family, val, n); s->font_family[n] = 0; }
+    else if (!strcmp(name, "font-weight")) { if (!strncmp(val, "bold", 4)) s->font_weight = 700; else if (!strncmp(val, "normal", 6)) s->font_weight = 400; else { int v = atoi(val); if (v >= 100 && v <= 900) s->font_weight = v; } }
+    else if (!strcmp(name, "font-style")) s->font_italic = !strncmp(val, "italic", 6) || !strncmp(val, "oblique", 7);
+    else if (!strcmp(name, "text-anchor")) s->text_anchor = !strncmp(val, "middle", 6) ? 1 : !strncmp(val, "end", 3) ? 2 : 0;
+    else if (!strcmp(name, "letter-spacing")) s->letter_spacing = parse_len(val, s->font_size, 0);
     else if (!strcmp(name, "stop-color")) { uint32_t c = 0; url[0] = 0; int k = parse_color(val, &c, s->color, url, sizeof url); if (k == 1 || k == 2) { s->stop_color = c; s->has_stop_color = 1; } }
 }
 static void style_decls(Style* s, const char* d, size_t len) {                 /* "имя: значение; имя: значение" */
@@ -361,14 +381,15 @@ static void style_decls(Style* s, const char* d, size_t len) {                 /
     free(buf);
 }
 static const char* PRES_ATTRS[] = {"fill", "stroke", "fill-opacity", "stroke-opacity", "opacity", "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-miterlimit",
-    "stroke-dasharray", "stroke-dashoffset", "fill-rule", "clip-rule", "color", "display", "visibility", "stop-color", "stop-opacity", NULL};
+    "stroke-dasharray", "stroke-dashoffset", "fill-rule", "clip-rule", "color", "display", "visibility", "stop-color", "stop-opacity",
+    "filter", "clip-path", "mask", "font-size", "font-family", "font-weight", "font-style", "text-anchor", "letter-spacing", NULL};
 
 /* Спрайты: <use href="#id"> может ссылаться на <symbol> из ДРУГОГО встроенного svg страницы. html.c сохраняет такие svg
    в cache/sprite_<хэш origin>_<хэш>.svg, а в svg, использующие <use>, добавляет комментарий <!--mlsprite:<хэш origin>-->.
    Распарсенные спрайты держим в памяти (парсинг сотен символов на каждую иконку был бы слишком дорог). */
 typedef struct { Doc* docs[8]; int n; char key[32]; char sig[512]; } ExtSet;
 static ExtSet g_ext;
-typedef struct { Doc* doc; Rules rules; uint32_t cur; float vw, vh; ExtSet* ext; } Ctx;
+typedef struct { Doc* doc; Rules rules; uint32_t cur; float vw, vh; ExtSet* ext; SNode* bypass_effect_node; int clip_mode, text_active; float text_x, text_y; } Ctx;
 static SNode* ctx_by_id(Ctx* cx, const char* id) {
     SNode* n = doc_by_id(cx->doc, id); if (n) return n;
     if (cx->ext) for (int i = 0; i < cx->ext->n; i++) { n = doc_by_id(cx->ext->docs[i], id); if (n) return n; }
@@ -378,6 +399,7 @@ static int rule_cmp_idx(const void* a, const void* b, void* ud) { Rules* rs = ud
 static void compute_style(Ctx* cx, const SNode* n, const Style* parent, Style* out) {
     float pop = parent->opacity; *out = *parent;
     out->opacity = 1; out->none = 0; out->stop_op = 1; out->has_stop_color = 0; out->stop_color = 0xFF000000u;
+    /* SVG filter/clip/mask не наследуются. */ out->filter_url[0] = out->clip_url[0] = out->mask_url[0] = 0;
     for (int i = 0; PRES_ATTRS[i]; i++) { const char* v = attr_get(n, PRES_ATTRS[i]); if (v) style_decl(out, PRES_ATTRS[i], v); }
     int idx[64], ni = 0;
     for (int i = 0; i < cx->rules.n && ni < 64; i++) if (rule_match(&cx->rules.r[i], n)) idx[ni++] = i;
@@ -727,9 +749,26 @@ static int make_paint(Ctx* cx, int kind, uint32_t color, const char* url, float 
     if (is_solid) { pt->kind = 1; pt->color = solid; pt->alpha = ((solid >> 24) / 255.0f) * op; } else pt->alpha = op;
     return pt->alpha > 0;
 }
+static uint32_t paint_sample(const Paint* pt, float dx, float dy) {
+    if (pt->kind != 2) return pt->color;
+    float gx, gy; mat_pt(pt->g.inv, dx, dy, &gx, &gy);
+    float t;
+    if (pt->g.type == 0) { float vx = pt->g.x2 - pt->g.x1, vy = pt->g.y2 - pt->g.y1, l2 = vx * vx + vy * vy; t = l2 > 1e-12f ? ((gx - pt->g.x1) * vx + (gy - pt->g.y1) * vy) / l2 : 0; }
+    else { float vx = gx - pt->g.cx, vy = gy - pt->g.cy; t = pt->g.r > 1e-9f ? sqrtf(vx * vx + vy * vy) / pt->g.r : 0; }
+    return grad_color(&pt->g, t);
+}
+
 static void draw_path(Ctx* cx, Canvas* cv, Mat ctm, Path* path, const Style* st) {
     if (path->n < 1 || st->none) return;
     float bbox[4]; path_bbox(path, bbox);
+    if (cx->clip_mode) {
+        Paint maskpt = {0}; maskpt.kind = 1; maskpt.color = 0xFFFFFFFFu;
+        maskpt.alpha = st->opacity * (st->hidden ? 0.0f : 1.0f);
+        PolySet ps = {0};
+        for (int i = 0; i < path->ns; i++) { int a = path->st[i], b = path->st[i + 1]; if (b - a < 2) continue; ps_begin(&ps); for (int k = a; k < b; k++) ps_pt(&ps, path->xy[k * 2], path->xy[k * 2 + 1]); }
+        raster(cv, ctm, &ps, st->clip_evenodd || st->evenodd, &maskpt); ps_free(&ps);
+        return;
+    }
     float sc = mat_scale(ctm);
     Paint pt;
     if (!st->hidden && st->fill_kind && make_paint(cx, st->fill_kind, st->fill, st->fill_url, st->fill_op * st->opacity, ctm, bbox, &pt)) {
@@ -754,7 +793,7 @@ static void draw_path(Ctx* cx, Canvas* cv, Mat ctm, Path* path, const Style* st)
     }
 }
 static int is_skipped_tag(const char* t) {
-    static const char* skip[] = {"defs", "symbol", "clippath", "mask", "marker", "pattern", "lineargradient", "radialgradient", "filter", "style", "title", "desc", "metadata", "script", "text", "image", "foreignobject", "stop", "animate", "set", "view", NULL};
+    static const char* skip[] = {"defs", "symbol", "clippath", "mask", "marker", "pattern", "lineargradient", "radialgradient", "filter", "style", "title", "desc", "metadata", "script", "image", "foreignobject", "stop", "animate", "set", "view", NULL};
     for (int i = 0; skip[i]; i++) if (!strcmp(t, skip[i])) return 1; return 0;
 }
 static void render_node(Ctx* cx, Canvas* cv, SNode* n, Mat ctm, const Style* parent, int depth, int use_depth);
@@ -762,10 +801,314 @@ static void render_children(Ctx* cx, Canvas* cv, SNode* n, Mat ctm, const Style*
     int sw = !strcmp(n->tag, "switch");
     for (SNode* c = n->first; c; c = c->next) { render_node(cx, cv, c, ctm, st, depth + 1, use_depth); if (sw && !is_skipped_tag(c->tag)) break; }
 }
+
+/* XML text nodes are retained on their parent; collapse SVG's default whitespace. */
+static char* svg_text_content(const SNode* n) {
+    if (!n->text || !n->tlen) return NULL;
+    char* decoded = malloc(n->tlen + 1); if (!decoded) return NULL;
+    size_t dl = xml_decode(n->text, n->tlen, decoded); (void)dl;
+    const char* sp = attr_get(n, "space"); int preserve = sp && !strcmp(sp, "preserve");
+    if (preserve) return decoded;
+    size_t r = 0, w = 0; int pending = 0;
+    while (decoded[r]) {
+        unsigned char c = (unsigned char)decoded[r++];
+        if (isspace(c)) { if (w) pending = 1; continue; }
+        if (pending && w) decoded[w++] = ' ';
+        pending = 0; decoded[w++] = (char)c;
+    }
+    decoded[w] = 0; return decoded;
+}
+
+#ifdef SVG_WITH_TTF
+static void draw_svg_text(Ctx* cx, Canvas* cv, const char* raw, float x, float baseline, Mat ctm, const Style* st) {
+    if (!raw || !*raw || st->none || st->hidden) return;
+    int fs = (int)floorf(st->font_size + 0.5f); if (fs < 1) fs = 1; if (fs > 512) fs = 512;
+    TTFFont* font = font_manager_get_styled(st->font_family[0] ? st->font_family : "sans-serif", st->font_weight, st->font_italic);
+    if (!font) return;
+    float twf = ttf_text_width_f(font, raw, fs, (st->font_weight >= 600 ? TTF_BOLD : 0) | (st->font_italic ? TTF_ITALIC : 0));
+    if (!(twf >= 0) || twf > 8190) return;
+    float tw = twf + 4; int asc = ttf_font_ascent(font, fs), desc = ttf_font_descent(font, fs);
+    if (asc < 1) asc = fs;
+    if (desc < 0) desc = 0;
+    int mw = (int)ceilf(tw); int mh = asc + desc + 6;
+    if (mw < 4 || mh < 4 || (long)mw * mh > 16000000L) return;
+    size_t count = (size_t)mw * (size_t)mh;
+    uint32_t* black = calloc(count, sizeof(uint32_t)); uint32_t* white = malloc(count * sizeof(uint32_t));
+    uint8_t* cov = malloc(count);
+    if (!black || !white || !cov) { free(black); free(white); free(cov); return; }
+    for (size_t i = 0; i < count; i++) white[i] = 0xFFFFFFu;
+    int tstyle = (st->font_weight >= 600 ? TTF_BOLD : 0) | (st->font_italic ? TTF_ITALIC : 0);
+    ttf_render_string_ex(font, raw, black, mw, 0, 0, mw, mh, fs, 2, 2, 0xFFFFFFu, tstyle);
+    ttf_render_string_ex(font, raw, white, mw, 0, 0, mw, mh, fs, 2, 2, 0xFFFFFFu, tstyle);
+    for (size_t i = 0; i < count; i++) {
+        int dr = (int)((white[i] >> 16) & 255) - (int)((black[i] >> 16) & 255);
+        int dg = (int)((white[i] >> 8) & 255) - (int)((black[i] >> 8) & 255);
+        int db = (int)(white[i] & 255) - (int)(black[i] & 255);
+        int a = 255 - (dr + dg + db) / 3; if (a < 0) a = 0; if (a > 255) a = 255; cov[i] = (uint8_t)a;
+    }
+    free(black); free(white);
+    if (cx->clip_mode) {
+        Mat inv; if (mat_inv(ctm, &inv)) {
+            float y0 = baseline - asc;
+            for (int py = 0; py < cv->h; py++) for (int px = 0; px < cv->w; px++) {
+                float ux, uy; mat_pt(inv, px + 0.5f, py + 0.5f, &ux, &uy);
+                int mx = (int)floorf(ux - x + 2), my = (int)floorf(uy - y0 + 2);
+                if (mx < 0 || my < 0 || mx >= mw || my >= mh) continue;
+                unsigned a = cov[(size_t)my * mw + mx]; if (!a) continue;
+                uint32_t* dst = &cv->px[(size_t)py * cv->w + px]; blend(dst, 0xFFFFFFFFu, (float)a / 255.0f * st->opacity);
+            }
+        }
+        free(cov); return;
+    }
+    if (!st->fill_kind) { free(cov); return; }
+    float bbox[4] = {x, baseline - asc, x + twf, baseline + desc}; Paint pt;
+    if (!make_paint(cx, st->fill_kind, st->fill, st->fill_url, st->fill_op * st->opacity, ctm, bbox, &pt)) { free(cov); return; }
+    Mat inv; if (!mat_inv(ctm, &inv)) { free(cov); return; }
+    /* Ограничиваем обход преобразованными углами текстовой маски. */
+    float ax[4], ay[4]; mat_pt(ctm, x - 2, baseline - asc - 2, &ax[0], &ay[0]); mat_pt(ctm, x + mw - 2, baseline - asc - 2, &ax[1], &ay[1]);
+    mat_pt(ctm, x - 2, baseline - asc + mh - 2, &ax[2], &ay[2]); mat_pt(ctm, x + mw - 2, baseline - asc + mh - 2, &ax[3], &ay[3]);
+    float minx=ax[0], maxx=ax[0], miny=ay[0], maxy=ay[0]; for (int i=1;i<4;i++){if(ax[i]<minx)minx=ax[i];if(ax[i]>maxx)maxx=ax[i];if(ay[i]<miny)miny=ay[i];if(ay[i]>maxy)maxy=ay[i];}
+    int x0=(int)fmaxf(0,floorf(minx)), x1=(int)fminf(cv->w,ceilf(maxx)), y0=(int)fmaxf(0,floorf(miny)), y1=(int)fminf(cv->h,ceilf(maxy));
+    for (int py = y0; py < y1; py++) for (int px = x0; px < x1; px++) {
+        float ux, uy; mat_pt(inv, px + 0.5f, py + 0.5f, &ux, &uy);
+        int mx = (int)floorf(ux - x + 2), my = (int)floorf(uy - (baseline - asc) + 2);
+        if (mx < 0 || my < 0 || mx >= mw || my >= mh) continue;
+        unsigned a = cov[(size_t)my * mw + mx]; if (!a) continue;
+        uint32_t color = paint_sample(&pt, px + 0.5f, py + 0.5f);
+        blend(&cv->px[(size_t)py * cv->w + px], color, (float)a / 255.0f * pt.alpha);
+    }
+    free(cov);
+}
+#endif
+
+static int canvas_user_bbox(const Canvas* cv, const uint32_t* px, Mat ctm, float b[4]) {
+    int x0=cv->w, y0=cv->h, x1=0, y1=0;
+    for (int y=0;y<cv->h;y++) for (int x=0;x<cv->w;x++) if (px[(size_t)y*cv->w+x] >> 24) { if(x<x0)x0=x;if(x+1>x1)x1=x+1;if(y<y0)y0=y;if(y+1>y1)y1=y+1; }
+    Mat inv; if (x1<=x0 || y1<=y0 || !mat_inv(ctm,&inv)) return 0;
+    float x[4], y[4]; mat_pt(inv,x0,y0,&x[0],&y[0]); mat_pt(inv,x1,y0,&x[1],&y[1]); mat_pt(inv,x0,y1,&x[2],&y[2]); mat_pt(inv,x1,y1,&x[3],&y[3]);
+    b[0]=b[2]=x[0]; b[1]=b[3]=y[0];
+    for(int i=1;i<4;i++){if(x[i]<b[0])b[0]=x[i];if(x[i]>b[2])b[2]=x[i];if(y[i]<b[1])b[1]=y[i];if(y[i]>b[3])b[3]=y[i];}
+    return b[2]>b[0] && b[3]>b[1];
+}
+static float svg_num_attr(const SNode* n, const char* name, float rel, float def) {
+    const char* s=attr_get(n,name); return s ? parse_len(s,rel,def) : def;
+}
+static Mat bbox_matrix(const float b[4]) { Mat m={b[2]-b[0],0,0,b[3]-b[1],b[0],b[1]}; return m; }
+static void canvas_blend_over(Canvas* dst, const Canvas* src) {
+    size_t n=(size_t)dst->w*dst->h; for(size_t i=0;i<n;i++) if(src->px[i]>>24) blend(&dst->px[i],src->px[i],1.0f);
+}
+static void svg_apply_clip(Ctx* cx, SNode* cp, Canvas* layer, Mat target_ctm, const Style* target_style, const float bbox[4], int have_bbox, int depth, int use_depth) {
+    size_t n=(size_t)layer->w*layer->h; uint32_t* mpx=calloc(n,sizeof(uint32_t)); if(!mpx)return;
+    Canvas mask={layer->w,layer->h,mpx}; Mat cm=target_ctm;
+    const char* tr=attr_get(cp,"transform"); if(tr){Mat t;if(parse_transform(tr,&t))cm=mat_mul(cm,t);}
+    const char* units=attr_get(cp,"clippathunits");
+    if(units && !strncmp(units,"objectBoundingBox",17) && have_bbox) cm=mat_mul(cm,bbox_matrix(bbox));
+    Ctx sub=*cx; sub.clip_mode=1; sub.bypass_effect_node=NULL; sub.text_active=0;
+    Style clipbase=*target_style; clipbase.opacity=1.0f; clipbase.fill_op=clipbase.stroke_op=1.0f; clipbase.none=0; clipbase.hidden=0;
+    render_children(&sub,&mask,cp,cm,&clipbase,depth+1,use_depth);
+    for(size_t i=0;i<n;i++){ unsigned a=(mpx[i]>>24)&255; if(!a){layer->px[i]=0;continue;} unsigned da=(layer->px[i]>>24)&255; unsigned na=(da*a+127)/255; layer->px[i]=(layer->px[i]&0x00FFFFFFu)|(na<<24); }
+    free(mpx);
+}
+static void svg_apply_mask(Ctx* cx, SNode* mn, Canvas* layer, Mat target_ctm, const Style* target_style, const float bbox[4], int have_bbox, int depth, int use_depth) {
+    size_t n=(size_t)layer->w*layer->h; uint32_t* mpx=calloc(n,sizeof(uint32_t)); if(!mpx)return;
+    Canvas mask={layer->w,layer->h,mpx}; Mat cm=target_ctm;
+    const char* cu=attr_get(mn,"maskcontentunits");
+    if(cu && !strncmp(cu,"objectBoundingBox",17) && have_bbox) cm=mat_mul(cm,bbox_matrix(bbox));
+    Style base; style_default(&base,cx->cur); Style ms; compute_style(cx,mn,&base,&ms);
+    Ctx sub=*cx; sub.bypass_effect_node=NULL; sub.clip_mode=0; sub.text_active=0;
+    render_children(&sub,&mask,mn,cm,&ms,depth+1,use_depth);
+    const char* type=attr_get(mn,"mask-type"); int alpha_mode=type && !strncmp(type,"alpha",5);
+    /* SVG default region: x/y=-10%, width/height=120% of the target bbox. */
+    float rx,ry,rw,rh;
+    const char* units=attr_get(mn,"maskunits"); int objunits=!units || strncmp(units,"userSpaceOnUse",14)!=0;
+    if(objunits && have_bbox){
+        rx=bbox[0]+svg_num_attr(mn,"x",1,-0.1f)*(bbox[2]-bbox[0]);
+        ry=bbox[1]+svg_num_attr(mn,"y",1,-0.1f)*(bbox[3]-bbox[1]);
+        rw=svg_num_attr(mn,"width",1,1.2f)*(bbox[2]-bbox[0]);
+        rh=svg_num_attr(mn,"height",1,1.2f)*(bbox[3]-bbox[1]);
+    } else {
+        rx=svg_num_attr(mn,"x",cx->vw,-0.1f*(have_bbox?bbox[2]-bbox[0]:cx->vw));
+        ry=svg_num_attr(mn,"y",cx->vh,-0.1f*(have_bbox?bbox[3]-bbox[1]:cx->vh));
+        rw=svg_num_attr(mn,"width",cx->vw,1.2f*(have_bbox?bbox[2]-bbox[0]:cx->vw));
+        rh=svg_num_attr(mn,"height",cx->vh,1.2f*(have_bbox?bbox[3]-bbox[1]:cx->vh));
+    }
+    Mat inv; int invok=mat_inv(target_ctm,&inv);
+    for(int y=0;y<layer->h;y++) for(int x=0;x<layer->w;x++){
+        size_t i=(size_t)y*layer->w+x; uint32_t v=mpx[i]; unsigned ma=(v>>24)&255;
+        if(!alpha_mode) ma=(ma*(unsigned)(0.2126f*((v>>16)&255)+0.7152f*((v>>8)&255)+0.0722f*(v&255)+0.5f)+127)/255;
+        if(invok){float ux,uy;mat_pt(inv,x+0.5f,y+0.5f,&ux,&uy);if(ux<rx||uy<ry||ux>=rx+rw||uy>=ry+rh)ma=0;}
+        unsigned da=(layer->px[i]>>24)&255, na=(da*ma+127)/255;
+        layer->px[i]=(layer->px[i]&0x00FFFFFFu)|(na<<24);
+    }
+    free(mpx);
+    (void)target_style;
+}
+
+/* Маленькие вспомогательные функции для фильтров SVG. Буферы хранят straight ARGB. */
+static unsigned svg_clamp_byte(float x){if(!(x>0))return 0;if(x>=255)return 255;return (unsigned)(x+0.5f);}
+static uint32_t svg_over_pixel(uint32_t s,uint32_t d){
+    float sa=((s>>24)&255)/255.0f, da=((d>>24)&255)/255.0f, oa=sa+da*(1-sa); if(oa<=1e-8f)return 0;
+    float sr=(s>>16)&255,sg=(s>>8)&255,sb=s&255,dr=(d>>16)&255,dg=(d>>8)&255,db=d&255,k=da*(1-sa);
+    unsigned r=svg_clamp_byte((sr*sa+dr*k)/oa),g=svg_clamp_byte((sg*sa+dg*k)/oa),b=svg_clamp_byte((sb*sa+db*k)/oa),a=svg_clamp_byte(oa*255);
+    return (a<<24)|(r<<16)|(g<<8)|b;
+}
+static uint32_t svg_composite_pixel(uint32_t s,uint32_t d,const char* op,float k1,float k2,float k3,float k4){
+    float sa=((s>>24)&255)/255.0f, da=((d>>24)&255)/255.0f;
+    float sc[3]={((s>>16)&255)/255.0f,((s>>8)&255)/255.0f,(s&255)/255.0f};
+    float dc[3]={((d>>16)&255)/255.0f,((d>>8)&255)/255.0f,(d&255)/255.0f};
+    if(op && !strcmp(op,"arithmetic")){
+        float a[4]={sc[0]*sa,sc[1]*sa,sc[2]*sa,sa}, b[4]={dc[0]*da,dc[1]*da,dc[2]*da,da}, o[4];
+        for(int c=0;c<4;c++) o[c]=fmaxf(0.0f,fminf(1.0f,k1*a[c]*b[c]+k2*a[c]+k3*b[c]+k4));
+        float oa=o[3]; if(oa<=1e-8f)return 0;
+        return (svg_clamp_byte(oa*255)<<24)|(svg_clamp_byte(o[0]/oa*255)<<16)|(svg_clamp_byte(o[1]/oa*255)<<8)|svg_clamp_byte(o[2]/oa*255);
+    }
+    float fs=1.0f, fd=1.0f;
+    if(op && !strcmp(op,"in")){fs=da;fd=0;}
+    else if(op && !strcmp(op,"out")){fs=1-da;fd=0;}
+    else if(op && !strcmp(op,"atop")){fs=da;fd=1-sa;}
+    else if(op && !strcmp(op,"xor")){fs=1-da;fd=1-sa;}
+    else if(op && !strcmp(op,"over")){fs=1;fd=1-sa;}
+    else { /* SVG default operator is over. */ fs=1;fd=1-sa; }
+    float outa=sa*fs+da*fd;
+    if(outa<=1e-8f)return 0;
+    float out[3];for(int c=0;c<3;c++)out[c]=(sc[c]*sa*fs+dc[c]*da*fd)/outa;
+    return (svg_clamp_byte(outa*255)<<24)|(svg_clamp_byte(out[0]*255)<<16)|(svg_clamp_byte(out[1]*255)<<8)|svg_clamp_byte(out[2]*255);
+}
+static void svg_box_pass(uint8_t* src,uint8_t* dst,int w,int h,int radius,int horizontal){
+    if(radius<1){memcpy(dst,src,(size_t)w*h*4);return;}
+    int lines=horizontal?h:w, len=horizontal?w:h, span=radius*2+1;
+    for(int line=0;line<lines;line++){
+        unsigned sums[4]={0,0,0,0};
+        for(int k=-radius;k<=radius;k++){int q=k<0?0:k>=len?len-1:k;size_t z=((size_t)(horizontal?line:q)*w+(horizontal?q:line))*4;for(int c=0;c<4;c++)sums[c]+=src[z+c];}
+        for(int j=0;j<len;j++){
+            size_t z=((size_t)(horizontal?line:j)*w+(horizontal?j:line))*4;
+            for(int c=0;c<4;c++)dst[z+c]=(uint8_t)(sums[c]/(unsigned)span);
+            int old=j-radius, add=j+radius+1; if(old<0)old=0;if(old>=len)old=len-1;if(add<0)add=0;if(add>=len)add=len-1;
+            size_t zo=((size_t)(horizontal?line:old)*w+(horizontal?old:line))*4, za=((size_t)(horizontal?line:add)*w+(horizontal?add:line))*4;
+            for(int c=0;c<4;c++)sums[c]=sums[c]-src[zo+c]+src[za+c];
+        }
+    }
+}
+static void svg_blur(uint32_t* px,int w,int h,float sigma){
+    if(!(sigma>0.01f)||!isfinite(sigma)) return;
+    if(sigma>32) sigma=32;
+    size_t n=(size_t)w*h; uint8_t* a=malloc(n*4),*b=malloc(n*4);if(!a||!b){free(a);free(b);return;}
+    for(size_t i=0;i<n;i++){uint32_t v=px[i];unsigned al=v>>24; a[i*4]=(uint8_t)((((v>>16)&255)*al+127)/255);a[i*4+1]=(uint8_t)((((v>>8)&255)*al+127)/255);a[i*4+2]=(uint8_t)(((v&255)*al+127)/255);a[i*4+3]=(uint8_t)al;}
+    int radius=(int)ceilf(sigma*0.57735f); if(radius<1)radius=1;if(radius>24)radius=24;
+    for(int it=0;it<3;it++){svg_box_pass(a,b,w,h,radius,1);svg_box_pass(b,a,w,h,radius,0);}
+    for(size_t i=0;i<n;i++){unsigned al=a[i*4+3],r=0,g=0,bl=0;if(al){r=(a[i*4]*255u+al/2)/al;g=(a[i*4+1]*255u+al/2)/al;bl=(a[i*4+2]*255u+al/2)/al;if(r>255)r=255;if(g>255)g=255;if(bl>255)bl=255;}px[i]=(al<<24)|(r<<16)|(g<<8)|bl;}
+    free(a);free(b);
+}
+static void svg_offset(const uint32_t* in,uint32_t* out,int w,int h,int dx,int dy){
+    memset(out,0,(size_t)w*h*4); for(int y=0;y<h;y++){int sy=y-dy;if(sy<0||sy>=h)continue;for(int x=0;x<w;x++){int sx=x-dx;if(sx>=0&&sx<w)out[(size_t)y*w+x]=in[(size_t)sy*w+sx];}}
+}
+static void svg_color_matrix(const uint32_t* in,uint32_t* out,int w,int h,const SNode* p){
+    const char* ty=attr_get(p,"type"),*vs=attr_get(p,"values"); float m[20]={1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0};
+    if(ty&&!strcmp(ty,"saturate")){float sat=vs?strtof(vs,NULL):1;float rr=.213f+.787f*sat,rg=.715f-.715f*sat,rb=.072f-.072f*sat;m[0]=rr;m[1]=rg;m[2]=rb;m[5]=.213f-.213f*sat;m[6]=.715f+.285f*sat;m[7]=.072f-.072f*sat;m[10]=.213f-.213f*sat;m[11]=.715f-.715f*sat;m[12]=.072f+.928f*sat;}
+    else if(ty&&!strcasecmp(ty,"huerotate")){float deg=vs?strtof(vs,NULL):0,co=cosf(deg*(float)M_PI/180),si=sinf(deg*(float)M_PI/180);float a=.213f,b=.715f,c=.072f;m[0]=a+co*(1-a)+si*(-a);m[1]=b+co*(-b)+si*(-b);m[2]=c+co*(-c)+si*(1-c);m[5]=a+co*(-a)+si*.143f;m[6]=b+co*(1-b)+si*.140f;m[7]=c+co*(-c)+si*(-.283f);m[10]=a+co*(-a)+si*(-(1-a));m[11]=b+co*(-b)+si*b;m[12]=c+co*(1-c)+si*c;}
+    else if(ty&&!strcasecmp(ty,"luminancetoalpha")){memset(m,0,sizeof m);m[15]=.2126f;m[16]=.7152f;m[17]=.0722f;}
+    else if(vs){const char* q=vs;float vals[20];int nv=0;while(nv<20&&parse_num(&q,&vals[nv]))nv++;if(nv>=20)memcpy(m,vals,sizeof m);}
+    size_t n=(size_t)w*h;for(size_t i=0;i<n;i++){uint32_t v=in[i];float r=((v>>16)&255)/255.f,g=((v>>8)&255)/255.f,b=(v&255)/255.f,a=(v>>24)/255.f,iv[4]={r,g,b,a};float ov[4];for(int row=0;row<4;row++)ov[row]=m[row*5]*iv[0]+m[row*5+1]*iv[1]+m[row*5+2]*iv[2]+m[row*5+3]*iv[3]+m[row*5+4];unsigned R=svg_clamp_byte(fmaxf(0,fminf(1,ov[0]))*255),G=svg_clamp_byte(fmaxf(0,fminf(1,ov[1]))*255),B=svg_clamp_byte(fmaxf(0,fminf(1,ov[2]))*255),A=svg_clamp_byte(fmaxf(0,fminf(1,ov[3]))*255);out[i]=(A<<24)|(R<<16)|(G<<8)|B;}
+}
+static uint32_t svg_blend_pixel(uint32_t s,uint32_t d,const char* mode){
+    float sa=(s>>24)/255.f,da=(d>>24)/255.f;if(sa<=0)return d;if(da<=0)return s;
+    float cs[3]={((s>>16)&255)/255.f,((s>>8)&255)/255.f,(s&255)/255.f},cd[3]={((d>>16)&255)/255.f,((d>>8)&255)/255.f,(d&255)/255.f};float oa=sa+da-sa*da,o[3];
+    for(int c=0;c<3;c++){float b=cs[c];if(mode&&!strcmp(mode,"multiply"))b=cs[c]*cd[c];else if(mode&&!strcmp(mode,"screen"))b=cs[c]+cd[c]-cs[c]*cd[c];else if(mode&&!strcmp(mode,"darken"))b=fminf(cs[c],cd[c]);else if(mode&&!strcmp(mode,"lighten"))b=fmaxf(cs[c],cd[c]);o[c]=((1-da)*sa*cs[c]+(1-sa)*da*cd[c]+sa*da*b)/oa;}
+    return (svg_clamp_byte(oa*255)<<24)|(svg_clamp_byte(o[0]*255)<<16)|(svg_clamp_byte(o[1]*255)<<8)|svg_clamp_byte(o[2]*255);
+}
+typedef struct { char name[64]; uint32_t* px; } SVGFilterResult;
+static uint32_t* svg_filter_find(SVGFilterResult* r,int nr,const char* name,uint32_t* fallback){if(!name||!*name)return fallback;for(int i=nr-1;i>=0;i--)if(r[i].px&&r[i].name[0]&&!strcmp(r[i].name,name))return r[i].px;return fallback;}
+static int svg_filter_future_uses(SNode* filter,SNode* after,const char* name){
+    if(!name||!*name)return 0;
+    for(SNode* p=after?after->next:filter->first;p;p=p->next){
+        if(strncmp(p->tag,"fe",2))continue;
+        const char* in=attr_get(p,"in"),*in2=attr_get(p,"in2");
+        if((in&&!strcmp(in,name))||(in2&&!strcmp(in2,name)))return 1;
+        if(!strcmp(p->tag,"femerge"))for(SNode* m=p->first;m;m=m->next){const char* mi=attr_get(m,"in");if(mi&&!strcmp(mi,name))return 1;}
+    }
+    return 0;
+}
+static void svg_filter_apply(Ctx* cx,SNode* filter,Canvas* layer,Mat ctm,const float bbox[4],int have_bbox){
+    int w=layer->w,h=layer->h;size_t n=(size_t)w*h;if(n>12000000u)return;
+    SVGFilterResult res[40];memset(res,0,sizeof res);int nr=0;
+    uint32_t* source=malloc(n*4);if(!source)return;memcpy(source,layer->px,n*4);snprintf(res[nr].name,sizeof res[nr].name,"SourceGraphic");res[nr++].px=source;uint32_t* alpha=calloc(n,4);if(!alpha)goto done;for(size_t i=0;i<n;i++)alpha[i]=((source[i]>>24)<<24)|0xFFFFFFu;snprintf(res[nr].name,sizeof res[nr].name,"SourceAlpha");res[nr++].px=alpha;
+    uint32_t* last=source;float scale=mat_scale(ctm);
+    for(SNode* p=filter->first;p&&nr<38;p=p->next){const char* tg=p->tag;if(strncmp(tg,"fe",2))continue;const char* iname=attr_get(p,"in"),*in2name=attr_get(p,"in2"),*result=attr_get(p,"result");uint32_t* in=svg_filter_find(res,nr,iname,last);uint32_t* in2=svg_filter_find(res,nr,in2name,source);uint32_t* out=calloc(n,4);if(!out)break;
+        if(!strcmp(tg,"fegaussianblur")){memcpy(out,in,n*4);const char* sd=attr_get(p,"stddeviation");float sx=0,sy=0;if(sd){const char* q=sd;parse_num(&q,&sx);if(!parse_num(&q,&sy))sy=sx;}float sig=fmaxf(sx,sy)*scale;svg_blur(out,w,h,sig);}
+        else if(!strcmp(tg,"feoffset")){float dx=svg_num_attr(p,"dx",cx->vw,0),dy=svg_num_attr(p,"dy",cx->vh,0);float ox,oy;mat_pt(ctm,dx,dy,&ox,&oy);float zx,zy;mat_pt(ctm,0,0,&zx,&zy);svg_offset(in,out,w,h,(int)lroundf(ox-zx),(int)lroundf(oy-zy));}
+        else if(!strcmp(tg,"fecolormatrix")){svg_color_matrix(in,out,w,h,p);}
+        else if(!strcmp(tg,"feflood")){const char* fc=attr_get(p,"flood-color");uint32_t col=0xFF000000u;char url[64]={0};if(fc)parse_color(fc,&col,cx->cur,url,sizeof url);float op=svg_num_attr(p,"flood-opacity",1,1);unsigned a=svg_clamp_byte(((col>>24)&255)*op);uint32_t v=(a<<24)|(col&0xFFFFFFu);for(size_t i=0;i<n;i++)out[i]=v;}
+        else if(!strcmp(tg,"feblend")){const char* mode=attr_get(p,"mode");for(size_t i=0;i<n;i++)out[i]=svg_blend_pixel(in[i],in2[i],mode);}
+        else if(!strcmp(tg,"fecomposite")){const char* op=attr_get(p,"operator");float k1=svg_num_attr(p,"k1",1,0),k2=svg_num_attr(p,"k2",1,0),k3=svg_num_attr(p,"k3",1,0),k4=svg_num_attr(p,"k4",1,0);for(size_t i=0;i<n;i++)out[i]=svg_composite_pixel(in[i],in2[i],op,k1,k2,k3,k4);}
+        else if(!strcmp(tg,"femerge")){for(SNode* mn=p->first;mn;mn=mn->next)if(!strcmp(mn->tag,"femergenode")){uint32_t* src=svg_filter_find(res,nr,attr_get(mn,"in"),source);for(size_t i=0;i<n;i++)out[i]=svg_over_pixel(src[i],out[i]);}}
+        else if(!strcmp(tg,"fedropshadow")){memcpy(out,in,n*4);uint32_t* sh=calloc(n,4);if(sh){for(size_t i=0;i<n;i++){unsigned a=in[i]>>24;sh[i]=(a<<24)|0xFFFFFFu;}const char* sd=attr_get(p,"stddeviation");float sig=sd?strtof(sd,NULL)*scale:0;svg_blur(sh,w,h,sig);uint32_t* off=calloc(n,4);if(off){float dx=svg_num_attr(p,"dx",cx->vw,2),dy=svg_num_attr(p,"dy",cx->vh,2),ax,ay,zx,zy;mat_pt(ctm,dx,dy,&ax,&ay);mat_pt(ctm,0,0,&zx,&zy);svg_offset(sh,off,w,h,(int)lroundf(ax-zx),(int)lroundf(ay-zy));const char* fc=attr_get(p,"flood-color");uint32_t col=0xFF000000u;char uu[64]={0};if(fc)parse_color(fc,&col,cx->cur,uu,sizeof uu);float fop=svg_num_attr(p,"flood-opacity",1,1);for(size_t i=0;i<n;i++){unsigned a=((off[i]>>24)*((col>>24)&255)+127)/255;a=svg_clamp_byte(a*fop);uint32_t sv=(a<<24)|(col&0xFFFFFFu);out[i]=svg_over_pixel(in[i],sv);}free(off);}free(sh);}}
+        else {memcpy(out,in,n*4);} /* неизвестный примитив сохраняет вход, не обрывая цепочку */
+        /* Не держим всю цепочку RGBA в памяти: сохраняем промежуточный буфер только если на него ссылается будущий primitive. */
+        if(last!=source && last!=alpha){
+            for(int ri=2;ri<nr;ri++)if(res[ri].px==last){
+                if(!svg_filter_future_uses(filter,p,res[ri].name)){free(res[ri].px);res[ri].px=NULL;}
+                break;
+            }
+        }
+        last=out;snprintf(res[nr].name,sizeof res[nr].name,"%s",result?result:"");res[nr++].px=out;
+    }
+    /* Фильтр по умолчанию выводится в bbox, расширенный на 10%; это также не даёт feFlood закрасить весь viewport. */
+    float region[4]={0,0,(float)cx->vw,(float)cx->vh};
+    const char* units=attr_get(filter,"filterunits");int obj=!units||strncmp(units,"userSpaceOnUse",14)!=0;
+    if(obj&&have_bbox){float bw=bbox[2]-bbox[0],bh=bbox[3]-bbox[1];region[0]=bbox[0]+svg_num_attr(filter,"x",1,-.1f)*bw;region[1]=bbox[1]+svg_num_attr(filter,"y",1,-.1f)*bh;region[2]=region[0]+svg_num_attr(filter,"width",1,1.2f)*bw;region[3]=region[1]+svg_num_attr(filter,"height",1,1.2f)*bh;}
+    else {float bw=have_bbox?bbox[2]-bbox[0]:cx->vw,bh=have_bbox?bbox[3]-bbox[1]:cx->vh;const char* fx=attr_get(filter,"x"),*fy=attr_get(filter,"y"),*fw=attr_get(filter,"width"),*fh=attr_get(filter,"height");region[0]=fx?parse_len(fx,cx->vw,0):(have_bbox?bbox[0]-.1f*bw:0);region[1]=fy?parse_len(fy,cx->vh,0):(have_bbox?bbox[1]-.1f*bh:0);region[2]=region[0]+(fw?parse_len(fw,cx->vw,0):1.2f*bw);region[3]=region[1]+(fh?parse_len(fh,cx->vh,0):1.2f*bh);}
+    Mat inv;int invok=mat_inv(ctm,&inv);for(int y=0;y<h;y++)for(int x=0;x<w;x++){size_t i=(size_t)y*w+x;if(invok){float ux,uy;mat_pt(inv,x+.5f,y+.5f,&ux,&uy);if(ux<region[0]||uy<region[1]||ux>=region[2]||uy>=region[3]){layer->px[i]=0;continue;}}layer->px[i]=last[i];}
+ done:
+    for(int i=0;i<nr;i++)free(res[i].px);
+}
+
 static void render_node(Ctx* cx, Canvas* cv, SNode* n, Mat ctm, const Style* parent, int depth, int use_depth) {
     if (depth > SVG_MAX_DEPTH || is_skipped_tag(n->tag)) return;
     Style st; compute_style(cx, n, parent, &st); if (st.none) return;
+    int bypass = cx->bypass_effect_node == n;
+    if (!bypass && (st.filter_url[0] || st.clip_url[0] || st.mask_url[0])) {
+        /* Элемент с эффектами сначала изолируется в прозрачный слой. Это сохраняет backdrop и не затрагивает соседей. */
+        size_t count = (size_t)cv->w * (size_t)cv->h;
+        if (count > 12000000u) { /* На очень больших изображениях избегаем нескольких сотен мегабайт временных буферов. */
+            /* Безопасный fallback: рендерим исходный элемент, не теряя его содержимое. */
+        } else {
+            uint32_t* layer_px = calloc(count, sizeof(uint32_t));
+            if (layer_px) {
+                Canvas layer = {cv->w, cv->h, layer_px}; Ctx sub = *cx; sub.bypass_effect_node = n;
+                render_node(&sub, &layer, n, ctm, parent, depth, use_depth);
+                Mat node_ctm = ctm; const char* nts = attr_get(n, "transform"); if (nts) { Mat nt; if (parse_transform(nts, &nt)) node_ctm = mat_mul(node_ctm, nt); }
+                float ub[4]; int have_bbox = canvas_user_bbox(&layer, layer_px, node_ctm, ub);
+                if (st.filter_url[0]) { SNode* fn = ctx_by_id(cx, st.filter_url); if (fn && !strcmp(fn->tag,"filter")) svg_filter_apply(cx, fn, &layer, node_ctm, ub, have_bbox); }
+                if (st.clip_url[0]) { SNode* cp = ctx_by_id(cx, st.clip_url); if (cp && !strcmp(cp->tag,"clippath")) svg_apply_clip(cx, cp, &layer, node_ctm, &st, ub, have_bbox, depth, use_depth); }
+                if (st.mask_url[0]) { SNode* mn = ctx_by_id(cx, st.mask_url); if (mn && !strcmp(mn->tag,"mask")) svg_apply_mask(cx, mn, &layer, node_ctm, &st, ub, have_bbox, depth, use_depth); }
+                canvas_blend_over(cv, &layer);
+                free(layer_px); return;
+            }
+        }
+    }
     const char* ts = attr_get(n, "transform"); if (ts) { Mat t; if (parse_transform(ts, &t)) ctm = mat_mul(ctm, t); }
+    if (!strcmp(n->tag, "text") || !strcmp(n->tag, "tspan")) {
+#ifdef SVG_WITH_TTF
+        float x = cx->text_active ? cx->text_x : 0.0f;
+        float y = cx->text_active ? cx->text_y : 0.0f;
+        const char* xs = attr_get(n, "x"), *ys = attr_get(n, "y"), *dxs = attr_get(n, "dx"), *dys = attr_get(n, "dy");
+        if (xs) x = parse_len(xs, cx->vw, x); if (ys) y = parse_len(ys, cx->vh, y);
+        if (dxs) x += parse_len(dxs, cx->vw, 0); if (dys) y += parse_len(dys, cx->vh, 0);
+        char* txt = svg_text_content(n);
+        if (txt && *txt) {
+            TTFFont* font = font_manager_get_styled(st.font_family, st.font_weight, st.font_italic);
+            float width = 0;
+            if (font) { int fs=(int)floorf(st.font_size+0.5f); if(fs<1)fs=1;if(fs>512)fs=512; width=ttf_text_width_f(font,txt,fs,(st.font_weight>=600?TTF_BOLD:0)|(st.font_italic?TTF_ITALIC:0)); }
+            if (st.text_anchor == 1) x -= width * 0.5f; else if (st.text_anchor == 2) x -= width;
+            draw_svg_text(cx, cv, txt, x, y, ctm, &st); x += width;
+        }
+        free(txt);
+        if (n->first) { Ctx tc = *cx; tc.text_active = 1; tc.text_x = x; tc.text_y = y; render_children(&tc, cv, n, ctm, &st, depth, use_depth); }
+#else
+        /* Standalone svg_cli builds without the browser font manager intentionally keep text inert. */
+#endif
+        return;
+    }
     float tol = 0.2f / mat_scale(ctm);
     const char* tg = n->tag; Path p = {0};
     if (!strcmp(tg, "g") || !strcmp(tg, "a") || !strcmp(tg, "switch")) { render_children(cx, cv, n, ctm, &st, depth, use_depth); return; }

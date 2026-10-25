@@ -40,7 +40,18 @@ void  afree(Arena* a);
  X(TEXT_DECO_LINE,"text-decoration-line") X(TEXT_TRANSFORM,"text-transform") X(TOP,"top") \
  X(VERTICAL_ALIGN,"vertical-align") X(VISIBILITY,"visibility") X(WHITE_SPACE,"white-space") X(WIDTH,"width") \
  X(WORD_BREAK,"word-break") X(OVERFLOW_WRAP,"overflow-wrap") X(WORD_WRAP,"word-wrap") X(Z_INDEX,"z-index") \
- X(BG_CLIP,"background-clip") X(TEXT_FILL,"text-fill-color") X(TRANSFORM,"transform") X(CONTENT,"content")
+ X(BG_CLIP,"background-clip") X(TEXT_FILL,"text-fill-color") X(TRANSFORM,"transform") X(CONTENT,"content") \
+ X(FILTER,"filter") X(BACKDROP_FILTER,"backdrop-filter") X(CLIP_PATH,"clip-path") X(MASK,"mask") X(MASK_IMAGE,"mask-image") \
+ X(MASK_SIZE,"mask-size") X(MASK_POS,"mask-position") X(MASK_REPEAT,"mask-repeat") X(TRANSFORM_ORIGIN,"transform-origin") \
+ X(TRANSITION,"transition") X(TRANSITION_PROPERTY,"transition-property") X(TRANSITION_DURATION,"transition-duration") \
+ X(TRANSITION_DELAY,"transition-delay") X(TRANSITION_TIMING,"transition-timing-function") \
+ X(ANIMATION,"animation") X(ANIMATION_NAME,"animation-name") X(ANIMATION_DURATION,"animation-duration") X(ANIMATION_DELAY,"animation-delay") \
+ X(ANIMATION_TIMING,"animation-timing-function") X(ANIMATION_ITER,"animation-iteration-count") X(ANIMATION_DIR,"animation-direction") \
+ X(ANIMATION_FILL,"animation-fill-mode") X(ANIMATION_PLAY,"animation-play-state") \
+ X(GRID_ROWS,"grid-template-rows") X(GRID_AUTO_ROWS,"grid-auto-rows") X(GRID_AUTO_COLS,"grid-auto-columns") X(GRID_AUTO_FLOW,"grid-auto-flow") \
+ X(GRID_ROW,"grid-row") X(GRID_ROW_START,"grid-row-start") X(GRID_ROW_END,"grid-row-end") X(GRID_COL_START,"grid-column-start") X(GRID_COL_END,"grid-column-end") \
+ X(JUSTIFY_ITEMS,"justify-items") X(JUSTIFY_SELF,"justify-self") X(ALIGN_CONTENT,"align-content") \
+ X(PLACE_ITEMS,"place-items") X(PLACE_SELF,"place-self") X(PLACE_CONTENT,"place-content")
 
 #define X(id, name) P_##id,
 enum { P_NONE = 0, PROP_LIST(X) P_CUSTOM, P_COUNT };
@@ -49,7 +60,7 @@ int css_prop_id(const char* name, size_t n);
 
 /* ── правила ── */
 enum { PC_FIRST_CHILD = 1, PC_LAST_CHILD, PC_ONLY_CHILD, PC_FIRST_TYPE, PC_LAST_TYPE, PC_ONLY_TYPE,
-       PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_NTH_TYPE, PC_ROOT, PC_EMPTY, PC_LINK, PC_CHECKED, PC_DISABLED, PC_ENABLED, PC_NEVER };
+       PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_NTH_TYPE, PC_ROOT, PC_EMPTY, PC_LINK, PC_CHECKED, PC_DISABLED, PC_ENABLED, PC_HOVER, PC_ACTIVE, PC_FOCUS, PC_FOCUS_WITHIN = PC_FOCUS + 100, PC_NEVER };
 
 typedef struct Simple {
     char tag[24];
@@ -72,7 +83,9 @@ typedef struct Rule {
     Decl* decls; int ndecls;
 } Rule;
 
-typedef struct { Rule** v; int n, cap; int next_order; } RuleSet;
+typedef struct { float off; Decl* decls; int nd; } KfFrame;
+typedef struct Keyframes { char name[48]; KfFrame* fr; int n; struct Keyframes* next; } Keyframes;
+typedef struct { Rule** v; int n, cap; int next_order; Keyframes* kf; int has_trans; int has_dyn; } RuleSet;
 
 Decl* css_parse_decls(Arena* a, const char* text, size_t len, int* out_n);
 void  css_parse_sheet(Arena* a, RuleSet* rs, const char* css, const char* sheet_url, int origin, int depth);
@@ -80,6 +93,7 @@ int   css_parse_color(const char* s, uint32_t* argb, uint32_t cur_color);
 int   css_parse_len(const char* s, Len* out, float em, float rem);
 int   css_media_matches(const char* query);
 extern int css_fetch_budget;
+extern int css_dyn_seen;
 Simple* css_parse_selector_ex(Arena* a, const char* s, size_t n, int* nsel);
 
 #endif

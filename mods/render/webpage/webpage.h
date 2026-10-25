@@ -40,6 +40,7 @@ void        webdoc_free(void* doc);
 int         websel_match(void* doc, WebSel* sel, DOMNode* n);
 void        webpage_invalidate_layout(void);
 void        webpage_force_layout(void);
+void        webpage_force_layout_for(DOMNode* head);
 void        webpage_get_scroll(int* x, int* y, int* vw, int* vh);
 int         webpage_node_rect(DOMNode* n, float* out4);          /* border-box в координатах документа */
 int         webpage_scroll_at(int mx, int my, int dx, int dy);   /* колесо над прокручиваемым контейнером: 1 — прокрутка выполнена */
@@ -50,6 +51,16 @@ void        font_manager_set_offline(int off);
 /* ── JavaScript (QuickJS + DOM-примитивы), см. js.c ── */
 void*       webpage_js_attach(DOMNode* head, const char* url, PageBundle* bundle);   /* создаёт JS-страницу, исполняет скрипты; владеет bundle */
 void        webpage_js_free(void* page);
+void        webpage_js_restyle(void* page);                                 /* пересчитать стили (после :hover/:active) */
+void        webpage_js_anim_events(void* page);                             /* transitionend/animationend… → JS */
+int         webpage_anim_tick(void);                                        /* 1 — идёт transition/animation и пора рисовать кадр */
+void        webpage_set_hover(DOMNode* n);
+void        webpage_set_active(DOMNode* n);
+DOMNode*    webpage_hover_node(void);
+DOMNode*    webpage_active_node(void);
+int         webpage_dyn_pending(void);
+void        webpage_dyn_clear_pending(void);
+int         webpage_uses_dyn(void);
 int         webpage_js_tick(void* page);                                    /* таймеры, промисы, пересчёт стилей; 1 — нужна перерисовка */
 int         webpage_js_dispatch(void* page, DOMNode* target, const char* type, const char* key, int mods);   /* 1 — preventDefault */
 int         webpage_js_before_submit(void* page, DOMNode* control);       /* submit-событие; 1 — можно отправлять */

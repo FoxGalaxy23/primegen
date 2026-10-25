@@ -7,11 +7,11 @@
 /* Раскладка порождает список команд отрисовки (display list) в координатах документа.
    Отрисовка (paint.c) применяет прокрутку и отсечение и не пересчитывает раскладку. */
 enum { C_BOX, C_RECT, C_TEXT, C_IMG, C_BGIMG, C_CTRL, C_CLIP, C_UNCLIP, C_HIT, C_MARK,
-       C_STK, C_ENDSTK };   /* C_STK/C_ENDSTK — границы position:sticky-блока: между ними смещение считается при отрисовке */
+       C_STK, C_ENDSTK, C_FX, C_ENDFX };   /* C_FX/C_ENDFX — слой эффектов элемента (filter/clip-path/mask/transform/backdrop-filter); node = элемент, x,y,w,h = border-box */   /* C_STK/C_ENDSTK — границы position:sticky-блока: между ними смещение считается при отрисовке */
 /* C_CLIP.flags: бит 1 — прокрутка по Y, бит 2 — по X (overflow:auto|scroll); ex = {scrollW, scrollH, maxX, maxY}, node = прокручиваемый элемент.
    C_STK.flags: бит 1 — задан top, бит 2 — задан bottom; x,y,w,h — border-box элемента;
-   ex = {top, y_верха_контейнера, y_низа_контейнера, bottom} в координатах документа (контейнер — content-box родителя). */
-enum { CF_SCROLL_Y = 1, CF_SCROLL_X = 2, SF_TOP = 1, SF_BOTTOM = 2 };
+   ex = {top, y_верха_контейнера, y_низа_контейнера, bottom, left, right, x_левого_края_контейнера, x_правого_края} в координатах документа (контейнер — content-box родителя). */
+enum { CF_SCROLL_Y = 1, CF_SCROLL_X = 2, SF_TOP = 1, SF_BOTTOM = 2, SF_LEFT = 4, SF_RIGHT = 8 };
 enum { F_NOLEFT = 1, F_NORIGHT = 2 };
 
 typedef struct {
@@ -25,7 +25,8 @@ typedef struct {
     uint32_t color;         /* C_TEXT/C_RECT */
     float    rad;           /* C_RECT: радиус; C_IMG: см. node->st.radius */
     float    opacity;
-    float    ex[4];         /* доп. параметры для C_CLIP (прокрутка) и C_STK (sticky), см. выше */
+    float    ex[8];         /* доп. параметры для C_CLIP (прокрутка) и C_STK (sticky), см. выше */
+    int      mate;          /* C_FX/C_ENDFX: индекс парной команды */
 } Cmd;
 
 extern Cmd*  l2_dl;
@@ -35,8 +36,11 @@ extern float l2_doc_w, l2_doc_h;
 extern float* l2_rects;      /* по idx узла: x,y,w,h border-box в координатах документа (из C_MARK) */
 extern int   l2_nrects;
 
+typedef struct { float x, y, mx, my, sw, sh, cw, ch; uint8_t is; } L2ScrollState;
 void l2_layout(DOMNode* head, int vw, int vh);   /* строит l2_dl */
 void l2_release(void);
+int  l2_scroll_state_export(const DOMNode* head, L2ScrollState* out, int cap); /* out==NULL: вернуть требуемое число записей */
+void l2_scroll_state_import(const L2ScrollState* in, int count, DOMNode* head);
 
 /* ── прокрутка внутри элементов (overflow:auto|scroll) ──
    Состояние хранится по idx узла и переживает перерасчёт раскладки (пока не сменился документ). */

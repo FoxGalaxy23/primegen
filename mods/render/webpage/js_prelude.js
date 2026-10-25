@@ -138,11 +138,127 @@ function makeClassList(el) {
 
 /* ───────── DOM: узлы ───────── */
 const wrappers = new Map();
+const customElementDefinitions = new Map();
+const customElementWaiters = new Map();
+const customConstructionStack = [];
+const customElementUpgradingIds = new Set();
+const shadowRootNodes = new Map();
+const RESERVED_CUSTOM_NAMES = new Set(['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri', 'font-face-format', 'font-face-name', 'missing-glyph']);
+function validCustomElementName(name) { return /^[a-z][.0-9_a-z-]*-[.0-9_a-z-]*$/.test(name) && !RESERVED_CUSTOM_NAMES.has(name); }
+function customDefinitionForId(id) {
+  const tag = D.tag(id);
+  const autonomous = customElementDefinitions.get(tag);
+  const is = D.attr(id, 'is');
+  if (is) { const def = customElementDefinitions.get(is); if (def && def.extendsTag && def.extendsTag === tag) return def; }
+  return autonomous && !autonomous.extendsTag ? autonomous : null;
+}
+function walkNative(id, visit) {
+  if (id == null || id < 0) return;
+  visit(id);
+  const kids = D.children(id) || [];
+  for (const child of kids) walkNative(child, visit);
+}
+function callCustomCallback(el, name, args) {
+  const cb = el && el[name];
+  if (typeof cb !== 'function') return;
+  try { cb.apply(el, args || []); } catch (e) { report(e); }
+}
+function upgradeCustomElement(id, def, existing) {
+  existing = existing || wrappers.get(id) || null;
+  // A custom constructor may mutate its own DOM and trigger an upgrade walk.
+  // Do not re-enter the same constructor while Reflect.construct is active.
+  if (customElementUpgradingIds.has(id)) return existing;
+  if (existing && existing.__ceDefinition === def) return existing;
+  if (existing && existing.__ceDefinition && existing.__ceDefinition !== def) return existing;
+  if (existing && existing instanceof def.constructor) {
+    existing.__ceDefinition = def;
+    existing.__ceConstructor = def.constructor;
+    existing.__ceConnected = false;
+    notifyInitialAttributes(existing, def);
+    if (existing.isConnected) {
+      existing.__ceConnected = true;
+      callCustomCallback(existing, 'connectedCallback', []);
+    }
+    return existing;
+  }
+  const entry = { id, target: existing, consumed: false };
+  customConstructionStack.push(entry);
+  customElementUpgradingIds.add(id);
+  let instance;
+  try {
+    instance = Reflect.construct(def.constructor, []);
+  } catch (e) {
+    const at = customConstructionStack.lastIndexOf(entry);
+    if (at >= 0) customConstructionStack.splice(at, 1);
+    customElementUpgradingIds.delete(id);
+    report(e);
+    return existing || wrappers.get(id) || mk(HTMLElement, id);
+  }
+  customElementUpgradingIds.delete(id);
+  const at = customConstructionStack.lastIndexOf(entry);
+  if (at >= 0) customConstructionStack.splice(at, 1);
+  if (!instance || instance.__id !== id) {
+    report(new TypeError('Custom element constructor must call super() and extend HTMLElement'));
+    return existing || wrappers.get(id) || mk(HTMLElement, id);
+  }
+  instance.__ceDefinition = def;
+  instance.__ceConstructor = def.constructor;
+  instance.__ceConnected = false;
+  notifyInitialAttributes(instance, def);
+  // Upgrade can happen lazily when a wrapper is first requested, outside
+  // the native-tree walk. In that case we must still deliver connectedCallback.
+  if (instance.isConnected) {
+    instance.__ceConnected = true;
+    callCustomCallback(instance, 'connectedCallback', []);
+  }
+  return instance;
+}
+function notifyInitialAttributes(el, def) {
+  if (!def.observedAttributes.length) return;
+  for (const name of D.attrNames(el.__id)) {
+    const attr = String(name).toLowerCase();
+    if (def.observedAttributes.includes(attr)) callCustomCallback(el, 'attributeChangedCallback', [attr, null, D.attr(el.__id, attr)]);
+  }
+}
+function upgradeTree(id) {
+  walkNative(id, (nodeId) => {
+    const def = customDefinitionForId(nodeId);
+    if (def) upgradeCustomElement(nodeId, def, wrappers.get(nodeId));
+  });
+}
+function connectedTree(id) {
+  walkNative(id, (nodeId) => {
+    const el = wrap(nodeId);
+    if (el && el.__ceDefinition && el.isConnected && !el.__ceConnected) {
+      el.__ceConnected = true;
+      callCustomCallback(el, 'connectedCallback', []);
+    }
+  });
+}
+function disconnectedTree(id) {
+  walkNative(id, (nodeId) => {
+    const el = wrappers.get(nodeId);
+    if (el && el.__ceDefinition && el.__ceConnected) {
+      el.__ceConnected = false;
+      callCustomCallback(el, 'disconnectedCallback', []);
+    }
+  });
+}
+function disconnectedChildren(id) { for (const child of (D.children(id) || []).slice()) disconnectedTree(child); }
+function setDomText(id, value) {
+  const oldChildren = D.type(id) === 3 ? [] : (D.children(id) || []).slice();
+  D.setText(id, value == null ? '' : String(value));
+  for (const child of oldChildren) disconnectedTree(child);
+}
 function mk(cls, id) { const o = Object.create(cls.prototype); o.__id = id; wrappers.set(id, o); return o; }
 const nodeList = (ids) => { const a = ids.map(wrap); a.item = (i) => a[i] || null; return a; };
 let document;
 function wrap(id) {
-  if (id < 0 || id == null) return null; let w = wrappers.get(id); if (w) return w;
+  if (id < 0 || id == null) return null;
+  let w = wrappers.get(id);
+  const def = customDefinitionForId(id);
+  if (def && (!w || w.__ceDefinition !== def)) return upgradeCustomElement(id, def, w);
+  if (w) return w;
   const t = D.tag(id); if (D.type(id) === 3) return mk(Text, id);
   if (t === '#frag') return mk(DocumentFragment, id);
   return mk(TAGCLS[t] || HTMLElement, id);
@@ -152,7 +268,7 @@ const unwrap = (n) => { if (n == null) throw new TypeError('parameter is not of 
 class Node extends EventTarget {
   get nodeType() { return this === document ? 9 : D.tag(this.__id) === '#frag' ? 11 : D.type(this.__id); }
   get nodeName() { const t = D.tag(this.__id); return t === '#text' ? '#text' : t === '#frag' ? '#document-fragment' : t == null ? '#document' : String(t).toUpperCase(); }
-  get parentNode() { const p = D.parent(this.__id); if (p < 0) return this.__id === D.root() ? document : null; return wrap(p); }
+  get parentNode() { const p = D.parent(this.__id); if (p < 0) return this.__id === D.root() ? document : null; const sr = shadowRootNodes.get(this.__id); if (sr && p === sr.__host.__id) return sr; return wrap(p); }
   __parent() { return this.parentNode; }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
   get childNodes() { return nodeList(D.children(this.__id)); }
@@ -162,21 +278,28 @@ class Node extends EventTarget {
   get previousElementSibling() { let n = D.prev(this.__id); while (n >= 0 && D.type(n) !== 1) n = D.prev(n); return wrap(n); }
   get isConnected() { let n = this.__id; while (D.parent(n) >= 0) n = D.parent(n); return n === D.root(); }
   get ownerDocument() { return document; }
-  get textContent() { return D.text(this.__id); } set textContent(v) { D.setText(this.__id, v == null ? '' : String(v)); }
+  get textContent() { return D.text(this.__id); }
+  set textContent(v) { setDomText(this.__id, v); }
   hasChildNodes() { return D.first(this.__id) >= 0; }
   contains(o) { for (let n = o; n; n = n.parentNode) if (n === this) return true; return false; }
   insertBefore(child, ref) {
-    if (child && child.nodeType === 11) { for (const c of child.childNodes) this.insertBefore(c, ref); return child; }
-    const ok = D.insertBefore(this.__id, unwrap(child), ref ? ref.__id : -1);
-    if (!ok) throw new DOMException('The new child element contains the parent.', 'HierarchyRequestError');
-    activateScript(child); return child;
+    if (child && child.nodeType === 11 && !child.__isShadowRoot) { for (const c of child.childNodes) this.insertBefore(c, ref); return child; }
+    const id = unwrap(child), wasConnected = !!(child && child.isConnected);
+    if (child === this || (child && typeof child.contains === 'function' && child.contains(this))) throw new DOMException('The new child element contains the parent.', 'HierarchyRequestError');
+    if (ref === child) return child;
+    if (wasConnected) { D.remove(id); disconnectedTree(id); }
+    if (this.__isShadowRoot) shadowRootNodes.set(id, this);
+    else shadowRootNodes.delete(id);
+    const ok = D.insertBefore(this.__id, id, ref ? ref.__id : -1);
+    if (!ok) { shadowRootNodes.delete(id); throw new DOMException('The new child element contains the parent.', 'HierarchyRequestError'); }
+    activateScript(child); upgradeTree(id); if (child && child.isConnected) connectedTree(id); return child;
   }
   appendChild(child) { return this.insertBefore(child, null); }
-  removeChild(child) { if (D.parent(child.__id) !== this.__id) throw new DOMException('The node to be removed is not a child of this node.', 'NotFoundError'); D.remove(child.__id); return child; }
+  removeChild(child) { if (!child || D.parent(child.__id) !== this.__id) throw new DOMException('The node to be removed is not a child of this node.', 'NotFoundError'); D.remove(child.__id); disconnectedTree(child.__id); return child; }
   replaceChild(n, old) { this.insertBefore(n, old); this.removeChild(old); return old; }
   cloneNode(deep) { return wrap(D.clone(this.__id, !!deep)); }
   normalize() {} isEqualNode(o) { return this.cloneNode(true).outerHTML === o.outerHTML; } isSameNode(o) { return this === o; }
-  getRootNode() { return document; } compareDocumentPosition() { return 0; }
+  getRootNode() { let n = this; while (n && n.parentNode) n = n.parentNode; return n || document; } compareDocumentPosition() { return 0; }
 }
 class CharacterData extends Node { get data() { return D.text(this.__id); } set data(v) { D.setText(this.__id, String(v)); } get nodeValue() { return this.data; } set nodeValue(v) { this.data = v; } get length() { return this.data.length; }
   get textContent() { return this.data; } set textContent(v) { this.data = v; } remove() { if (this.parentNode) this.parentNode.removeChild(this); } appendData(s) { this.data += s; } }
@@ -187,6 +310,19 @@ class DocumentFragment extends Node {
   get children() { return nodeList(D.children(this.__id).filter((c) => D.type(c) === 1)); } getElementById(id) { return this.querySelector('[id="' + id + '"]'); }
   append(...n) { for (const x of n) this.appendChild(typeof x === 'string' ? document.createTextNode(x) : x); }
 }
+class ShadowRoot extends DocumentFragment {
+  get nodeType() { return 11; } get nodeName() { return '#document-fragment'; }
+  get host() { return this.__host; } get parentNode() { return null; } get parentElement() { return null; }
+  get isConnected() { return !!(this.__host && this.__host.isConnected); }
+  get ownerDocument() { return document; }
+  __parent() { return this.__host || null; }
+  getRootNode() { return this; }
+  get innerHTML() { return D.innerHTML(this.__host.__id); }
+  set innerHTML(v) { this.__host.innerHTML = v; }
+  querySelector(s) { return wrap(D.query(this.__host.__id, s, false)); }
+  querySelectorAll(s) { return nodeList(D.query(this.__host.__id, s, true)); }
+  getElementById(id) { return this.querySelector('[id="' + String(id).replace(/"/g, '\\"') + '"]'); }
+}
 const toNodes = (a) => a.map((x) => (typeof x === 'string' ? document.createTextNode(x) : x));
 class Element extends Node {
   get tagName() { return D.tag(this.__id).toUpperCase(); } get localName() { return D.tag(this.__id); } get namespaceURI() { return 'http://www.w3.org/1999/xhtml'; }
@@ -194,17 +330,20 @@ class Element extends Node {
   get className() { return D.attr(this.__id, 'class') || ''; } set className(v) { D.setAttr(this.__id, 'class', String(v)); }
   get classList() { return makeClassList(this); } get style() { return makeStyle(this); } set style(v) { D.setAttr(this.__id, 'style', String(v)); } get dataset() { return makeDataset(this); }
   get attributes() { const a = D.attrNames(this.__id).map((n) => ({ name: n, value: D.attr(this.__id, n), nodeName: n, nodeValue: D.attr(this.__id, n) })); a.getNamedItem = (n) => a.find((x) => x.name === n) || null; a.item = (i) => a[i] || null; return a; }
-  getAttribute(n) { return D.attr(this.__id, String(n).toLowerCase()); } setAttribute(n, v) { D.setAttr(this.__id, String(n), String(v)); if (String(n).toLowerCase() === 'src') srcChanged(this); }
-  hasAttribute(n) { return D.attr(this.__id, String(n).toLowerCase()) !== null; } removeAttribute(n) { D.removeAttr(this.__id, String(n).toLowerCase()); }
+  getAttribute(n) { return D.attr(this.__id, String(n).toLowerCase()); }
+  setAttribute(n, v) { const name = String(n).toLowerCase(), value = String(v), oldValue = D.attr(this.__id, name); D.setAttr(this.__id, name, value); if (name === 'src') srcChanged(this); const def = this.__ceDefinition; if (def && oldValue !== value && def.observedAttributes.includes(name)) callCustomCallback(this, 'attributeChangedCallback', [name, oldValue, value]); }
+  hasAttribute(n) { return D.attr(this.__id, String(n).toLowerCase()) !== null; }
+  removeAttribute(n) { const name = String(n).toLowerCase(), oldValue = D.attr(this.__id, name); D.removeAttr(this.__id, name); const def = this.__ceDefinition; if (def && oldValue !== null && def.observedAttributes.includes(name)) callCustomCallback(this, 'attributeChangedCallback', [name, oldValue, null]); }
   toggleAttribute(n, f) { const has = this.hasAttribute(n); const on = f === undefined ? !has : !!f; if (on && !has) this.setAttribute(n, ''); else if (!on && has) this.removeAttribute(n); return on; }
   getAttributeNames() { return D.attrNames(this.__id); } hasAttributes() { return D.attrNames(this.__id).length > 0; }
   get children() { return nodeList(D.children(this.__id).filter((c) => D.type(c) === 1)); } get childElementCount() { return D.children(this.__id).filter((c) => D.type(c) === 1).length; }
   get firstElementChild() { const c = D.children(this.__id).find((x) => D.type(x) === 1); return c === undefined ? null : wrap(c); }
   get lastElementChild() { const a = D.children(this.__id).filter((x) => D.type(x) === 1); return a.length ? wrap(a[a.length - 1]) : null; }
-  get innerHTML() { return D.innerHTML(this.__id); } set innerHTML(v) { D.setInnerHTML(this.__id, String(v)); }
+  get innerHTML() { return D.innerHTML(this.__id); }
+  set innerHTML(v) { const oldChildren = (D.children(this.__id) || []).slice(); D.setInnerHTML(this.__id, String(v)); for (const child of oldChildren) disconnectedTree(child); upgradeTree(this.__id); connectedTree(this.__id); }
   get outerHTML() { return D.outerHTML(this.__id); } set outerHTML(v) { const p = this.parentNode; if (p) { D.insertHTML(this.__id, 0, String(v)); this.remove(); } }
-  get innerText() { return D.text(this.__id); } set innerText(v) { D.setText(this.__id, String(v)); }
-  insertAdjacentHTML(pos, html) { D.insertHTML(this.__id, ['beforebegin', 'afterbegin', 'beforeend', 'afterend'].indexOf(String(pos).toLowerCase()), String(html)); }
+  get innerText() { return D.text(this.__id); } set innerText(v) { this.textContent = String(v); }
+  insertAdjacentHTML(pos, html) { const at = ['beforebegin', 'afterbegin', 'beforeend', 'afterend'].indexOf(String(pos).toLowerCase()); D.insertHTML(this.__id, at, String(html)); const scope = at === 0 || at === 3 ? this.parentNode : this; if (scope && scope.__id >= 0) { upgradeTree(scope.__id); connectedTree(scope.__id); } }
   insertAdjacentElement(pos, el) { pos = String(pos).toLowerCase(); if (pos === 'beforebegin') this.parentNode.insertBefore(el, this); else if (pos === 'afterbegin') this.insertBefore(el, this.firstChild); else if (pos === 'beforeend') this.appendChild(el); else this.parentNode.insertBefore(el, this.nextSibling); return el; }
   insertAdjacentText(pos, t) { this.insertAdjacentElement(pos, document.createTextNode(t)); }
   append(...n) { for (const x of toNodes(n)) this.appendChild(x); } prepend(...n) { const f = this.firstChild; for (const x of toNodes(n)) this.insertBefore(x, f); }
@@ -223,13 +362,35 @@ class Element extends Node {
   focus() { D.focus(this.__id); fire(this, new FocusEvent('focus')); fire(this, new FocusEvent('focusin', { bubbles: true })); } blur() { if (D.active() === this.__id) D.focus(-1); fire(this, new FocusEvent('blur')); }
   click() { const ev = new MouseEvent('click', { bubbles: true, cancelable: true }); ev.isTrusted = false; if (fire(this, ev)) defaultAction(this); }
   animate() { return { finished: Promise.resolve(), cancel: noop, play: noop, pause: noop, finish: noop, onfinish: null, addEventListener: noop }; } getAnimations() { return []; }
-  attachShadow() { return this; } get shadowRoot() { return null; } setPointerCapture() {} releasePointerCapture() {} requestFullscreen() { return Promise.resolve(); }
+  attachShadow(init) {
+    init = init || {}; const mode = init.mode;
+    if (mode !== 'open' && mode !== 'closed') throw new TypeError("Failed to execute 'attachShadow': an options object with mode 'open' or 'closed' is required.");
+    if (this.__shadowRoot) throw new DOMException('Shadow root cannot be created on this host more than once.', 'NotSupportedError');
+    const root = Object.create(ShadowRoot.prototype); root.__id = this.__id; root.__host = this; root.__isShadowRoot = true;
+    root.mode = mode; root.delegatesFocus = !!init.delegatesFocus; root.slotAssignment = init.slotAssignment === 'named' ? 'named' : 'manual';
+    this.__shadowRoot = root; D.setAttr(this.__id, 'data-ml-shadow-root', '1'); return root;
+  }
+  get shadowRoot() { return this.__shadowRoot && this.__shadowRoot.mode === 'open' ? this.__shadowRoot : null; }
+  setPointerCapture() {} releasePointerCapture() {} requestFullscreen() { return Promise.resolve(); }
   get hidden() { return this.hasAttribute('hidden'); } set hidden(v) { this.toggleAttribute('hidden', !!v); }
   get title() { return this.getAttribute('title') || ''; } set title(v) { this.setAttribute('title', v); } get lang() { return this.getAttribute('lang') || ''; } set lang(v) { this.setAttribute('lang', v); } get dir() { return this.getAttribute('dir') || ''; } set dir(v) { this.setAttribute('dir', v); }
   get tabIndex() { const v = this.getAttribute('tabindex'); return v === null ? -1 : +v; } set tabIndex(v) { this.setAttribute('tabindex', v); }
   get slot() { return ''; } get part() { return []; } get isContentEditable() { return false; } get contentEditable() { return 'inherit'; } set contentEditable(v) {}
 }
 class HTMLElement extends Element {
+  constructor() {
+    super();
+    const entry = customConstructionStack.length ? customConstructionStack[customConstructionStack.length - 1] : null;
+    if (entry && !entry.consumed) {
+      entry.consumed = true; customConstructionStack.pop();
+      const target = entry.target;
+      if (target) {
+        Object.setPrototypeOf(target, new.target.prototype); target.__id = entry.id; wrappers.set(entry.id, target);
+        return target;
+      }
+      this.__id = entry.id; wrappers.set(entry.id, this);
+    }
+  }
   get onclick() { return this.__onclick || null; } set onclick(f) { this.__onclick = f; }
 }
 for (const ev of ['change', 'input', 'submit', 'load', 'error', 'keydown', 'keyup', 'keypress', 'focus', 'blur', 'mousedown', 'mouseup', 'mouseover', 'mouseout', 'mousemove', 'scroll', 'resize', 'dblclick', 'contextmenu', 'touchstart', 'touchend', 'wheel', 'animationend', 'transitionend', 'pointerdown', 'pointerup', 'message', 'popstate'])
@@ -444,7 +605,7 @@ g.CanvasRenderingContext2D = CanvasRenderingContext2D; g.CanvasGradient = Canvas
 class HTMLCanvasElement extends HTMLElement {
   getContext(type) { type = String(type || '2d').toLowerCase(); if (type !== '2d') return null; if (!this.__ctx2d) this.__ctx2d = new CanvasRenderingContext2D(this); return this.__ctx2d; }
   toDataURL() { if (!this.__ctx2d) return 'data:,'; this.__ctx2d.__flush(); return D.canvasToDataURL(this.__ctx2d.__buf.buffer, this.width, this.height); }
-  toBlob(cb, type, quality) { void type; void quality; const url = this.toDataURL(); const b64 = url.split(',')[1] || ''; const bin = atob(b64); defer(() => cb(new Blob([bin], { type: 'image/png' }))); }
+  toBlob(cb, type, quality) { void type; void quality; const url = this.toDataURL(); const b64 = url.split(',')[1] || ''; const bin = atob(b64); const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i); defer(() => cb(new Blob([u8], { type: 'image/png' }))); }
   get width() { return +D.attr(this.__id, 'width') || 300; } set width(v) { this.setAttribute('width', v); if (this.__ctx2d) this.__ctx2d.__resize(); }
   get height() { return +D.attr(this.__id, 'height') || 150; } set height(v) { this.setAttribute('height', v); if (this.__ctx2d) this.__ctx2d.__resize(); }
 }
@@ -477,7 +638,8 @@ class Document extends Node {
   get title() { return D.title(); } set title(v) { D.setTitle(String(v)); }
   getElementById(id) { return wrap(D.byId(String(id))); } querySelector(s) { return wrap(D.query(-1, s, false)); } querySelectorAll(s) { return nodeList(D.query(-1, s, true)); }
   getElementsByTagName(t) { return nodeList(D.query(-1, t, true)); } getElementsByClassName(c) { return nodeList(D.query(-1, c.trim().split(/\s+/).map((x) => '.' + x).join(''), true)); } getElementsByName(n) { return nodeList(D.query(-1, '[name="' + n + '"]', true)); }
-  createElement(t) { return wrap(D.create(String(t))); } createElementNS(ns, t) { return wrap(D.create(String(t))); } createTextNode(s) { return wrap(D.createText(String(s))); } createComment() { return mk(Comment, D.createText('')); }
+  createElement(t, options) { const id = D.create(String(t)); if (options && options.is) D.setAttr(id, 'is', String(options.is)); return wrap(id); }
+  createElementNS(ns, t) { return wrap(D.create(String(t))); } createTextNode(s) { return wrap(D.createText(String(s))); } createComment() { return mk(Comment, D.createText('')); }
   createDocumentFragment() { return wrap(D.create('#frag')); } createEvent(t) { return /mouse/i.test(t) ? new MouseEvent('') : /key/i.test(t) ? new KeyboardEvent('') : new Event(''); }
   createRange() { return { setStart: noop, setEnd: noop, selectNodeContents: noop, collapse: noop, getBoundingClientRect() { return { top: 0, left: 0, width: 0, height: 0, right: 0, bottom: 0 }; }, createContextualFragment(h) { const f = document.createDocumentFragment(); D.setInnerHTML(f.__id, h); return f; }, detach: noop }; }
   createTreeWalker() { return { nextNode() { return null; } }; } getSelection() { return { rangeCount: 0, removeAllRanges: noop, addRange: noop, toString() { return ''; }, isCollapsed: true }; }
@@ -505,7 +667,7 @@ for (const [k, v] of Object.entries({ Event, CustomEvent, UIEvent, MouseEvent, P
   HTMLInputElement, HTMLTextAreaElement, HTMLButtonElement, HTMLSelectElement, HTMLOptionElement, HTMLFormElement, HTMLAnchorElement, HTMLImageElement, HTMLScriptElement, HTMLLinkElement, HTMLStyleElement, HTMLTemplateElement, HTMLCanvasElement, HTMLIFrameElement, HTMLMediaElement, HTMLBodyElement, HTMLDivElement, HTMLSpanElement, HTMLLabelElement, HTMLTableElement, HTMLUListElement, HTMLLIElement, HTMLParagraphElement, HTMLHtmlElement, HTMLHeadElement }))
   Object.defineProperty(g, k, { value: v, writable: true, configurable: true });
 Object.setPrototypeOf(g, EventTarget.prototype);
-g.HTMLMediaElement = HTMLMediaElement; g.HTMLVideoElement = HTMLMediaElement; g.HTMLAudioElement = HTMLMediaElement; g.HTMLHeadingElement = HTMLElement; g.SVGElement = Element; g.ShadowRoot = DocumentFragment; g.Window = function Window() {}; g.NodeList = Array; g.HTMLCollection = Array;
+g.HTMLMediaElement = HTMLMediaElement; g.HTMLVideoElement = HTMLMediaElement; g.HTMLAudioElement = HTMLMediaElement; g.HTMLHeadingElement = HTMLElement; g.SVGElement = Element; g.ShadowRoot = ShadowRoot; g.Window = function Window() {}; g.NodeList = Array; g.HTMLCollection = Array;
 class DOMException extends Error { constructor(m, n) { super(m); this.name = n || 'Error'; this.message = m; } } g.DOMException = DOMException;
 g.Image = function (w, h) { const i = document.createElement('img'); if (w) i.setAttribute('width', w); if (h) i.setAttribute('height', h); return i; }; g.Option = function (t, v, d, s) { const o = document.createElement('option'); if (t !== undefined) o.textContent = t; if (v !== undefined) o.setAttribute('value', v); if (s) o.selected = true; return o; }; g.Audio = function () { return document.createElement('audio'); };
 
@@ -538,7 +700,7 @@ g.history = { get length() { return hist.states.length; }, get state() { return 
 g.navigator = { userAgent: UA, appVersion: UA.slice(8), appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko', vendor: 'Google Inc.', platform: 'Linux x86_64', language: 'en-US', languages: ['en-US', 'en', 'ru'], cookieEnabled: true, onLine: true, hardwareConcurrency: 4, deviceMemory: 8, maxTouchPoints: 0, doNotTrack: null, webdriver: false,
   sendBeacon() { return true; }, javaEnabled() { return false; }, clipboard: { writeText() { return Promise.resolve(); }, readText() { return Promise.resolve(''); } }, permissions: { query() { return Promise.resolve({ state: 'denied', addEventListener: noop }); } }, mediaDevices: undefined, serviceWorker: undefined, connection: { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, addEventListener: noop } };
 g.screen = { get width() { return D.viewport()[0] + 10; }, get height() { return D.viewport()[1] + 80; }, get availWidth() { return this.width; }, get availHeight() { return this.height; }, colorDepth: 24, pixelDepth: 24, orientation: { type: 'landscape-primary', angle: 0, addEventListener: noop } };
-g.devicePixelRatio = 1; g.isSecureContext = true; g.origin = undefined;
+g.devicePixelRatio = 1; g.isSecureContext = (location.protocol === 'https:' || (location.protocol === 'http:' && /^(localhost|127(?:\.\d+){3})$/i.test(location.hostname))); g.origin = undefined;
 Object.defineProperties(g, { innerWidth: { get: () => D.viewport()[0], configurable: true }, innerHeight: { get: () => D.viewport()[1], configurable: true }, outerWidth: { get: () => D.viewport()[0] + 10, configurable: true }, outerHeight: { get: () => D.viewport()[1] + 80, configurable: true },
   scrollX: { get: () => D.viewport()[2], configurable: true }, scrollY: { get: () => D.viewport()[3], configurable: true }, pageXOffset: { get: () => D.viewport()[2], configurable: true }, pageYOffset: { get: () => D.viewport()[3], configurable: true } });
 g.scrollTo = g.scroll = (x, y) => { if (typeof x === 'object' && x) { y = x.top; x = x.left; } D.scrollTo(x || 0, y === undefined ? D.viewport()[3] : y); }; g.scrollBy = (x, y) => { if (typeof x === 'object' && x) { y = x.top; x = x.left; } const v = D.viewport(); D.scrollTo(v[2] + (x || 0), v[3] + (y || 0)); };
@@ -551,7 +713,41 @@ g.performance = { now: () => D.now() - t0, timeOrigin: Date.now(), mark: noop, m
 const t0 = D.now();
 g.crypto = { getRandomValues(a) { for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 4294967296); return a; }, randomUUID() { return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => { const r = (Math.random() * 16) | 0; return (c === 'x' ? r : (r & 3) | 8).toString(16); }); }, subtle: {} };
 g.CSS = { supports: () => false, escape: (s) => String(s).replace(/[^a-zA-Z0-9_\u00a0-\uffff-]/g, (c) => '\\' + c) };
-g.customElements = { define: noop, get: () => undefined, whenDefined: () => Promise.resolve(), upgrade: noop };
+g.customElements = {
+  define(name, constructor, options) {
+    name = String(name);
+    if (!validCustomElementName(name)) throw new DOMException(`'${name}' is not a valid custom element name`, 'SyntaxError');
+    if (customElementDefinitions.has(name)) throw new DOMException(`A custom element with name '${name}' has already been defined`, 'NotSupportedError');
+    if (typeof constructor !== 'function' || !constructor.prototype || !(constructor.prototype instanceof HTMLElement)) throw new TypeError('Custom element constructor must extend HTMLElement');
+    for (const def of customElementDefinitions.values()) if (def.constructor === constructor) throw new DOMException('This constructor has already been used with a different name', 'NotSupportedError');
+    let extendsTag = '';
+    if (options && options.extends != null) {
+      extendsTag = String(options.extends).toLowerCase();
+      if (!extendsTag || validCustomElementName(extendsTag)) throw new DOMException('The extends option must name a built-in HTML element', 'NotSupportedError');
+    }
+    let observed = [];
+    if (Array.isArray(constructor.observedAttributes)) observed = constructor.observedAttributes.map((a) => String(a).toLowerCase());
+    const def = { name, constructor, extendsTag, observedAttributes: observed };
+    customElementDefinitions.set(name, def);
+    const waiter = customElementWaiters.get(name); if (waiter) { waiter.resolve(); customElementWaiters.delete(name); }
+    const rootId = D.root(); upgradeTree(rootId); connectedTree(rootId);
+  },
+  get(name) { const def = customElementDefinitions.get(String(name)); return def ? def.constructor : undefined; },
+  whenDefined(name) {
+    name = String(name);
+    if (!validCustomElementName(name)) return Promise.reject(new DOMException(`'${name}' is not a valid custom element name`, 'SyntaxError'));
+    if (customElementDefinitions.has(name)) return Promise.resolve();
+    let waiter = customElementWaiters.get(name);
+    if (!waiter) { let resolve; const promise = new Promise((r) => { resolve = r; }); waiter = { promise, resolve }; customElementWaiters.set(name, waiter); }
+    return waiter.promise;
+  },
+  upgrade(root) {
+    if (!root) return;
+    const id = root === document ? D.root() : root.__id;
+    if (id == null || id < 0) return;
+    upgradeTree(id); if (root.isConnected) connectedTree(id);
+  }
+};
 /* ───────── Intl: настоящее форматирование (не ICU-таблицы, но реальная логика — группировка разрядов,
    валюты, названия месяцев/дней недели по нескольким распространённым локалям, плюральные правила en/ru). ───────── */
 (function () {
@@ -647,6 +843,121 @@ const storageProxy = (persist) => { const s = new Storage();
   return new Proxy(s, { get(t, k) { if (k in Storage.prototype || k === '__d') return typeof t[k] === 'function' ? t[k].bind(t) : t[k]; return typeof k === 'string' ? t.getItem(k) ?? undefined : undefined; }, set(t, k, v) { t.setItem(k, v); return true; }, deleteProperty(t, k) { t.removeItem(k); return true; }, has(t, k) { return t.__d.has(String(k)) || k in Storage.prototype; }, ownKeys(t) { return [...t.__d.keys()]; }, getOwnPropertyDescriptor(t, k) { return t.__d.has(String(k)) ? { value: t.__d.get(String(k)), writable: true, enumerable: true, configurable: true } : undefined; } }); };
 g.Storage = Storage; g.localStorage = storageProxy(true); g.sessionStorage = storageProxy(false);
 
+/* ───────── IndexedDB (SQLite-backed, origin/profile isolated) ─────────
+   Implementiert asynchrone Requests, Version-Upgrades, Stores und die üblichen Key/Value-Operationen.
+   Werte müssen JSON-serialisierbar sein; komplexe Structured-Clone-Typen/Transaktions-Rollback sind noch nicht enthalten. */
+function idbErr(name, message) { return new DOMException(message || name, name); }
+function idbClone(v) { const s = JSON.stringify(v); if (s === undefined) throw idbErr('DataCloneError', 'Value cannot be cloned'); return JSON.parse(s); }
+function idbKeyEncode(k) {
+  if (typeof k === 'string') return 's:' + k;
+  if (typeof k === 'number' && Number.isFinite(k)) return 'n:' + (Object.is(k, -0) ? '0' : String(k));
+  if (k instanceof Date && Number.isFinite(k.getTime())) return 'd:' + k.getTime();
+  if (Array.isArray(k)) return 'a:' + JSON.stringify(k.map((x) => idbKeyEncode(x)));
+  throw idbErr('DataError', 'The provided key is not a valid IndexedDB key');
+}
+function idbKeyDecode(k) {
+  k = String(k); const p = k.slice(0, 2), v = k.slice(2);
+  if (p === 's:') return v; if (p === 'n:') return Number(v); if (p === 'd:') return new Date(Number(v));
+  if (p === 'a:') { try { return JSON.parse(v).map(idbKeyDecode); } catch (e) { return []; } }
+  return v;
+}
+function idbCmp(a, b) {
+  if (Array.isArray(a) && Array.isArray(b)) { for (let i = 0; i < Math.min(a.length, b.length); i++) { const c = idbCmp(a[i], b[i]); if (c) return c; } return a.length - b.length; }
+  if (a instanceof Date) a = a.getTime(); if (b instanceof Date) b = b.getTime();
+  if (typeof a === 'number' && typeof b === 'number') return a < b ? -1 : a > b ? 1 : 0;
+  if (typeof a !== typeof b) return typeof a < typeof b ? -1 : 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+class IDBKeyRange {
+  constructor(lower, upper, lowerOpen, upperOpen) { this.lower = lower; this.upper = upper; this.lowerOpen = !!lowerOpen; this.upperOpen = !!upperOpen; this.__idbRange = true; }
+  includes(k) { if (this.lower !== undefined) { const c = idbCmp(k, this.lower); if (c < 0 || (c === 0 && this.lowerOpen)) return false; } if (this.upper !== undefined) { const c = idbCmp(k, this.upper); if (c > 0 || (c === 0 && this.upperOpen)) return false; } return true; }
+  static only(v) { idbKeyEncode(v); return new IDBKeyRange(v, v, false, false); }
+  static lowerBound(v, open) { idbKeyEncode(v); return new IDBKeyRange(v, undefined, !!open, false); }
+  static upperBound(v, open) { idbKeyEncode(v); return new IDBKeyRange(undefined, v, false, !!open); }
+  static bound(a, b, lo, uo) { idbKeyEncode(a); idbKeyEncode(b); if (idbCmp(a, b) > 0 || (idbCmp(a, b) === 0 && (lo || uo))) throw idbErr('DataError', 'The lower key is greater than the upper key'); return new IDBKeyRange(a, b, !!lo, !!uo); }
+}
+g.IDBKeyRange = IDBKeyRange;
+class IDBNameList {
+  constructor(getter) { this.__get = getter; return new Proxy(this, { get(t, k) { const a = t.__get(); if (typeof k === 'string' && /^\d+$/.test(k)) return a[+k]; if (k === 'length') return a.length; if (k === Symbol.iterator) return a[Symbol.iterator].bind(a); if (k in t) return typeof t[k] === 'function' ? t[k].bind(t) : t[k]; return undefined; }, ownKeys(t) { return [...t.__get().map((_, i) => String(i)), 'length']; }, getOwnPropertyDescriptor(t, k) { const a=t.__get(); if (k==='length') return { configurable:true, value:a.length }; if (/^\d+$/.test(String(k)) && +k<a.length) return { configurable:true, enumerable:true, value:a[+k] }; return undefined; } }); }
+  item(i) { return this.__get()[i] || null; } contains(n) { return this.__get().includes(String(n)); }
+}
+class IDBRequest extends EventTarget {
+  constructor() { super(); this.result = undefined; this.error = null; this.source = null; this.transaction = null; this.readyState = 'pending'; this.onsuccess = this.onerror = null; }
+  __ok(value) { if (this.readyState !== 'pending') return; this.result = value; this.error = null; this.readyState = 'done'; fire(this, new Event('success')); }
+  __fail(err) { if (this.readyState !== 'pending') return; this.error = err instanceof Error ? err : idbErr('UnknownError', String(err)); this.readyState = 'done'; fire(this, new Event('error', { bubbles: true, cancelable: true })); }
+}
+class IDBOpenDBRequest extends IDBRequest { constructor() { super(); this.onblocked = this.onupgradeneeded = null; } }
+function idbGetPath(v, path) { if (!path) return undefined; let x=v; for(const p of String(path).split('.')) { if(x==null) return undefined; x=x[p]; } return x; }
+function idbSetPath(v, path, key) { const ps=String(path).split('.'); let x=v; for(let i=0;i<ps.length-1;i++) { if(!x[ps[i]] || typeof x[ps[i]]!=='object') x[ps[i]]={}; x=x[ps[i]]; } x[ps[ps.length-1]]=key; }
+function idbRangeMatch(query, key) { if (query === undefined) return true; if (query && query.__idbRange) return query.includes(key); try { return idbCmp(key, query) === 0; } catch (e) { return false; } }
+class IDBDatabase extends EventTarget {
+  constructor(name, meta) { super(); this.name=name; this.version=meta.version; this.__meta=meta; this.__closed=false; this.onabort=this.onclose=this.onerror=this.onversionchange=null; this.objectStoreNames=new IDBNameList(()=>this.__meta.stores.map((s)=>s.name)); }
+  __save() { D.idbMetaSet(this.name, this.version, JSON.stringify(this.__meta.stores)); }
+  createObjectStore(name, opts) { name=String(name); if(this.__meta.stores.some(s=>s.name===name)) throw idbErr('ConstraintError','An object store with this name already exists'); opts=opts||{}; const s={name, keyPath:opts.keyPath===undefined?null:opts.keyPath, autoIncrement:!!opts.autoIncrement, nextKey:1, indexes:[]}; if(s.keyPath!==null && typeof s.keyPath!=='string' && !Array.isArray(s.keyPath)) throw idbErr('SyntaxError','Invalid keyPath'); if(Array.isArray(s.keyPath)) throw idbErr('NotSupportedError','Compound key paths are not supported'); this.__meta.stores.push(s); this.__save(); return new IDBObjectStore(this, null, s.name, 'versionchange'); }
+  deleteObjectStore(name) { name=String(name); const i=this.__meta.stores.findIndex(s=>s.name===name); if(i<0) throw idbErr('NotFoundError','Object store not found'); D.idbClear(this.name,name); this.__meta.stores.splice(i,1); this.__save(); }
+  transaction(names, mode, options) { if(this.__closed) throw idbErr('InvalidStateError','Database connection is closed'); if(typeof names==='string') names=[names]; else names=Array.from(names||[]); mode=mode||'readonly'; if(!['readonly','readwrite'].includes(mode)) throw idbErr('TypeError','Invalid transaction mode'); for(const n of names) if(!this.__meta.stores.some(s=>s.name===n)) throw idbErr('NotFoundError','Object store not found: '+n); void options; return new IDBTransaction(this,names,mode); }
+  close() { this.__closed=true; }
+}
+class IDBTransaction extends EventTarget {
+  constructor(db,names,mode) { super(); this.db=db; this.mode=mode; this.objectStoreNames=new IDBNameList(()=>names.slice()); this.error=null; this.onabort=this.oncomplete=this.onerror=null; this.__names=names; this.__pending=0; this.__done=false; this.__aborted=false; this.__scheduled=false; defer(()=>this.__finishMaybe()); }
+  objectStore(n) { if(!this.__names.includes(String(n))) throw idbErr('NotFoundError','Object store is not in this transaction'); return new IDBObjectStore(this.db,this,String(n),this.mode); }
+  __queue(req, fn) { if(this.__done || this.__aborted) { defer(()=>req.__fail(idbErr('TransactionInactiveError','Transaction is inactive'))); return req; } this.__pending++; req.transaction=this; defer(()=>{ if(this.__aborted){ req.__fail(this.error||idbErr('AbortError','Transaction aborted')); this.__pending--; return this.__finishMaybe(); } try { req.__ok(fn()); } catch(e) { req.__fail(e); if(e && e.name==='ConstraintError') { /* request error does not automatically abort transaction */ } } this.__pending--; this.__finishMaybe(); }); return req; }
+  __finishMaybe() { if(this.__done || this.__pending>0 || this.__aborted || this.__scheduled) return; this.__scheduled=true; defer(()=>{this.__scheduled=false;if(this.__done||this.__pending>0||this.__aborted)return;this.__done=true;fire(this,new Event('complete'));}); }
+  abort() { if(this.__done) throw idbErr('InvalidStateError','Transaction already finished'); this.__aborted=true; this.error=idbErr('AbortError','Transaction aborted'); fire(this,new Event('abort')); }
+  commit() { this.__finishMaybe(); }
+}
+function idbRows(dbName, storeName) { let rows=[]; try { rows=JSON.parse(D.idbList(dbName,storeName)||'[]'); } catch(e) {} return rows.map(r=>({ key:idbKeyDecode(r.k), encoded:r.k, value:(()=>{try{return typeof r.v === 'string' ? JSON.parse(r.v) : r.v;}catch(e){return null;}})() })).sort((a,b)=>idbCmp(a.key,b.key)); }
+class IDBObjectStore {
+  constructor(db, tx, name, mode) { this.transaction=tx; this.__db=db; this.name=name; this.__mode=mode; this.__config=()=>db.__meta.stores.find(s=>s.name===name); this.keyPath=this.__config()?.keyPath ?? null; this.autoIncrement=!!this.__config()?.autoIncrement; this.indexNames=new IDBNameList(()=>((this.__config()||{}).indexes||[]).map(i=>i.name)); }
+  __tx() { if(this.__mode==='readonly' && this.transaction && this.transaction.mode!=='readonly') {} if(this.transaction) return this.transaction; return new IDBTransaction(this.__db,[this.name],this.__mode==='versionchange'?'readwrite':this.__mode); }
+  __request(fn) { return this.__tx().__queue(new IDBRequest(),fn); }
+  __write() { if(this.__mode==='readonly') throw idbErr('ReadOnlyError','The transaction is read-only'); }
+  put(value,key) { this.__write(); const v=idbClone(value); const cfg=this.__config(); let k=key; if(cfg.keyPath!==null) { if(key!==undefined) throw idbErr('DataError','Explicit key cannot be used with inline keyPath'); k=idbGetPath(v,cfg.keyPath); } if(k===undefined && cfg.autoIncrement) { k=cfg.nextKey++; if(cfg.keyPath!==null) idbSetPath(v,cfg.keyPath,k); this.__db.__save(); } if(k===undefined) throw idbErr('DataError','A key is required'); const ek=idbKeyEncode(k), serialized=JSON.stringify(v); return this.__request(()=>{D.idbPut(this.__db.name,this.name,ek,serialized);return k;}); }
+  add(value,key) { this.__write(); const v=idbClone(value); const cfg=this.__config(); let k=key; if(cfg.keyPath!==null){if(key!==undefined)throw idbErr('DataError','Explicit key cannot be used with inline keyPath');k=idbGetPath(v,cfg.keyPath);} if(k===undefined&&cfg.autoIncrement){k=cfg.nextKey++;if(cfg.keyPath!==null)idbSetPath(v,cfg.keyPath,k);this.__db.__save();}if(k===undefined)throw idbErr('DataError','A key is required');const ek=idbKeyEncode(k), serialized=JSON.stringify(v); return this.__request(()=>{if(D.idbGet(this.__db.name,this.name,ek)!==null)throw idbErr('ConstraintError','Key already exists');D.idbPut(this.__db.name,this.name,ek,serialized);return k;}); }
+  get(query) { return this.__request(()=>{const k=idbKeyEncode(query&&query.__idbRange?(()=>{throw idbErr('DataError','get() requires a single key, not a range');})():query); const v=D.idbGet(this.__db.name,this.name,k); return v===null?undefined:idbClone(JSON.parse(v));}); }
+  getKey(query) { return this.__request(()=>{const r=idbRows(this.__db.name,this.name).find(x=>idbRangeMatch(query,x.key));return r? r.key:undefined;}); }
+  getAll(query,count) { return this.__request(()=>idbRows(this.__db.name,this.name).filter(x=>idbRangeMatch(query,x.key)).slice(0,count===undefined?undefined:Math.max(0,+count)).map(x=>idbClone(x.value))); }
+  getAllKeys(query,count) { return this.__request(()=>idbRows(this.__db.name,this.name).filter(x=>idbRangeMatch(query,x.key)).slice(0,count===undefined?undefined:Math.max(0,+count)).map(x=>x.key)); }
+  count(query) { return this.__request(()=>idbRows(this.__db.name,this.name).filter(x=>idbRangeMatch(query,x.key)).length); }
+  delete(query) { this.__write(); return this.__request(()=>{const rows=idbRows(this.__db.name,this.name);for(const r of rows)if(idbRangeMatch(query,r.key))D.idbRemove(this.__db.name,this.name,r.encoded);return undefined;}); }
+  clear() { this.__write(); return this.__request(()=>{D.idbClear(this.__db.name,this.name);return undefined;}); }
+  createIndex(name,keyPath,opts) { if(this.__mode!=='versionchange')throw idbErr('InvalidStateError','Indexes can only be created during upgrade');const c=this.__config();name=String(name);if(c.indexes.some(i=>i.name===name))throw idbErr('ConstraintError','Index already exists');if(typeof keyPath!=='string')throw idbErr('NotSupportedError','Only string index paths are supported');const i={name,keyPath,unique:!!(opts&&opts.unique),multiEntry:!!(opts&&opts.multiEntry)};c.indexes.push(i);this.__db.__save();return new IDBIndex(this,i); }
+  index(name) { const i=(this.__config().indexes||[]).find(i=>i.name===String(name));if(!i)throw idbErr('NotFoundError','Index not found');return new IDBIndex(this,i); }
+  deleteIndex(name) { if(this.__mode!=='versionchange')throw idbErr('InvalidStateError','Indexes can only be deleted during upgrade');const c=this.__config();const i=c.indexes.findIndex(i=>i.name===String(name));if(i<0)throw idbErr('NotFoundError','Index not found');c.indexes.splice(i,1);this.__db.__save(); }
+  openCursor(query,direction) { return new IDBCursorRequest(this,query,direction||'next',false); }
+  openKeyCursor(query,direction) { return new IDBCursorRequest(this,query,direction||'next',true); }
+}
+class IDBIndex {
+  constructor(store,cfg) { this.objectStore=store;this.name=cfg.name;this.keyPath=cfg.keyPath;this.unique=cfg.unique;this.multiEntry=cfg.multiEntry; }
+  __rows(query,keysOnly) { return idbRows(this.objectStore.__db.name,this.objectStore.name).map(r=>({r,k:idbGetPath(r.value,this.keyPath)})).filter(x=>x.k!==undefined&&idbRangeMatch(query,x.k)).sort((a,b)=>idbCmp(a.k,b.k)); }
+  get(q) { return this.objectStore.__request(()=>{const x=this.__rows(q)[0];return x?idbClone(x.r.value):undefined;}); }
+  getKey(q) { return this.objectStore.__request(()=>{const x=this.__rows(q)[0];return x?x.r.key:undefined;}); }
+  getAll(q,count) { return this.objectStore.__request(()=>this.__rows(q).slice(0,count===undefined?undefined:Math.max(0,+count)).map(x=>idbClone(x.r.value))); }
+  getAllKeys(q,count) { return this.objectStore.__request(()=>this.__rows(q).slice(0,count===undefined?undefined:Math.max(0,+count)).map(x=>x.r.key)); }
+  count(q) { return this.objectStore.__request(()=>this.__rows(q).length); }
+  openCursor(q,d) { return new IDBCursorRequest(this.objectStore,q,d||'next',false,this); }
+  openKeyCursor(q,d) { return new IDBCursorRequest(this.objectStore,q,d||'next',true,this); }
+}
+class IDBCursor {
+  constructor(req,rows,index,keysOnly,direction) { this.request=req;this.__rows=rows;this.__idx=index;this.__keysOnly=keysOnly;this.direction=direction;this.key=rows[index].key;this.primaryKey=rows[index].r?rows[index].r.key:rows[index].key;this.value=keysOnly?undefined:idbClone(rows[index].r?rows[index].r.value:rows[index].value);this.__store=req.__store; }
+  continue(key) { if(key!==undefined){while(this.__idx<this.__rows.length&&idbCmp(this.__rows[this.__idx].key,key)<0)this.__idx++;}else this.__idx++; this.__advance(); }
+  advance(n) { this.__idx+=Math.max(1,Math.floor(n));this.__advance(); }
+  __advance() { const self=this;this.request.readyState='pending';this.request.result=undefined;this.request.transaction.__queue(this.request,()=>{if(self.__idx>=self.__rows.length)return null;const row=self.__rows[self.__idx];return new IDBCursor(self.request,self.__rows,self.__idx,self.__keysOnly,self.direction);}); }
+  update(value) { return this.__store.put(value,this.primaryKey); }
+  delete() { return this.__store.delete(this.primaryKey); }
+}
+class IDBCursorRequest extends IDBRequest {
+  constructor(store,query,direction,keysOnly,index) { super();this.__store=store;this.transaction=store.transaction; this.__idxSource=index||null;const tx=store.__tx();this.transaction=tx;const req=this;tx.__queue(this,()=>{let rows=idbRows(store.__db.name,store.name).filter(r=>idbRangeMatch(query,index?idbGetPath(r.value,index.keyPath):r.key)).map(r=>index?{key:idbGetPath(r.value,index.keyPath),r}:r);rows.sort((a,b)=>idbCmp(a.key,b.key));if(direction==='prev'||direction==='prevunique')rows.reverse();if(direction!=='next'&&direction!=='nextunique'&&direction!=='prev'&&direction!=='prevunique')throw idbErr('TypeError','Invalid cursor direction');this.__cursorRows=rows;this.__cursorDir=direction;return rows.length?new IDBCursor(req,rows,0,keysOnly,direction):null;}); }
+}
+class IDBFactory {
+  open(name, version) { name=String(name);const req=new IDBOpenDBRequest();defer(()=>{try{const raw=D.idbMetaGet(name);let meta=raw?JSON.parse(raw):null;const old=meta?meta.version:0;const wanted=version===undefined?(meta?meta.version:1):Number(version);if(!Number.isInteger(wanted)||wanted<=0)throw new TypeError('Database version must be a positive integer');if(meta&&wanted<old)throw idbErr('VersionError','Requested version is lower than existing version');let upgrade=!meta||wanted>old;if(!meta)meta={version:wanted,stores:[]};if(!Array.isArray(meta.stores))meta.stores=[];const db=new IDBDatabase(name,meta);db.version=wanted;if(upgrade){req.result=db;req.transaction=new IDBTransaction(db,[],'versionchange');fire(req,new Event('upgradeneeded'));db.__save();req.transaction.__done=true;req.transaction=null;}req.__ok(db);}catch(e){req.__fail(e);}});return req; }
+  deleteDatabase(name) { name=String(name);const req=new IDBOpenDBRequest();defer(()=>{D.idbDeleteDatabase(name);req.__ok(undefined);});return req; }
+  databases() { return Promise.resolve(JSON.parse(D.idbMetaList()||'[]').map(x=>({name:x.name,version:x.version}))); }
+  cmp(a,b) { return idbCmp(a,b); }
+}
+g.IDBRequest=IDBRequest;g.IDBOpenDBRequest=IDBOpenDBRequest;g.IDBDatabase=IDBDatabase;g.IDBTransaction=IDBTransaction;g.IDBObjectStore=IDBObjectStore;g.IDBIndex=IDBIndex;g.IDBCursor=IDBCursor;g.IDBFactory=IDBFactory;g.indexedDB=new IDBFactory();
+
+
 /* ───────── URL, кодировки ───────── */
 class URLSearchParams { constructor(init) { this.__p = []; if (typeof init === 'string') { for (const kv of init.replace(/^\?/, '').split('&')) if (kv) { const i = kv.indexOf('='); const dec = (s) => decodeURIComponent(s.replace(/\+/g, ' ')); this.__p.push(i < 0 ? [dec(kv), ''] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]); } } else if (init && typeof init[Symbol.iterator] === 'function') { for (const [k, v] of init) this.__p.push([String(k), String(v)]); } else if (init) for (const k of Object.keys(init)) this.__p.push([k, String(init[k])]); }
   append(k, v) { this.__p.push([String(k), String(v)]); } delete(k) { this.__p = this.__p.filter((x) => x[0] !== k); } get(k) { const r = this.__p.find((x) => x[0] === k); return r ? r[1] : null; } getAll(k) { return this.__p.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__p.some((x) => x[0] === k); }
@@ -655,7 +966,7 @@ class URLSearchParams { constructor(init) { this.__p = []; if (typeof init === '
   get size() { return this.__p.length; } toString() { const e = (s) => encodeURIComponent(s).replace(/%20/g, '+'); return this.__p.map(([k, v]) => e(k) + '=' + e(v)).join('&'); } }
 class URL { constructor(u, base) { u = String(u); let p = parseUrl(u); if (!p && base !== undefined) { const b = parseUrl(String(base)); if (!b) throw new TypeError('Invalid URL: ' + u); u = resolveRel(b, u); p = parseUrl(u); } if (!p) throw new TypeError('Invalid URL: ' + u); Object.assign(this, p); this.searchParams = new URLSearchParams(p.search); }
   get href() { const s = this.searchParams.toString(); this.search = s ? '?' + s : ''; return rebuild(this); } set href(v) { const p = parseUrl(String(v)); if (p) { Object.assign(this, p); this.searchParams = new URLSearchParams(p.search); } } get origin() { return origin(this); } toString() { return this.href; } toJSON() { return this.href; }
-  static canParse(u, b) { try { new URL(u, b); return true; } catch (e) { return false; } } static createObjectURL() { return 'blob:null/' + Math.random().toString(16).slice(2); } static revokeObjectURL() {} }
+  static canParse(u, b) { try { new URL(u, b); return true; } catch (e) { return false; } } static createObjectURL(b) { const u = 'blob:' + (location.origin && location.origin !== 'null' ? location.origin : 'null') + '/' + g.crypto.randomUUID(); if (b instanceof Blob) BLOBS.set(u, b); return u; } static revokeObjectURL(u) { BLOBS.delete(String(u)); } }
 function resolveRel(b, r) { if (r.startsWith('//')) return b.protocol + r; if (r.startsWith('/')) return b.protocol + '//' + b.host + r; if (r.startsWith('?')) return b.protocol + '//' + b.host + b.pathname + r; if (r.startsWith('#')) return b.protocol + '//' + b.host + b.pathname + b.search + r;
   const dir = b.pathname.replace(/[^\/]*$/, ''); const parts = (dir + r.split(/[?#]/)[0]).split('/'); const out = []; for (const s of parts) { if (s === '..') out.pop(); else if (s !== '.') out.push(s); } const tail = r.slice(r.split(/[?#]/)[0].length); return b.protocol + '//' + b.host + out.join('/') + tail; }
 g.URL = URL; g.URLSearchParams = URLSearchParams;
@@ -666,73 +977,231 @@ g.TextEncoder = class { get encoding() { return 'utf-8'; } encode(s) { const o =
 g.TextDecoder = class { constructor(l) { this.encoding = l || 'utf-8'; } decode(b) { if (!b) return ''; b = b instanceof ArrayBuffer ? new Uint8Array(b) : new Uint8Array(b.buffer || b, b.byteOffset || 0, b.byteLength); let s = ''; for (let i = 0; i < b.length;) { const c = b[i++]; if (c < 128) s += String.fromCharCode(c); else if (c < 224) s += String.fromCharCode(((c & 31) << 6) | (b[i++] & 63)); else if (c < 240) s += String.fromCharCode(((c & 15) << 12) | ((b[i++] & 63) << 6) | (b[i++] & 63)); else { const cp = ((c & 7) << 18) | ((b[i++] & 63) << 12) | ((b[i++] & 63) << 6) | (b[i++] & 63); s += String.fromCodePoint(cp); } } return s; } };
 
 /* ───────── сеть ───────── */
-class Headers { constructor(i) { this.__h = new Map(); if (i) for (const [k, v] of (i instanceof Headers ? i.__h : Array.isArray(i) ? i : Object.entries(i))) this.__h.set(String(k).toLowerCase(), String(v)); } get(k) { return this.__h.get(String(k).toLowerCase()) ?? null; } set(k, v) { this.__h.set(String(k).toLowerCase(), String(v)); } has(k) { return this.__h.has(String(k).toLowerCase()); } append(k, v) { this.set(k, v); } delete(k) { this.__h.delete(String(k).toLowerCase()); } forEach(f) { this.__h.forEach((v, k) => f(v, k, this)); } entries() { return this.__h.entries(); } keys() { return this.__h.keys(); } values() { return this.__h.values(); } [Symbol.iterator]() { return this.__h.entries(); } }
-class Blob { constructor(parts, o) { this.__t = (parts || []).map((p) => (typeof p === 'string' ? p : p instanceof Blob ? p.__t : String(p))).join(''); this.type = (o && o.type) || ''; this.size = this.__t.length; } text() { return Promise.resolve(this.__t); } arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this.__t).buffer); } slice() { return new Blob([this.__t]); } }
-class Response { constructor(body, init) { init = init || {}; this.__b = body == null ? '' : String(body); this.status = init.status === undefined ? 200 : init.status; this.ok = this.status >= 200 && this.status < 300; this.statusText = init.statusText || (this.ok ? 'OK' : ''); this.headers = new Headers(init.headers); this.url = init.url || ''; this.type = 'basic'; this.redirected = false; this.bodyUsed = false; this.body = null; }
-  text() { this.bodyUsed = true; return Promise.resolve(this.__b); } json() { return this.text().then((t) => JSON.parse(t)); } blob() { return Promise.resolve(new Blob([this.__b])); } arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this.__b).buffer); } formData() { return Promise.resolve(new FormData()); } clone() { return new Response(this.__b, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url }); } static error() { const r = new Response('', { status: 0 }); r.type = 'error'; return r; } static json(d, i) { return new Response(JSON.stringify(d), i); } }
-class Request { constructor(u, o) { o = o || {}; this.url = u instanceof Request ? u.url : String(u); this.method = (o.method || 'GET').toUpperCase(); this.headers = new Headers(o.headers); this.body = o.body || null; this.signal = o.signal || null; this.credentials = o.credentials || (u instanceof Request ? u.credentials : 'same-origin'); this.mode = o.mode || (u instanceof Request ? u.mode : 'cors'); } clone() { return new Request(this.url, this); } }
-class AbortSignal extends EventTarget { constructor() { super(); this.aborted = false; this.reason = undefined; } throwIfAborted() { if (this.aborted) throw this.reason; } static abort() { const s = new AbortSignal(); s.aborted = true; return s; } static timeout() { return new AbortSignal(); } }
-class AbortController { constructor() { this.signal = new AbortSignal(); } abort(r) { if (this.signal.aborted) return; this.signal.aborted = true; this.signal.reason = r || new DOMException('The operation was aborted.', 'AbortError'); fire(this.signal, new Event('abort')); } }
-class FormData { constructor(f) { this.__e = []; if (f && f.elements) for (const e of f.elements) if (e.name && !e.disabled) this.__e.push([e.name, e.value]); } append(k, v) { this.__e.push([String(k), v]); } get(k) { const r = this.__e.find((x) => x[0] === k); return r ? r[1] : null; } getAll(k) { return this.__e.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__e.some((x) => x[0] === k); } set(k, v) { this.delete(k); this.append(k, v); } delete(k) { this.__e = this.__e.filter((x) => x[0] !== k); } entries() { return this.__e[Symbol.iterator](); } [Symbol.iterator]() { return this.entries(); } forEach(f) { this.__e.forEach(([k, v]) => f(v, k)); } }
-/* Сырой ответ curl (-D dump-header) может содержать несколько HTTP-блоков подряд, если были редиректы (-L) —
-   нас интересует только последний (финальный ответ). */
+/* Тела запросов/ответов — байты (Uint8Array с собственным буфером). Кодирование UTF-8 — нативное (D.utf8Encode/D.utf8Decode).
+   Blob/File хранят байты в __b, Request/Response — в __bytes. На C-границе (D.fetchStart/D.fetchPoll) тела — ArrayBuffer, без потерь. */
+const enc8 = (s) => new Uint8Array(D.utf8Encode(String(s)));
+const exactBuf = (u) => (u.byteOffset === 0 && u.byteLength === u.buffer.byteLength ? u.buffer : u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
+const dec8 = (u) => D.utf8Decode(exactBuf(u));
+const asU8 = (b) => (b instanceof Uint8Array ? b : b instanceof ArrayBuffer ? new Uint8Array(b) : new Uint8Array(b.buffer, b.byteOffset, b.byteLength));
+const binStr = (u) => { let s = ''; for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode.apply(null, u.subarray(i, i + 8192)); return s; };
+const strBin = (s) => { const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 255; return u; };
+function concatBytes(chunks) { let n = 0; for (const c of chunks) n += c.length; const o = new Uint8Array(n); let p = 0; for (const c of chunks) { o.set(c, p); p += c.length; } return o; }
+const BLOBS = new Map();                                        /* blob:-URL → Blob (URL.createObjectURL) */
+const HNAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+function hname(k) { k = String(k); if (!HNAME.test(k)) throw new TypeError("Invalid header name: " + k); return k.toLowerCase(); }
+function hval(v) { v = String(v).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, ''); if (/[\0\r\n]/.test(v)) throw new TypeError('Invalid header value'); return v; }
+class Headers {
+  constructor(i) { this.__h = new Map(); if (i) { if (i instanceof Headers) i.__h.forEach((v, k) => this.__h.set(k, v)); else for (const [k, v] of (Array.isArray(i) || typeof i[Symbol.iterator] === 'function' ? i : Object.entries(i))) this.append(k, v); } }
+  get(k) { return this.__h.get(String(k).toLowerCase()) ?? null; } set(k, v) { this.__h.set(hname(k), hval(v)); } has(k) { return this.__h.has(String(k).toLowerCase()); }
+  append(k, v) { k = hname(k); v = hval(v); this.__h.set(k, this.__h.has(k) ? this.__h.get(k) + ', ' + v : v); }
+  delete(k) { this.__h.delete(String(k).toLowerCase()); } getSetCookie() { return []; }
+  forEach(f, t) { this.__h.forEach((v, k) => f.call(t, v, k, this)); } entries() { return this.__h.entries(); } keys() { return this.__h.keys(); } values() { return this.__h.values(); } [Symbol.iterator]() { return this.__h.entries(); } }
+const headersFromPairs = (pairs) => { const h = new Headers(); for (const [k, v] of pairs) { const l = k.toLowerCase(); h.__h.set(l, h.__h.has(l) ? h.__h.get(l) + ', ' + v : v); } return h; };
+function headersToRaw(h) { let s = ''; if (h) h.forEach((v, k) => { s += k + ': ' + v + '\n'; }); return s; }
+
+function blobPart(p) {
+  if (p instanceof Blob) return p.__b;
+  if (typeof p === 'string') return enc8(p);
+  if (p instanceof ArrayBuffer || ArrayBuffer.isView(p)) return asU8(p).slice();
+  return enc8(String(p));
+}
+class Blob {
+  constructor(parts, o) { this.__b = concatBytes(parts == null ? [] : Array.from(parts, blobPart)); this.type = o && o.type !== undefined ? String(o.type).toLowerCase() : ''; }
+  get size() { return this.__b.length; } get __t() { return dec8(this.__b); }
+  text() { return Promise.resolve(dec8(this.__b)); } arrayBuffer() { return Promise.resolve(this.__b.slice().buffer); } bytes() { return Promise.resolve(this.__b.slice()); }
+  slice(s, e, t) { const n = this.__b.length; s = s === undefined ? 0 : s < 0 ? Math.max(n + s, 0) : Math.min(s, n); e = e === undefined ? n : e < 0 ? Math.max(n + e, 0) : Math.min(e, n); const b = new Blob([], { type: t || '' }); b.__b = this.__b.slice(s, Math.max(s, e)); return b; }
+  get [Symbol.toStringTag]() { return 'Blob'; } }
+class File extends Blob { constructor(parts, name, o) { super(parts, o); this.name = String(name); this.lastModified = o && o.lastModified !== undefined ? +o.lastModified : Date.now(); this.webkitRelativePath = ''; } get [Symbol.toStringTag]() { return 'File'; } }
+
+/* FormData: значение — строка или File (Blob оборачивается в File "blob"). */
+function fdValue(v, fn) { if (v instanceof Blob) { if (!(v instanceof File) || fn !== undefined) { const f = new File([v], fn !== undefined ? fn : v instanceof File ? v.name : 'blob', { type: v.type }); return f; } return v; } return String(v); }
+function fillFromForm(fd, form, submitter) {
+  for (const e of Array.from(form.elements)) {
+    const name = e.name; if (!name || e.disabled) continue; const tag = (e.tagName || '').toLowerCase(); const ty = (e.type || '').toLowerCase();
+    if (tag === 'select') {
+      if (e.hasAttribute('multiple')) { for (const o of e.options) if (o.selected && !o.disabled) fd.append(name, o.value); }
+      else { const o = e.options[e.selectedIndex]; if (o && !o.disabled) fd.append(name, o.value); }
+    } else if (tag === 'textarea') fd.append(name, e.value);
+    else if (tag === 'input') {
+      if (ty === 'submit' || ty === 'button' || ty === 'reset' || ty === 'image') continue;
+      if (ty === 'checkbox' || ty === 'radio') { if (e.checked) fd.append(name, e.hasAttribute('value') ? e.value : 'on'); }
+      else if (ty === 'file') { const fl = Array.from(e.files || []); if (fl.length) for (const f of fl) fd.append(name, f); else fd.append(name, new File([], '', { type: 'application/octet-stream' })); }
+      else fd.append(name, e.value);
+    }
+  }
+  if (submitter && submitter.name && !submitter.disabled) fd.append(submitter.name, submitter.value);
+}
+class FormData {
+  constructor(form, submitter) { this.__e = []; if (form && form.elements) fillFromForm(this, form, submitter); }
+  append(k, v, fn) { this.__e.push([String(k), fdValue(v, fn)]); } get(k) { const r = this.__e.find((x) => x[0] === String(k)); return r ? r[1] : null; } getAll(k) { return this.__e.filter((x) => x[0] === String(k)).map((x) => x[1]); }
+  has(k) { return this.__e.some((x) => x[0] === String(k)); } delete(k) { this.__e = this.__e.filter((x) => x[0] !== String(k)); }
+  set(k, v, fn) { k = String(k); const nv = fdValue(v, fn); const i = this.__e.findIndex((x) => x[0] === k); if (i < 0) { this.__e.push([k, nv]); return; } this.__e[i][1] = nv; this.__e = this.__e.filter((x, j) => j <= i || x[0] !== k); }
+  entries() { return this.__e.map((x) => [x[0], x[1]])[Symbol.iterator](); } keys() { return this.__e.map((x) => x[0])[Symbol.iterator](); } values() { return this.__e.map((x) => x[1])[Symbol.iterator](); }
+  [Symbol.iterator]() { return this.entries(); } forEach(f, t) { for (const [k, v] of this.__e.slice()) f.call(t, v, k, this); } }
+
+/* multipart/form-data (RFC 7578 / HTML): имена и файлы экранируются (%0D %0A %22), значения — с CRLF-переносами. */
+const mpEsc = (s) => String(s).replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
+function encodeMultipart(fd) {
+  let bd = '----MLBrowserFormBoundary'; for (let i = 0; i < 16; i++) bd += 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 62)];
+  const out = [];
+  for (const [k, v] of fd.__e) {
+    if (typeof v === 'string') out.push(enc8('--' + bd + '\r\nContent-Disposition: form-data; name="' + mpEsc(k) + '"\r\n\r\n' + v.replace(/\r\n|\r|\n/g, '\r\n') + '\r\n'));
+    else out.push(enc8('--' + bd + '\r\nContent-Disposition: form-data; name="' + mpEsc(k) + '"; filename="' + mpEsc(v.name) + '"\r\nContent-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n'), v.__b, enc8('\r\n'));
+  }
+  out.push(enc8('--' + bd + '--\r\n'));
+  return { bytes: concatBytes(out), type: 'multipart/form-data; boundary=' + bd };
+}
+function parseFormData(bytes, ct) {
+  const fd = new FormData(); const tm = /^\s*([^;\s]+)/.exec(ct || ''); const type = tm ? tm[1].toLowerCase() : '';
+  if (type === 'application/x-www-form-urlencoded') {
+    const dq = (s) => { s = s.replace(/\+/g, ' '); try { return decodeURIComponent(s); } catch (e) { return s; } };
+    for (const kv of dec8(bytes).split('&')) if (kv) { const i = kv.indexOf('='); fd.append(dq(i < 0 ? kv : kv.slice(0, i)), dq(i < 0 ? '' : kv.slice(i + 1))); }
+    return fd;
+  }
+  if (type === 'multipart/form-data') {
+    const bm = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(ct); if (!bm) throw new TypeError('Missing multipart boundary');
+    const parts = binStr(bytes).split('--' + (bm[1] || bm[2]));
+    for (let i = 1; i < parts.length; i++) {
+      let p = parts[i]; if (p.slice(0, 2) === '--') break; if (p.slice(0, 2) === '\r\n') p = p.slice(2); if (p.slice(-2) === '\r\n') p = p.slice(0, -2);
+      const he = p.indexOf('\r\n\r\n'); if (he < 0) continue; const head = dec8(strBin(p.slice(0, he))); const data = strBin(p.slice(he + 4));
+      const nm = /[;\s]name="([^"]*)"/i.exec(head); if (!nm) continue; const un = (s) => s.replace(/%22/g, '"').replace(/%0D/gi, '\r').replace(/%0A/gi, '\n');
+      const fm = /[;\s]filename="([^"]*)"/i.exec(head); const cm = /^content-type:\s*([^\r\n]*)/im.exec(head);
+      if (fm) fd.append(un(nm[1]), new File([data], un(fm[1]), { type: cm ? cm[1].trim() : '' })); else fd.append(un(nm[1]), dec8(data));
+    }
+    return fd;
+  }
+  throw new TypeError('Content-Type is not form data');
+}
+/* тело → {bytes, type}: Content-Type по умолчанию как в Fetch Standard */
+function extractBody(b) {
+  if (b == null) return { bytes: null, type: null };
+  if (typeof b === 'string') return { bytes: enc8(b), type: 'text/plain;charset=UTF-8' };
+  if (typeof URLSearchParams !== 'undefined' && b instanceof URLSearchParams) return { bytes: enc8(b.toString()), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
+  if (b instanceof FormData) return encodeMultipart(b);
+  if (b instanceof Blob) return { bytes: b.__b.slice(), type: b.type || null };
+  if (b instanceof ArrayBuffer || ArrayBuffer.isView(b)) return { bytes: asU8(b).slice(), type: null };
+  return { bytes: enc8(String(b)), type: 'text/plain;charset=UTF-8' };
+}
+const usedErr = (m) => new TypeError("Failed to execute '" + m + "': body stream already read");
+const bodyMethods = {
+  text() { if (this.bodyUsed) return Promise.reject(usedErr('text')); this.bodyUsed = true; return Promise.resolve(dec8(this.__bytes)); },
+  json() { return this.text().then((t) => JSON.parse(t)); },
+  arrayBuffer() { if (this.bodyUsed) return Promise.reject(usedErr('arrayBuffer')); this.bodyUsed = true; return Promise.resolve(this.__bytes.slice().buffer); },
+  bytes() { if (this.bodyUsed) return Promise.reject(usedErr('bytes')); this.bodyUsed = true; return Promise.resolve(this.__bytes.slice()); },
+  blob() { if (this.bodyUsed) return Promise.reject(usedErr('blob')); this.bodyUsed = true; return Promise.resolve(new Blob([this.__bytes], { type: this.headers.get('content-type') || '' })); },
+  formData() { if (this.bodyUsed) return Promise.reject(usedErr('formData')); this.bodyUsed = true; try { return Promise.resolve(parseFormData(this.__bytes, this.headers.get('content-type'))); } catch (e) { return Promise.reject(e); } },
+};
+const addBody = (C) => { for (const k in bodyMethods) Object.defineProperty(C.prototype, k, { value: bodyMethods[k], writable: true, configurable: true }); };
+
+function initResp(r, bytes, status, statusText, headers, url, ctype) {
+  r.__bytes = bytes || new Uint8Array(0); r.status = status; r.ok = status >= 200 && status < 300; r.statusText = statusText || ''; r.headers = headers instanceof Headers ? headers : new Headers(headers);
+  if (ctype && !r.headers.has('content-type')) r.headers.set('content-type', ctype);
+  r.url = url || ''; r.type = 'default'; r.redirected = false; r.bodyUsed = false; r.body = null; return r;
+}
+class Response {
+  constructor(body, init) { init = init || {}; const st = init.status === undefined ? 200 : +init.status;
+    if (!(st >= 200 && st <= 599)) throw new RangeError("Failed to construct 'Response': The status provided (" + st + ') is outside the range [200, 599].');
+    const x = body == null ? { bytes: null, type: null } : extractBody(body); initResp(this, x.bytes, st, init.statusText, init.headers, init.url, x.type); }
+  clone() { if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used"); const r = initResp(Object.create(Response.prototype), this.__bytes, this.status, this.statusText, new Headers(this.headers), this.url); r.type = this.type; return r; }
+  static error() { const r = initResp(Object.create(Response.prototype), null, 0, '', null, ''); r.type = 'error'; return r; }
+  static json(d, i) { const r = new Response(JSON.stringify(d), i); if (!(i && i.headers && new Headers(i.headers).has('content-type'))) r.headers.set('content-type', 'application/json'); return r; }
+  static redirect(u, s) { s = s === undefined ? 302 : s; if ([301, 302, 303, 307, 308].indexOf(s) < 0) throw new RangeError('Invalid redirect status'); const r = new Response(null, { status: s === 302 ? 302 : s }); r.headers.set('location', new URL(String(u), location.href).href); return r; } }
+addBody(Response);
+const STD_M = /^(delete|get|head|options|post|put)$/i;
+class Request {
+  constructor(input, o) { o = o || {}; const src = input instanceof Request ? input : null; let url = src ? src.url : String(input);
+    try { url = new URL(url, location.href).href; } catch (e) { /* data:/blob: и прочее — как есть */ }
+    this.url = url; let m = o.method !== undefined ? String(o.method) : src ? src.method : 'GET'; if (STD_M.test(m)) m = m.toUpperCase(); this.method = m;
+    this.headers = new Headers(o.headers !== undefined ? o.headers : src ? src.headers : undefined);
+    let x = { bytes: null, type: null }, has = false;
+    if (o.body != null) { x = extractBody(o.body); has = true; } else if (src && src.__hasBody) { if (src.bodyUsed) throw new TypeError("Failed to construct 'Request': Cannot construct a Request with a Request object that has already been used."); x = { bytes: src.__bytes, type: null }; has = true; }
+    if (has && (m === 'GET' || m === 'HEAD')) throw new TypeError("Failed to construct 'Request': Request with GET/HEAD method cannot have body.");
+    if (x.type && !this.headers.has('content-type')) this.headers.set('content-type', x.type);
+    this.__bytes = x.bytes || new Uint8Array(0); this.__hasBody = has; this.bodyUsed = false; this.body = null;
+    this.signal = o.signal !== undefined && o.signal !== null ? o.signal : src ? src.signal : new AbortController().signal;
+    this.credentials = o.credentials || (src && src.credentials) || 'same-origin'; this.mode = o.mode || (src && src.mode) || 'cors'; this.cache = o.cache || (src && src.cache) || 'default';
+    this.redirect = o.redirect || (src && src.redirect) || 'follow'; this.referrer = o.referrer !== undefined ? o.referrer : src ? src.referrer : 'about:client'; this.referrerPolicy = o.referrerPolicy || (src && src.referrerPolicy) || ''; this.integrity = o.integrity || ''; this.keepalive = !!o.keepalive; }
+  clone() { if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used"); return new Request(this); } }
+addBody(Request);
+class AbortSignal extends EventTarget {
+  constructor() { super(); this.aborted = false; this.reason = undefined; this.onabort = null; }
+  throwIfAborted() { if (this.aborted) throw this.reason; }
+  __abort(r) { if (this.aborted) return; this.aborted = true; this.reason = r !== undefined ? r : new DOMException('signal is aborted without reason', 'AbortError'); const e = new Event('abort'); if (typeof this.onabort === 'function') { try { this.onabort(e); } catch (x) { report(x); } } fire(this, e); }
+  static abort(r) { const s = new AbortSignal(); s.aborted = true; s.reason = r !== undefined ? r : new DOMException('signal is aborted without reason', 'AbortError'); return s; }
+  static timeout(ms) { const s = new AbortSignal(); D.timerAdd(() => s.__abort(new DOMException('signal timed out', 'TimeoutError')), ms, false); return s; }
+  static any(list) { const s = new AbortSignal(); for (const x of list) { if (x.aborted) { s.aborted = true; s.reason = x.reason; return s; } x.addEventListener('abort', () => s.__abort(x.reason)); } return s; } }
+class AbortController { constructor() { this.signal = new AbortSignal(); } abort(r) { this.signal.__abort(r); } }
+
+/* Сырой ответ нативного клиента: только финальный блок заголовков (редиректы пройдены) → { pairs, text (статус-фраза) }. */
 function parseRawHeaders(raw) {
   const blocks = String(raw || '').split(/\r?\n\r?\n/).filter((b) => b.indexOf('HTTP/') === 0 || /^\S+:/.test(b));
-  const last = blocks.length ? blocks[blocks.length - 1] : '';
-  const lines = last.split(/\r?\n/); const out = {};
-  for (let i = 0; i < lines.length; i++) { const idx = lines[i].indexOf(':'); if (idx > 0) out[lines[i].slice(0, idx).trim().toLowerCase()] = lines[i].slice(idx + 1).trim(); }
-  return out;
+  const lines = (blocks.length ? blocks[blocks.length - 1] : '').split(/\r?\n/); const pairs = []; let text = '';
+  for (let i = 0; i < lines.length; i++) { if (i === 0 && lines[i].indexOf('HTTP/') === 0) { text = lines[i].split(' ').slice(2).join(' '); continue; } const idx = lines[i].indexOf(':'); if (idx > 0) pairs.push([lines[i].slice(0, idx).trim(), lines[i].slice(idx + 1).trim()]); }
+  return { pairs, text };
 }
-function headersToRaw(h) { let s = ''; if (h) h.forEach((v, k) => { s += k + ': ' + v + '\n'; }); return s; }
-function bodyToStr(b) {
-  if (b == null) return null;
-  if (typeof b === 'string') return b;
-  if (b instanceof Blob) return b.__t;
-  if (b instanceof FormData) return b.__e.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
-  if (typeof URLSearchParams !== 'undefined' && b instanceof URLSearchParams) return b.toString();
-  if (b instanceof ArrayBuffer) return new TextDecoder().decode(b);
-  if (ArrayBuffer.isView(b)) return new TextDecoder().decode(b.buffer);
-  return String(b);
-}
-/* Каждый вызов D.fetchStart форкает curl и сразу возвращается — движок JS не блокируется на время запроса.
-   Готовность проверяется тут через таймер (~раз в несколько мс), так что рендер и обработка событий
-   продолжают идти своим чередом, пока сеть работает в фоне. */
+/* Каждый вызов D.fetchStart форкает процесс и сразу возвращается — движок JS не блокируется на время запроса.
+   Готовность проверяется через таймер (~раз в несколько мс), так что рендер и события идут своим чередом. */
 function pollFetch(id, onDone) { const check = () => { const r = D.fetchPoll(id); if (r === null) { D.timerAdd(check, 4, false); return; } onDone(r); }; D.timerAdd(check, 0, false); }
+const CRED = { omit: 0, 'same-origin': 1, include: 2 }, MODE = { cors: 0, 'no-cors': 1, 'same-origin': 2 };
+const pctBytes = (s) => { const o = []; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c === 37 && i + 2 < s.length && /^[0-9a-fA-F]{2}$/.test(s.substr(i + 1, 2))) { o.push(parseInt(s.substr(i + 1, 2), 16)); i += 2; } else if (c < 128) o.push(c); else for (const b of enc8(s[i])) o.push(b); } return new Uint8Array(o); };
+/* data: и blob: — без сети */
+function localResponse(url) {
+  if (url.slice(0, 5) === 'data:') {
+    const c = url.indexOf(','); if (c < 0) return null; let meta = url.slice(5, c); const pl = url.slice(c + 1); let bytes;
+    if (/;base64$/i.test(meta)) { meta = meta.slice(0, -7); try { bytes = strBin(atob(decodeURIComponent(pl).replace(/\s+/g, ''))); } catch (e) { return null; } } else bytes = pctBytes(pl);
+    return initResp(Object.create(Response.prototype), bytes, 200, 'OK', { 'content-type': meta || 'text/plain;charset=US-ASCII' }, url);
+  }
+  const b = BLOBS.get(url); if (!b) return null;
+  return initResp(Object.create(Response.prototype), b.__b.slice(), 200, 'OK', b.type ? { 'content-type': b.type, 'content-length': String(b.size) } : { 'content-length': String(b.size) }, url);
+}
 g.fetch = (input, init) => new Promise((res, rej) => {
-  const req = input instanceof Request ? input : new Request(input, init);
-  if (req.signal && req.signal.aborted) return rej(req.signal.reason);
-  const id = D.fetchStart(req.method, req.url, headersToRaw(req.headers), bodyToStr(req.body), ({ omit: 0, 'same-origin': 1, include: 2 })[req.credentials] ?? 1, ({ cors: 0, 'no-cors': 1, 'same-origin': 2 })[req.mode] ?? 0);
+  const req = new Request(input, init); const sig = req.signal;
+  if (sig && sig.aborted) return rej(sig.reason);
+  const sch = req.url.slice(0, 5);
+  if (sch === 'data:' || sch === 'blob:') { const lr = localResponse(req.url); defer(() => (lr ? res(lr) : rej(new TypeError('Failed to fetch')))); return; }
+  const id = D.fetchStart(req.method, req.url, headersToRaw(req.headers), req.__hasBody && req.__bytes.length ? exactBuf(req.__bytes) : null, CRED[req.credentials] ?? 1, MODE[req.mode] ?? 0);
   if (id < 0) return rej(new TypeError('Failed to fetch'));
-  let settled = false;
-  if (req.signal) req.signal.addEventListener('abort', () => { if (settled) return; settled = true; D.fetchCancel(id); rej(req.signal.reason); });
-  pollFetch(id, (r) => { if (settled) return; settled = true;
+  let settled = false; const onAbort = () => { if (settled) return; settled = true; D.fetchCancel(id); rej(sig.reason); };
+  if (sig) sig.addEventListener('abort', onAbort);
+  pollFetch(id, (r) => { if (settled) return; settled = true; if (sig) sig.removeEventListener('abort', onAbort);
     if (r.status === 0) return rej(new TypeError('Failed to fetch'));
-    let full = req.url; try { full = new URL(req.url, location.href).href; } catch (e) {}
-    res(new Response(r.body, { status: r.status, statusText: '', url: full, headers: parseRawHeaders(r.headers) }));
-  });
+    const h = parseRawHeaders(r.headers); let origin = ''; try { origin = new URL(req.url).origin; } catch (e) {}
+    const rs = initResp(Object.create(Response.prototype), new Uint8Array(r.body), r.status, h.text, headersFromPairs(h.pairs), req.url); rs.type = origin && origin !== location.origin ? 'cors' : 'basic'; res(rs); });
 });
-g.Headers = Headers; g.Request = Request; g.Response = Response; g.Blob = Blob; g.File = Blob; g.FormData = FormData; g.AbortController = AbortController; g.AbortSignal = AbortSignal;
+g.Headers = Headers; g.Request = Request; g.Response = Response; g.Blob = Blob; g.File = File; g.FormData = FormData; g.AbortController = AbortController; g.AbortSignal = AbortSignal;
 class XMLHttpRequest extends EventTarget {
-  constructor() { super(); this.readyState = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this.response = ''; this.responseType = ''; this.timeout = 0; this.withCredentials = false; this.upload = new EventTarget(); this.__hd = new Headers(); }
-  open(m, u) { this.__m = String(m || 'GET').toUpperCase(); this.__u = u; this.readyState = 1; this.__hd = new Headers(); this.__ch(); }
-  setRequestHeader(k, v) { this.__hd.set(k, v); } overrideMimeType() {}
-  abort() { this.__ab = true; if (this.__id >= 0) D.fetchCancel(this.__id); this.readyState = 0; fire(this, new ProgressEvent('abort')); fire(this, new ProgressEvent('loadend')); }
-  getAllResponseHeaders() { return this.__rh ? Object.entries(this.__rh).map(([k, v]) => k + ': ' + v).join('\r\n') + '\r\n' : ''; }
-  getResponseHeader(k) { return this.__rh ? (this.__rh[String(k).toLowerCase()] ?? null) : null; }
+  constructor() { super(); this.readyState = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this.response = ''; this.responseType = ''; this.responseURL = ''; this.responseXML = null; this.timeout = 0; this.withCredentials = false; this.upload = new EventTarget(); this.__hd = new Headers(); this.__rh = null; this.__id = -1; this.__done = true; }
+  open(m, u) { this.__m = String(m || 'GET'); if (STD_M.test(this.__m)) this.__m = this.__m.toUpperCase(); this.__u = String(u); this.readyState = 1; this.__hd = new Headers(); this.__rh = null; this.__done = true; this.__ch(); }
+  setRequestHeader(k, v) { this.__hd.append(k, v); } overrideMimeType() {}
+  __ev(t, tgt, loaded, total) { fire(tgt || this, new ProgressEvent(t, { loaded: loaded || 0, total: total || 0, lengthComputable: !!total })); }
+  abort() { if (this.__id < 0 || this.__done) return; this.__done = true; this.__ab = true; D.fetchCancel(this.__id); if (this.__tm) D.timerClear(this.__tm); this.readyState = 4; this.__ch(); this.readyState = 0; this.status = 0; this.__ev('abort'); this.__ev('loadend'); }
+  getAllResponseHeaders() { if (!this.__rh) return ''; let s = ''; this.__rh.forEach((v, k) => { s += k + ': ' + v + '\r\n'; }); return s; }
+  getResponseHeader(k) { return this.__rh ? this.__rh.get(k) : null; }
   __ch() { fire(this, new Event('readystatechange')); }
   send(body) {
-    this.__id = D.fetchStart(this.__m, this.__u, headersToRaw(this.__hd), body === undefined ? null : bodyToStr(body), this.withCredentials ? 2 : 1, 0);
-    if (this.__id < 0) { defer(() => { this.readyState = 4; this.status = 0; this.__ch(); fire(this, new ProgressEvent('error')); fire(this, new ProgressEvent('loadend')); }); return; }
-    let done = false; const finishTimeout = this.timeout > 0 ? D.timerAdd(() => { if (done) return; done = true; D.fetchCancel(this.__id); this.readyState = 4; this.status = 0; this.__ch(); fire(this, new ProgressEvent('timeout')); fire(this, new ProgressEvent('loadend')); }, this.timeout, false) : 0;
-    pollFetch(this.__id, (r) => { if (done || this.__ab) return; done = true; if (finishTimeout) D.timerClear(finishTimeout);
-      if (r.status === 0) { this.readyState = 4; this.status = 0; this.__ch(); fire(this, new ProgressEvent('error')); fire(this, new ProgressEvent('loadend')); return; }
-      this.readyState = 4; this.status = r.status; this.statusText = ''; this.__rh = parseRawHeaders(r.headers); this.responseText = r.body;
-      this.response = this.responseType === 'json' ? (() => { try { return JSON.parse(r.body); } catch (e) { return null; } })() : this.responseType === 'arraybuffer' ? new TextEncoder().encode(r.body).buffer : r.body;
-      this.responseURL = this.__u;
-      this.__ch(); fire(this, new ProgressEvent('load')); fire(this, new ProgressEvent('loadend'));
+    const m = this.__m; let bytes = null;
+    if (body != null && m !== 'GET' && m !== 'HEAD') { const x = extractBody(body); bytes = x.bytes; if (x.type && !this.__hd.has('content-type')) this.__hd.set('content-type', x.type); }
+    this.__ab = false; this.__done = false;
+    this.__id = D.fetchStart(m, this.__u, headersToRaw(this.__hd), bytes && bytes.length ? exactBuf(bytes) : null, this.withCredentials ? 2 : 1, 0);
+    const fail = (t) => { this.__done = true; if (this.__tm) D.timerClear(this.__tm); this.readyState = 4; this.status = 0; this.__ch(); if (bytes) { this.__ev(t, this.upload); this.__ev('loadend', this.upload); } this.__ev(t); this.__ev('loadend'); };
+    if (this.__id < 0) { defer(() => fail('error')); return; }
+    this.__ev('loadstart'); if (bytes) this.__ev('loadstart', this.upload);
+    this.__tm = this.timeout > 0 ? D.timerAdd(() => { if (this.__done) return; D.fetchCancel(this.__id); fail('timeout'); }, this.timeout, false) : 0;
+    pollFetch(this.__id, (r) => { if (this.__done || this.__ab) return; this.__done = true; if (this.__tm) D.timerClear(this.__tm);
+      if (r.status === 0) { this.__done = false; fail('error'); return; }
+      const h = parseRawHeaders(r.headers); this.status = r.status; this.statusText = h.text; this.__rh = headersFromPairs(h.pairs);
+      try { this.responseURL = new URL(this.__u, location.href).href; } catch (e) { this.responseURL = this.__u; }
+      if (bytes) { this.__ev('progress', this.upload, bytes.length, bytes.length); this.__ev('load', this.upload, bytes.length, bytes.length); this.__ev('loadend', this.upload, bytes.length, bytes.length); }
+      this.readyState = 2; this.__ch(); this.readyState = 3; this.__ch();
+      const buf = r.body, rt = this.responseType;
+      if (rt === 'arraybuffer') this.response = buf;
+      else if (rt === 'blob') { const b = new Blob([new Uint8Array(buf)], { type: this.__rh.get('content-type') || '' }); this.response = b; }
+      else { const t = D.utf8Decode(buf); if (rt === 'json') { try { this.response = JSON.parse(t); } catch (e) { this.response = null; } } else { this.responseText = t; this.response = t; } }
+      this.readyState = 4; this.__ch(); this.__ev('progress', null, buf.byteLength, buf.byteLength); this.__ev('load', null, buf.byteLength, buf.byteLength); this.__ev('loadend', null, buf.byteLength, buf.byteLength);
     });
   }
 }
+XMLHttpRequest.UNSENT = 0; XMLHttpRequest.OPENED = 1; XMLHttpRequest.HEADERS_RECEIVED = 2; XMLHttpRequest.LOADING = 3; XMLHttpRequest.DONE = 4;
 g.XMLHttpRequest = XMLHttpRequest;
 /* Реальный WebSocket (ws://; wss:// сразу шлёт 'error' — TLS не реализован): соединение и разбор кадров
    идут в фоновом процессе (mods/render/webpage/ws.c), тут только неблокирующий опрос событий по таймеру. */
@@ -771,14 +1240,89 @@ g.Worker = class extends EventTarget {
   postMessage(data) { if (this.__id < 0) return; D.workerPost(this.__id, JSON.stringify(data === undefined ? null : data)); }
   terminate() { if (this.__id < 0) return; D.workerTerminate(this.__id); }
 };
+
+/* ───────── Service Workers: persisted registrations, lifecycle, CacheStorage, fetch events ─────────
+   Worker script runs in the existing isolated worker process. CacheStorage and structured clone are simplified. */
+const __swRegs = new Map(), __swFetchPending = new Map();
+let __swFetchSeq = 1;
+function __swSecure(url) { try { const u=new URL(url); return u.protocol==='https:' || (u.protocol==='http:' && /^(localhost|127(?:\.\d+){3})$/i.test(u.hostname)); } catch(e) { return false; } }
+function __swScopeMatches(scope, url) { try { const s=new URL(scope), u=new URL(url); return s.origin===u.origin && u.href.indexOf(s.href)===0; } catch(e) { return false; } }
+class ServiceWorker extends EventTarget {
+  constructor(reg, restored) { super(); this.scriptURL=reg.scriptURL; this.state=restored?'activating':'installing'; this.onstatechange=this.onerror=this.onmessage=null; this.__reg=reg; this.__worker=new g.Worker(this.scriptURL); this.__restored=!!restored;
+    this.__worker.addEventListener('message',(e)=>this.__handleMessage(e.data));
+    this.__worker.addEventListener('error',(e)=>{this.__setState('redundant');if(this.__reg.__reject){this.__reg.__reject(new TypeError(e.message||'Service worker failed to start'));this.__reg.__reject=null;this.__reg.__resolve=null;}fire(this,new ErrorEvent('error',{message:e.message||'Service worker failed'}));});
+    if(restored) this.__worker.postMessage({__ml_sw_event:'activate',__ml_sw_scope:reg.scope,__ml_sw_profile:D.profileId()}); else this.__worker.postMessage({__ml_sw_event:'install',__ml_sw_scope:reg.scope,__ml_sw_profile:D.profileId()});
+  }
+  __setState(s) { if(this.state===s)return; this.state=s; defer(()=>fire(this,new Event('statechange'))); }
+  __handleMessage(d) {
+    if(d && d.__ml_sw_lifecycle) {
+      const type=d.__ml_sw_lifecycle;
+      if(!d.ok) { this.__setState('redundant'); if(this.__reg.__reject){this.__reg.__reject(new TypeError(d.error||'Service worker lifecycle event failed'));this.__reg.__reject=null;this.__reg.__resolve=null;} return; }
+      if(type==='install' && this.state==='installing') { this.__setState('installed'); this.__reg.waiting=this; this.__setState('activating'); this.__worker.postMessage({__ml_sw_event:'activate',__ml_sw_scope:this.__reg.scope,__ml_sw_profile:D.profileId()}); return; }
+      if(type==='activate') { this.__setState('activated'); this.__reg.__active=this; this.__reg.installing=null; this.__reg.waiting=null; this.__reg.__readyResolve(this.__reg); __swContainer.__resolveReady(this.__reg); if(this.__reg.__resolve){this.__reg.__resolve(this.__reg);this.__reg.__resolve=null;this.__reg.__reject=null;} if(__swContainer.__scopeMatches(this.__reg.scope,location.href)) fire(__swContainer,new Event('controllerchange')); return; }
+    }
+    if(d && d.__ml_sw_reply!==undefined) { const p=__swFetchPending.get(d.__ml_sw_reply); if(p){__swFetchPending.delete(d.__ml_sw_reply);if(d.fallback)p.fallback();else if(d.error)p.reject(new TypeError(d.error));else {try{p.resolve(new Response(d.response.body,{status:d.response.status||200,statusText:d.response.statusText||'OK',headers:d.response.headers||{},url:d.response.url||p.request.url}));}catch(e){p.reject(e);}}} return; }
+    fire(this,new MessageEvent('message',{data:d,origin:location.origin}));
+  }
+  postMessage(data) { this.__worker.postMessage(data); }
+  __sendFetch(id, request) { this.__worker.postMessage({__ml_sw_event:'fetch',id,__ml_sw_scope:this.__reg.scope,__ml_sw_profile:D.profileId(),request:{url:request.url,method:request.method,headers:Object.fromEntries(request.headers.entries()),mode:request.mode,credentials:request.credentials}}); }
+  terminate() { if(this.__worker)this.__worker.terminate(); this.__setState('redundant'); }
+}
+class ServiceWorkerRegistration extends EventTarget {
+  constructor(scope, scriptURL) { super(); this.scope=scope; this.scriptURL=scriptURL; this.installing=null; this.waiting=null; this.__active=null; this.__resolve=null; this.__reject=null; this.__readyResolve=null; this.__ready=new Promise(resolve=>{this.__readyResolve=resolve;}); this.onupdatefound=null; this.updateViaCache='imports'; }
+  get active() { return this.__active; }
+  get navigationPreload() { return {enable:()=>Promise.resolve(),disable:()=>Promise.resolve(),setHeaderValue:()=>Promise.resolve(),getState:()=>Promise.resolve({enabled:false,headerValue:'true'})}; }
+  update() { if(!this.__active) return Promise.reject(idbErr('InvalidStateError','No active worker')); return Promise.resolve(this); }
+  unregister() { const r=this; D.swRemove(this.scope); __swRegs.delete(this.scope); for(const w of [this.installing,this.waiting,this.__active])if(w)w.terminate(); return Promise.resolve(true); }
+  get __readyPromise() { return this.__ready; }
+  __start(restored) { const worker=new ServiceWorker(this,restored); this.installing=restored?null:worker; if(restored)this.__active=worker; else fire(this,new Event('updatefound')); return worker; }
+}
+class ServiceWorkerContainer extends EventTarget {
+  constructor() { super(); this.oncontrollerchange=this.onmessage=null; this.__readyResolvers=[]; this.ready=new Promise(resolve=>{this.__readyResolvers.push(resolve);}); this.__restore(); }
+  get controller() { const r=this.__matching(location.href); return r&&r.active&&r.active.state==='activated'?r.active:null; }
+  __scopeMatches(scope,url) { return __swScopeMatches(scope,url); }
+  __matching(url) { let found=null; for(const r of __swRegs.values()) if(this.__scopeMatches(r.scope,url)&&(!found||r.scope.length>found.scope.length))found=r; return found; }
+  __resolveReady(reg) { for(const f of this.__readyResolvers.splice(0))try{f(reg);}catch(e){} }
+  __restore() { let rows=[];try{rows=JSON.parse(D.swList()||'[]');}catch(e){} for(const x of rows){if(!x||!x.scope||!x.scriptURL)continue;const r=new ServiceWorkerRegistration(x.scope,x.scriptURL);__swRegs.set(r.scope,r);r.__start(true);} }
+  register(script, options) {
+    let url,scope; try { url=new URL(String(script),location.href).href; scope=options&&options.scope!==undefined?new URL(String(options.scope),location.href).href:(new URL(url).origin+new URL(url).pathname.replace(/[^/]*$/,'')); } catch(e) { return Promise.reject(new TypeError('Invalid service worker URL')); }
+    if(!__swSecure(location.href))return Promise.reject(idbErr('SecurityError','Service workers require HTTPS or localhost'));
+    if(new URL(url).origin!==location.origin || new URL(scope).origin!==location.origin)return Promise.reject(idbErr('SecurityError','Service worker script and scope must be same-origin'));
+    let reg=__swRegs.get(scope);
+    if(reg&&reg.scriptURL===url&&reg.active&&reg.active.state==='activated')return Promise.resolve(reg);
+    if(reg){for(const w of [reg.installing,reg.waiting,reg.active])if(w)w.terminate();}
+    else {reg=new ServiceWorkerRegistration(scope,url);__swRegs.set(scope,reg);}
+    reg.scope=scope;reg.scriptURL=url;reg.installing=null;reg.waiting=null;reg.__active=null;
+    const promise=new Promise((resolve,reject)=>{reg.__resolve=resolve;reg.__reject=reject;});
+    D.swSet(scope,url); reg.__start(false); if(options&&options.updateViaCache)reg.updateViaCache=options.updateViaCache;
+    return promise;
+  }
+  getRegistration(clientURL) { const u=clientURL===undefined?location.href:new URL(String(clientURL),location.href).href; return Promise.resolve(this.__matching(u)); }
+  getRegistrations() { return Promise.resolve([...__swRegs.values()]); }
+  startMessages() {}
+}
+g.ServiceWorker=ServiceWorker;g.ServiceWorkerRegistration=ServiceWorkerRegistration;g.ServiceWorkerContainer=ServiceWorkerContainer;
+const __swContainer = new ServiceWorkerContainer(); g.navigator.serviceWorker=__swContainer;
+const __nativeFetch = g.fetch;
+g.fetch = function(input, init) {
+  let req; try { req=new Request(input,init); } catch(e) { return Promise.reject(e); }
+  const reg=__swContainer.__matching(req.url), worker=reg&&reg.active;
+  if(!worker||worker.state!=='activated'||req.url.slice(0,5)==='data:'||req.url.slice(0,5)==='blob:')return __nativeFetch(req);
+  const id=__swFetchSeq++;
+  return new Promise((resolve,reject)=>{
+    const fallback=()=>__nativeFetch(req).then(resolve,reject);
+    __swFetchPending.set(id,{resolve,reject,fallback,request:req});
+    try { worker.__sendFetch(id,req); } catch(e) { __swFetchPending.delete(id); fallback(); return; }
+    D.timerAdd(()=>{const p=__swFetchPending.get(id);if(p){__swFetchPending.delete(id);p.fallback();}},8000,false);
+  });
+};
+
 g.EventSource = class extends EventTarget { constructor(u) { super(); this.url = u; this.readyState = 2; } close() {} };
 g.DOMParser = class { parseFromString(s, t) { const d = Object.create(Document.prototype); const root = document.createElement('div'); D.setInnerHTML(root.__id, String(s)); Object.defineProperty(d, '__id', { value: -2 });
   d.body = root; d.documentElement = root; d.head = root; d.querySelector = (q) => root.querySelector(q); d.querySelectorAll = (q) => root.querySelectorAll(q); d.getElementById = (i) => root.querySelector('[id="' + i + '"]'); d.getElementsByTagName = (n) => root.getElementsByTagName(n); d.title = ''; return d; } };
 g.XMLSerializer = class { serializeToString(n) { return n.outerHTML || ''; } };
 
-/* ───────── MutationObserver: перехватываем реальные точки мутации DOM на уровне нативного моста D,
-   так что все пути (setAttribute/classList/style/dataset -> D.setAttr, appendChild/insertBefore -> D.insertBefore,
-   removeChild/remove -> D.remove, textContent/data -> D.setText, innerHTML -> D.setInnerHTML) ловятся в одном месте. */
+/* ───────── MutationObserver: журналируем мутации на общей границе JS/native DOM ───────── */
 const mutObservers = new Set();
 function isDescendant(node, anc) { let p = node && node.parentNode; while (p) { if (p === anc) return true; p = p.parentNode; } return false; }
 function mutQueue(rec) {
@@ -789,49 +1333,104 @@ function mutQueue(rec) {
     if (rec.type === 'characterData' && !options.characterData) continue;
     if (rec.type === 'childList' && !options.childList) continue;
     inst.__pending.push({ type: rec.type, target: rec.target, addedNodes: rec.addedNodes || [], removedNodes: rec.removedNodes || [], previousSibling: rec.previousSibling || null, nextSibling: rec.nextSibling || null,
-      attributeName: rec.attributeName || null, attributeNamespace: null, oldValue: rec.type === 'attributes' ? (options.attributeOldValue ? rec.oldValue : null) : rec.type === 'characterData' ? (options.characterDataOldValue ? rec.oldValue : null) : null });
-    if (!inst.__scheduled) { inst.__scheduled = true; Promise.resolve().then(() => { inst.__scheduled = false; const recs = inst.__pending; inst.__pending = []; if (recs.length) inst.cb(recs, inst); }); }
+      attributeName: rec.attributeName || null, attributeNamespace: null,
+      oldValue: rec.type === 'attributes' ? (options.attributeOldValue ? rec.oldValue : null) : rec.type === 'characterData' ? (options.characterDataOldValue ? rec.oldValue : null) : null });
+    if (!inst.__scheduled) { inst.__scheduled = true; Promise.resolve().then(() => { inst.__scheduled = false; const records = inst.__pending.splice(0); if (records.length && inst.__regs.length) { try { inst.cb(records, inst); } catch (e) { report(e); } } }); }
   }
 }
-{                                                                     /* врапим нативный мост один раз при старте прелюдии */
-  const _setAttr = D.setAttr, _removeAttr = D.removeAttr, _insertBefore = D.insertBefore, _remove = D.remove, _setText = D.setText, _setInnerHTML = D.setInnerHTML;
-  D.setAttr = (id, k, v) => { if (mutObservers.size) { const el = wrap(id); const old = D.attr(id, k); _setAttr(id, k, v); if (el) mutQueue({ type: 'attributes', target: el, attributeName: String(k).toLowerCase(), oldValue: old }); return; } _setAttr(id, k, v); };
-  D.removeAttr = (id, k) => { if (mutObservers.size) { const el = wrap(id); const old = D.attr(id, k); _removeAttr(id, k); if (el) mutQueue({ type: 'attributes', target: el, attributeName: String(k).toLowerCase(), oldValue: old }); return; } _removeAttr(id, k); };
-  D.insertBefore = (pid, cid, refid) => { const oldParent = mutObservers.size ? D.parent(cid) : -1; const ok = _insertBefore(pid, cid, refid); if (mutObservers.size && ok) { const par = wrap(pid), ch = wrap(cid); if (oldParent >= 0 && oldParent !== pid) mutQueue({ type: 'childList', target: wrap(oldParent), removedNodes: [ch] }); if (par) mutQueue({ type: 'childList', target: par, addedNodes: [ch], previousSibling: wrap(D.prev(cid)), nextSibling: wrap(D.next(cid)) }); } return ok; };
-  D.remove = (id) => { const pid = mutObservers.size ? D.parent(id) : -1; const ch = mutObservers.size ? wrap(id) : null; const ok = _remove(id); if (mutObservers.size && ok && pid >= 0) mutQueue({ type: 'childList', target: wrap(pid), removedNodes: [ch] }); return ok; };
-  D.setText = (id, v) => { if (mutObservers.size) { const el = wrap(id); const isChar = el && (el.nodeType === 3 || el.nodeType === 8); const old = isChar ? D.text(id) : null; _setText(id, v); if (el) mutQueue(isChar ? { type: 'characterData', target: el, oldValue: old } : { type: 'childList', target: el }); return; } _setText(id, v); };
-  D.setInnerHTML = (id, v) => { if (mutObservers.size) { const el = wrap(id); _setInnerHTML(id, v); if (el) mutQueue({ type: 'childList', target: el }); return; } _setInnerHTML(id, v); };
+function childWrappers(id) { try { return D.children(id).map((nid) => wrap(nid)).filter(Boolean); } catch (e) { return []; } }
+{
+  const _setAttr = D.setAttr, _removeAttr = D.removeAttr, _insertBefore = D.insertBefore, _remove = D.remove,
+    _setText = D.setText, _setInnerHTML = D.setInnerHTML, _insertHTML = D.insertHTML;
+  D.setAttr = (id, k, v) => {
+    const el = mutObservers.size ? wrap(id) : null, key = String(k).toLowerCase(), old = el ? D.attr(id, key) : null;
+    _setAttr(id, k, v);
+    if (el) { const now = D.attr(id, key); if (old !== now) mutQueue({ type: 'attributes', target: el, attributeName: key, oldValue: old }); }
+  };
+  D.removeAttr = (id, k) => {
+    const el = mutObservers.size ? wrap(id) : null, key = String(k).toLowerCase(), old = el ? D.attr(id, key) : null;
+    _removeAttr(id, k); if (el && old !== null) mutQueue({ type: 'attributes', target: el, attributeName: key, oldValue: old });
+  };
+  D.insertBefore = (pid, cid, refid) => {
+    const watching = mutObservers.size > 0, oldParent = watching ? D.parent(cid) : -1,
+      oldPrev = watching && oldParent >= 0 ? wrap(D.prev(cid)) : null, oldNext = watching && oldParent >= 0 ? wrap(D.next(cid)) : null;
+    const ok = _insertBefore(pid, cid, refid);
+    if (watching && ok) {
+      const par = wrap(pid), ch = wrap(cid);
+      if (oldParent >= 0 && oldParent !== pid) mutQueue({ type: 'childList', target: wrap(oldParent), removedNodes: [ch], previousSibling: oldPrev, nextSibling: oldNext });
+      if (par) mutQueue({ type: 'childList', target: par, addedNodes: [ch], previousSibling: wrap(D.prev(cid)), nextSibling: wrap(D.next(cid)) });
+    }
+    return ok;
+  };
+  D.remove = (id) => {
+    const watching = mutObservers.size > 0, pid = watching ? D.parent(id) : -1, ch = watching ? wrap(id) : null,
+      prev = watching && pid >= 0 ? wrap(D.prev(id)) : null, next = watching && pid >= 0 ? wrap(D.next(id)) : null;
+    const ok = _remove(id); if (watching && ok && pid >= 0) mutQueue({ type: 'childList', target: wrap(pid), removedNodes: [ch], previousSibling: prev, nextSibling: next }); return ok;
+  };
+  D.setText = (id, v) => {
+    const el = mutObservers.size ? wrap(id) : null, isChar = el && (el.nodeType === 3 || el.nodeType === 8), old = isChar ? D.text(id) : null, removed = el && !isChar ? childWrappers(id) : [];
+    _setText(id, v);
+    if (el) {
+      if (isChar) { const now = D.text(id); if (old !== now) mutQueue({ type: 'characterData', target: el, oldValue: old }); }
+      else { const added = childWrappers(id); if (removed.length || added.length) mutQueue({ type: 'childList', target: el, addedNodes: added, removedNodes: removed }); }
+    }
+  };
+  D.setInnerHTML = (id, v) => { const el = mutObservers.size ? wrap(id) : null, removed = el ? childWrappers(id) : []; _setInnerHTML(id, v); if (el) { const added = childWrappers(id); if (removed.length || added.length) mutQueue({ type: 'childList', target: el, addedNodes: added, removedNodes: removed }); } };
+  D.insertHTML = (id, pos, v) => {
+    if (!mutObservers.size) return _insertHTML(id, pos, v);
+    const host = wrap(id), parent = pos === 0 || pos === 3 ? (host && host.parentNode) : host;
+    const before = parent ? childWrappers(parent.__id) : [], ok = _insertHTML(id, pos, v);
+    if (ok !== false && parent) { const after = childWrappers(parent.__id), oldSet = new Set(before), newSet = new Set(after), added = after.filter(n => !oldSet.has(n)), removed = before.filter(n => !newSet.has(n)); if (added.length || removed.length) mutQueue({ type: 'childList', target: parent, addedNodes: added, removedNodes: removed }); }
+    return ok;
+  };
 }
-
-/* ───────── наблюдатели ───────── */
 g.MutationObserver = class {
-  constructor(cb) { this.cb = cb; this.__pending = []; this.__scheduled = false; this.__regs = []; }
-  observe(target, options) { options = options || {}; if (!options.childList && !options.attributes && !options.characterData) options = Object.assign({ childList: true }, options); const reg = { inst: this, target, options }; this.__regs.push(reg); mutObservers.add(reg); }
-  disconnect() { for (const r of this.__regs) mutObservers.delete(r); this.__regs = []; }
-  takeRecords() { const r = this.__pending; this.__pending = []; return r; }
+  constructor(cb) { if (typeof cb !== 'function') throw new TypeError('MutationObserver callback must be a function'); this.cb = cb; this.__pending = []; this.__scheduled = false; this.__regs = []; }
+  observe(target, options) {
+    if (!target || typeof target.nodeType !== 'number') throw new TypeError('The observed target must be a Node');
+    options = Object.assign({}, options || {});
+    if (options.attributeFilter || options.attributeOldValue) options.attributes = options.attributes !== false;
+    if (options.characterDataOldValue) options.characterData = options.characterData !== false;
+    if (!options.childList && !options.attributes && !options.characterData) throw new TypeError('At least one mutation type must be observed');
+    for (const r of this.__regs) if (r.target === target) mutObservers.delete(r);
+    const reg = { inst: this, target, options }; this.__regs.push(reg); mutObservers.add(reg);
+  }
+  disconnect() { for (const r of this.__regs) mutObservers.delete(r); this.__regs = []; this.__pending = []; }
+  takeRecords() { return this.__pending.splice(0); }
 };
-/* Реальный IntersectionObserver: раз в ~100мс сравнивает getBoundingClientRect() целей с областью root
-   (по умолчанию — вьюпорт), считает intersectionRatio и уведомляет только при смене isIntersecting или
-   пересечении порога threshold — а не «сразу true» для всего подряд. */
+
+/* IntersectionObserver: асинхронная первая доставка, фактическая геометрия, rootMargin и threshold transitions. */
 g.IntersectionObserver = class {
-  constructor(cb, options) { this.cb = cb; options = options || {}; this.root = options.root || null; this.rootMargin = options.rootMargin || '0px'; this.thresholds = Array.isArray(options.threshold) ? options.threshold.slice().sort((a, b) => a - b) : [options.threshold == null ? 0 : options.threshold]; this.__t = new Map(); this.__timer = null; }
-  observe(el) { if (this.__t.has(el)) return; this.__t.set(el, { ratio: -1, was: false }); if (!this.__timer) { const tick = () => { this.__check(); this.__timer = D.timerAdd(tick, 100, false); }; tick(); } }
-  unobserve(el) { this.__t.delete(el); }
-  disconnect() { this.__t.clear(); if (this.__timer) D.timerClear(this.__timer); this.__timer = null; }
-  takeRecords() { return []; }
+  constructor(cb, options) {
+    if (typeof cb !== 'function') throw new TypeError('IntersectionObserver callback must be a function');
+    options = options || {}; this.cb = cb; this.root = options.root || null; this.rootMargin = options.rootMargin || '0px';
+    const raw = options.threshold === undefined ? [0] : (Array.isArray(options.threshold) ? options.threshold : [options.threshold]);
+    if (raw.some(t => !Number.isFinite(+t) || +t < 0 || +t > 1)) throw new RangeError('threshold must be between 0 and 1');
+    this.thresholds = [...new Set(raw.map(Number))].sort((a,b)=>a-b); this.__t = new Map(); this.__timer = null; this.__records = []; this.__deliverScheduled = false;
+  }
+  observe(el) { if (!el || typeof el.getBoundingClientRect !== 'function') throw new TypeError('Target must be an Element'); if (this.__t.has(el)) return; this.__t.set(el, { ratio: null, was: false }); if (!this.__timer) { defer(() => { if (!this.__timer && this.__t.size) { this.__check(); this.__timer = D.timerAdd(() => this.__tick(), 100, true); } }); } }
+  __tick() { if (!this.__t.size) { if (this.__timer) D.timerClear(this.__timer); this.__timer = null; return; } this.__check(); }
+  unobserve(el) { this.__t.delete(el); if (!this.__t.size && this.__timer) { D.timerClear(this.__timer); this.__timer = null; } }
+  disconnect() { this.__t.clear(); if (this.__timer) D.timerClear(this.__timer); this.__timer = null; this.__records = []; }
+  takeRecords() { return this.__records.splice(0); }
+  __rootBounds() {
+    let r = this.root ? this.root.getBoundingClientRect() : { left:0, top:0, right:g.innerWidth, bottom:g.innerHeight, width:g.innerWidth, height:g.innerHeight };
+    const vals = String(this.rootMargin).trim().split(/\s+/).map(x=>/^[-+]?(?:\d*\.)?\d+%?$/.test(x)?x:'0px');
+    const m = vals.map((x,i)=>x.endsWith('%') ? parseFloat(x)*(i%2?r.width:r.height)/100 : parseFloat(x)||0);
+    const t=m[0]||0, rr=m[1]===undefined?t:m[1], b=m[2]===undefined?t:m[2], l=m[3]===undefined?rr:m[3];
+    return { left:r.left-l, top:r.top-t, right:r.right+rr, bottom:r.bottom+b, width:r.width+l+rr, height:r.height+t+b, x:r.left-l, y:r.top-t, toJSON(){return this;} };
+  }
   __check() {
-    const rr = this.root ? this.root.getBoundingClientRect() : { left: 0, top: 0, right: g.innerWidth, bottom: g.innerHeight, width: g.innerWidth, height: g.innerHeight };
-    const entries = [];
+    const rr = this.__rootBounds(), entries = [];
     for (const [el, st] of this.__t) {
       const r = el.getBoundingClientRect();
-      const ix = Math.max(0, Math.min(r.right, rr.right) - Math.max(r.left, rr.left));
-      const iy = Math.max(0, Math.min(r.bottom, rr.bottom) - Math.max(r.top, rr.top));
-      const area = r.width * r.height; const ratio = area > 0 ? (ix * iy) / area : 0; const now_ = ratio > 0;
-      const crossed = this.thresholds.some((t) => (st.ratio < t) !== (ratio < t));
-      if (now_ !== st.was || crossed) entries.push({ target: el, isIntersecting: now_, intersectionRatio: ratio, boundingClientRect: r, rootBounds: rr, intersectionRect: { left: Math.max(r.left, rr.left), top: Math.max(r.top, rr.top), right: Math.min(r.right, rr.right), bottom: Math.min(r.bottom, rr.bottom), width: ix, height: iy }, time: D.now() });
-      st.ratio = ratio; st.was = now_;
+      const left=Math.max(r.left,rr.left), top=Math.max(r.top,rr.top), right=Math.min(r.right,rr.right), bottom=Math.min(r.bottom,rr.bottom);
+      const ix=Math.max(0,right-left), iy=Math.max(0,bottom-top), area=Math.max(0,r.width)*Math.max(0,r.height), ratio=area>0?(ix*iy)/area:0, now_=ix>0&&iy>0;
+      const crossed=st.ratio===null || this.thresholds.some(t=>(st.ratio<t)!==(ratio<t));
+      if (st.ratio===null || now_!==st.was || crossed) entries.push({ target:el, isIntersecting:now_, intersectionRatio:ratio, boundingClientRect:r, rootBounds:rr, intersectionRect:{left,top,right,bottom,width:ix,height:iy,x:left,y:top,toJSON(){return this;}}, time:D.now() });
+      st.ratio=ratio; st.was=now_;
     }
-    if (entries.length) this.cb(entries, this);
+    if(entries.length){this.__records.push(...entries); if(!this.__deliverScheduled){this.__deliverScheduled=true;defer(()=>{this.__deliverScheduled=false;const out=this.takeRecords();if(out.length){try{this.cb(out,this);}catch(e){report(e);}}});}}
   }
 };
 g.ResizeObserver = class { constructor(cb) { this.cb = cb; } observe(el) { defer(() => { const r = el.getBoundingClientRect(); this.cb([{ target: el, contentRect: r, borderBoxSize: [{ inlineSize: r.width, blockSize: r.height }], contentBoxSize: [{ inlineSize: r.width, blockSize: r.height }] }], this); }); } unobserve() {} disconnect() {} };

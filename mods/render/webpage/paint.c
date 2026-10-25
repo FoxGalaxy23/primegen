@@ -3,12 +3,20 @@
 #include "layout.h"
 #include "font_manager.h"
 #include "gal.h"
+#include "fx.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <ctype.h>
 #include <strings.h>
+#ifndef _WIN32
+#include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#endif
 
 extern TTFFont* g_ttf_font;
 
@@ -336,11 +344,13 @@ static void paint_ctrl(const Cmd* c, int dx, int dy) {
 #define FR_MAX 64
 typedef struct {
     int cx0, cy0, cx1, cy1; float dx, dy, ry0, ry1; unsigned char kind;      /* сохранённое состояние до входа */
+    float rx0, rx1, im[6]; unsigned char has_im; int ox0, oy0, ox1, oy1;       /* sticky по X; обратная матрица transform для hit-test; внешнее отсечение (экранные координаты) */
     float bx0, by0, bx1, by1, sw, sh, ox, oy; unsigned char fl;               /* для скроллбара: рамка контейнера (экран), размеры, смещения, флаги */
     const DOMNode* node;
 } FrSave;
 typedef struct {
     int pass; int cx0, cy0, cx1, cy1; float dx, dy, ry0, ry1;
+    float rx0, rx1, im[6]; unsigned char has_im; int ox0, oy0, ox1, oy1;
     FrSave st[FR_MAX]; int sp;
     int popped; FrSave pop;                                                    /* только что закрытый прокручиваемый контейнер */
     const DOMNode* scroller; unsigned char scroller_fl; float s_ox, s_oy, s_mx, s_my;   /* только что открытый прокручиваемый контейнер (для колеса) */
@@ -348,15 +358,29 @@ typedef struct {
 
 static void fr_init(Frame* f, int pass, int x0, int y0, int x1, int y1) {
     memset(f, 0, sizeof *f); f->pass = pass; f->cx0 = x0; f->cy0 = y0; f->cx1 = x1; f->cy1 = y1;
-    f->dx = pass ? 0.0f : (float)-g_sx; f->dy = pass ? (float)g_top : (float)(g_top - g_sy); f->ry0 = (float)y0; f->ry1 = (float)y1;
+    f->dx = pass ? 0.0f : (float)-g_sx; f->dy = pass ? (float)g_top : (float)(g_top - g_sy); f->ry0 = (float)y0; f->ry1 = (float)y1; f->rx0 = (float)x0; f->rx1 = (float)x1;
 }
 static void fr_sync(const Frame* f) { cl_x0 = f->cx0; cl_y0 = f->cy0; cl_x1 = f->cx1; cl_y1 = f->cy1; }
 static void fr_push(Frame* f, unsigned char kind, FrSave** out) {
     FrSave* s = f->sp < FR_MAX ? &f->st[f->sp] : NULL;
-    if (s) { memset(s, 0, sizeof *s); s->cx0 = f->cx0; s->cy0 = f->cy0; s->cx1 = f->cx1; s->cy1 = f->cy1; s->dx = f->dx; s->dy = f->dy; s->ry0 = f->ry0; s->ry1 = f->ry1; s->kind = kind; }
+    if (s) { memset(s, 0, sizeof *s); s->cx0 = f->cx0; s->cy0 = f->cy0; s->cx1 = f->cx1; s->cy1 = f->cy1; s->dx = f->dx; s->dy = f->dy; s->ry0 = f->ry0; s->ry1 = f->ry1; s->rx0 = f->rx0; s->rx1 = f->rx1; memcpy(s->im, f->im, sizeof s->im); s->has_im = f->has_im; s->ox0 = f->ox0; s->oy0 = f->oy0; s->ox1 = f->ox1; s->oy1 = f->oy1; s->kind = kind; }
     f->sp++; *out = s;
 }
-static int fr_is_ctl(const Cmd* c) { return c->t == C_CLIP || c->t == C_UNCLIP || c->t == C_STK || c->t == C_ENDSTK; }
+static int fr_is_ctl(const Cmd* c) { return c->t == C_CLIP || c->t == C_UNCLIP || c->t == C_STK || c->t == C_ENDSTK || c->t == C_FX || c->t == C_ENDFX; }
+static void fr_restore(Frame* f, const FrSave* p) {
+    f->cx0 = p->cx0; f->cy0 = p->cy0; f->cx1 = p->cx1; f->cy1 = p->cy1; f->dx = p->dx; f->dy = p->dy; f->ry0 = p->ry0; f->ry1 = p->ry1; f->rx0 = p->rx0; f->rx1 = p->rx1;
+    memcpy(f->im, p->im, sizeof f->im); f->has_im = p->has_im; f->ox0 = p->ox0; f->oy0 = p->oy0; f->ox1 = p->ox1; f->oy1 = p->oy1;
+}
+/* точка экрана → локальные координаты внутри повёрнутого/масштабированного элемента */
+static void fr_map(const Frame* f, int mx, int my, float* px, float* py) {
+    if (!f->has_im) { *px = (float)mx; *py = (float)my; return; }
+    *px = f->im[0] * (mx + 0.5f) + f->im[2] * (my + 0.5f) + f->im[4]; *py = f->im[1] * (mx + 0.5f) + f->im[3] * (my + 0.5f) + f->im[5];
+}
+static int fr_in_clip(const Frame* f, int mx, int my) {
+    float px, py; fr_map(f, mx, my, &px, &py);
+    if (f->has_im && (mx < f->ox0 || mx >= f->ox1 || my < f->oy0 || my >= f->oy1)) return 0;
+    return px >= f->cx0 && px < f->cx1 && py >= f->cy0 && py < f->cy1;
+}
 /* применяет команду-«скобку» к кадру; для команд чужого прохода (fixed/не fixed) ничего не делает */
 static void fr_ctl(Frame* f, const Cmd* c) {
     f->popped = 0; f->scroller = NULL;
@@ -374,13 +398,12 @@ static void fr_ctl(Frame* f, const Cmd* c) {
             if (!(c->flags & CF_SCROLL_X)) ox = 0; if (!(c->flags & CF_SCROLL_Y)) oy = 0;
             if (s) { s->kind = 1; s->node = c->node; s->fl = c->flags; s->sw = c->ex[0]; s->sh = c->ex[1]; s->ox = ox; s->oy = oy; }
             f->scroller = c->node; f->scroller_fl = c->flags; f->s_ox = ox; f->s_oy = oy; f->s_mx = c->ex[2]; f->s_my = c->ex[3];
-            f->dx -= ox; f->dy -= oy; f->ry0 = (float)y0; f->ry1 = (float)y1;
+            f->dx -= ox; f->dy -= oy; f->ry0 = (float)y0; f->ry1 = (float)y1; f->rx0 = (float)x0; f->rx1 = (float)x1;
         }
         break; }
     case C_UNCLIP: {
-        if (f->sp > 0 && f->sp <= FR_MAX && f->st[f->sp - 1].kind == 2) return;      /* закрытие не того типа — игнорируем */
-        if (f->sp > 0) { f->sp--; if (f->sp < FR_MAX) { FrSave* p = &f->st[f->sp]; if (p->kind == 1) { f->popped = 1; f->pop = *p; }
-            f->cx0 = p->cx0; f->cy0 = p->cy0; f->cx1 = p->cx1; f->cy1 = p->cy1; f->dx = p->dx; f->dy = p->dy; f->ry0 = p->ry0; f->ry1 = p->ry1; } }
+        if (f->sp > 0 && f->sp <= FR_MAX && (f->st[f->sp - 1].kind == 2 || f->st[f->sp - 1].kind == 3)) return;      /* закрытие не того типа — игнорируем */
+        if (f->sp > 0) { f->sp--; if (f->sp < FR_MAX) { FrSave* p = &f->st[f->sp]; if (p->kind == 1) { f->popped = 1; f->pop = *p; } fr_restore(f, p); } }
         break; }
     case C_STK: {
         fr_push(f, 2, &s);
@@ -391,9 +414,26 @@ static void fr_ctl(Frame* f, const Cmd* c) {
         if ((c->flags & SF_BOTTOM) && shift == 0 && f->ry1 - c->ex[3] - c->h < ys) {
             shift = f->ry1 - c->ex[3] - c->h - ys; float room = (c->ex[1] + f->dy) - ys; if (shift < room) shift = room; if (shift > 0) shift = 0;
         }
-        f->dy += shift; break; }
+        float xs = c->x + f->dx, shx = 0;
+        if ((c->flags & SF_LEFT) && f->rx0 + c->ex[4] > xs) { shx = f->rx0 + c->ex[4] - xs; float room = (c->ex[7] + f->dx) - c->w - xs; if (shx > room) shx = room; if (shx < 0) shx = 0; }
+        if ((c->flags & SF_RIGHT) && shx == 0 && f->rx1 - c->ex[5] - c->w < xs) { shx = f->rx1 - c->ex[5] - c->w - xs; float room = (c->ex[6] + f->dx) - xs; if (shx < room) shx = room; if (shx > 0) shx = 0; }
+        f->dy += shift; f->dx += shx; break; }
     case C_ENDSTK: {
         if (f->sp > 0 && (f->sp > FR_MAX || f->st[f->sp - 1].kind == 2)) { f->sp--; if (f->sp < FR_MAX) { FrSave* p = &f->st[f->sp]; f->dy = p->dy; f->dx = p->dx; } }
+        break; }
+    case C_FX: {
+        if (!c->node) break; fr_push(f, 3, &s);
+        const NodeStyle* st = &c->node->st; if (!st->xf.n) break;
+        float tx = 0, ty = 0, m[6]; int lin = fx_xform_compute(&st->xf, c->x + f->dx, c->y + f->dy, c->w, c->h, m, &tx, &ty);
+        if (!lin) { f->dx += tx; f->dy += ty; break; }
+        float det = m[0] * m[3] - m[1] * m[2]; if (fabsf(det) < 1e-6f) break;
+        float inv[6] = {m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, 0, 0}; inv[4] = -(inv[0] * m[4] + inv[2] * m[5]); inv[5] = -(inv[1] * m[4] + inv[3] * m[5]);
+        if (f->has_im) { float o[6] = {inv[0] * f->im[0] + inv[2] * f->im[1], inv[1] * f->im[0] + inv[3] * f->im[1], inv[0] * f->im[2] + inv[2] * f->im[3], inv[1] * f->im[2] + inv[3] * f->im[3], 0, 0};
+            o[4] = inv[0] * f->im[4] + inv[2] * f->im[5] + inv[4]; o[5] = inv[1] * f->im[4] + inv[3] * f->im[5] + inv[5]; memcpy(inv, o, sizeof inv); }
+        else { f->ox0 = f->cx0; f->oy0 = f->cy0; f->ox1 = f->cx1; f->oy1 = f->cy1; }
+        memcpy(f->im, inv, sizeof f->im); f->has_im = 1; f->cx0 = f->cy0 = -1000000; f->cx1 = f->cy1 = 1000000; break; }
+    case C_ENDFX: {
+        if (f->sp > 0 && (f->sp > FR_MAX || f->st[f->sp - 1].kind == 3)) { f->sp--; if (f->sp < FR_MAX) fr_restore(f, &f->st[f->sp]); }
         break; }
     default: break;
     }
@@ -415,10 +455,13 @@ static void draw_elem_scrollbars(const FrSave* p) {
     }
 }
 
-static void paint_pass(int fixed_pass, int base_x0, int base_y0, int base_x1, int base_y1) {
-    Frame f; fr_init(&f, fixed_pass, base_x0, base_y0, base_x1, base_y1); fr_sync(&f);
-    for (int i = 0; i < l2_dn; i++) {
+static void fx_group(Frame* f, int i, int j, int pass);
+static void paint_range(const Frame* fp, int from, int to, int fixed_pass) {
+    Frame f = *fp; fr_sync(&f);
+    for (int i = from; i < to; i++) {
         const Cmd* c = &l2_dl[i];
+        if (c->t == C_FX) { if (c->fixed == fixed_pass && c->mate > i && c->mate < to) { fx_group(&f, i, c->mate, fixed_pass); i = c->mate; fr_sync(&f); } continue; }
+        if (c->t == C_ENDFX) continue;
         if (fr_is_ctl(c)) { fr_ctl(&f, c); fr_sync(&f); if (f.popped) draw_elem_scrollbars(&f.pop); continue; }
         if (c->fixed != fixed_pass) continue;
         int dx = (int)floorf(f.dx + 0.5f), dy = (int)floorf(f.dy + 0.5f);
@@ -458,26 +501,354 @@ static void paint_pass(int fixed_pass, int base_x0, int base_y0, int base_x1, in
     }
 }
 
+
+/* ══════════════ слои эффектов (C_FX … C_ENDFX) ══════════════ */
+static uint32_t* g_lay[3][2]; static size_t g_laycap[3]; static int g_fxdepth;
+
+static void range_bbox(const Frame* g, int i, int j, int pass, float* x0, float* y0, float* x1, float* y1) {
+    int dx = (int)floorf(g->dx + 0.5f), dy = (int)floorf(g->dy + 0.5f);
+    for (int k = i + 1; k < j; k++) {
+        const Cmd* c = &l2_dl[k]; if (c->fixed != pass) continue;
+        if (c->t == C_FX && c->node && c->node->st.xf.n) {                       /* вложенный transform расширяет границы слоя предка */
+            float tx = 0, ty = 0, m[6], bx = c->x + dx, by = c->y + dy; int lin = fx_xform_compute(&c->node->st.xf, bx, by, c->w, c->h, m, &tx, &ty);
+            float px[4] = {bx, bx + c->w, bx, bx + c->w}, py[4] = {by, by, by + c->h, by + c->h};
+            for (int q = 0; q < 4; q++) { float X = lin ? m[0] * px[q] + m[2] * py[q] + m[4] : px[q] + tx, Y = lin ? m[1] * px[q] + m[3] * py[q] + m[5] : py[q] + ty;
+                if (X < *x0) *x0 = X; if (X > *x1) *x1 = X; if (Y < *y0) *y0 = Y; if (Y > *y1) *y1 = Y; }
+            continue;
+        }
+        if (c->t != C_BOX && c->t != C_RECT && c->t != C_TEXT && c->t != C_IMG && c->t != C_BGIMG && c->t != C_CTRL) continue;
+        float ex = 0, ey0 = 0, ey1 = 0;
+        if (c->t == C_BOX && c->node && (c->node->st.sh_color >> 24)) { const NodeStyle* s = &c->node->st; float e = s->sh_blur + fabsf(s->sh_spread) + 2; ex = fabsf(s->sh_x) + e; ey0 = fabsf(s->sh_y) + e; ey1 = ey0; }
+        float ax = c->x + dx - ex, ay = c->y + dy - ey0, bx = c->x + c->w + dx + ex, by = c->y + c->h + dy + ey1;
+        if (ax < *x0) *x0 = ax; if (ay < *y0) *y0 = ay; if (bx > *x1) *x1 = bx; if (by > *y1) *y1 = by;
+    }
+}
+static int lay_get(int d, size_t need) {
+    if (g_laycap[d] < need) { for (int k = 0; k < 2; k++) { free(g_lay[d][k]); g_lay[d][k] = malloc(need * 4); if (!g_lay[d][k]) { g_laycap[d] = 0; return 0; } } g_laycap[d] = need; }
+    return 1;
+}
+static void fx_backdrop(const Cmd* c, const NodeStyle* st, float bx, float by) {
+    int pad = fx_filter_pad(&st->backdrop); int x0 = (int)floorf(bx) - pad, y0 = (int)floorf(by) - pad, x1 = (int)ceilf(bx + c->w) + pad, y1 = (int)ceilf(by + c->h) + pad;
+    int vx0 = (int)floorf(bx), vy0 = (int)floorf(by), vx1 = (int)ceilf(bx + c->w), vy1 = (int)ceilf(by + c->h);
+    if (vx0 < cl_x0) vx0 = cl_x0; if (vy0 < cl_y0) vy0 = cl_y0; if (vx1 > cl_x1) vx1 = cl_x1; if (vy1 > cl_y1) vy1 = cl_y1; if (vx1 <= vx0 || vy1 <= vy0) return;
+    if (x0 > vx0 - pad) x0 = vx0 - pad; if (y0 > vy0 - pad) y0 = vy0 - pad; if (x1 < vx1 + pad) x1 = vx1 + pad; if (y1 < vy1 + pad) y1 = vy1 + pad;
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > SCREEN_WIDTH) x1 = SCREEN_WIDTH; if (y1 > SCREEN_HEIGHT) y1 = SCREEN_HEIGHT; if (x1 <= x0 || y1 <= y0) return;
+    FxImg* im = fx_img_new(x0, y0, x1 - x0, y1 - y0); if (!im) return;
+    fx_img_from_buffer(im, back_buffer, SCREEN_WIDTH); fx_apply_filters(im, &st->backdrop);
+    float rad[4]; resolve_radii(st, c->w, c->h, rad);
+    fx_writeback(im, back_buffer, SCREEN_WIDTH, cl_x0, cl_y0, cl_x1, cl_y1, bx, by, c->w, c->h, rad);
+    fx_img_free(im);
+}
+static void fx_group(Frame* f, int i, int j, int pass) {
+    const Cmd* c = &l2_dl[i]; const NodeStyle* st = &c->node->st;
+    int dx = (int)floorf(f->dx + 0.5f), dy = (int)floorf(f->dy + 0.5f);
+    float bx = c->x + dx, by = c->y + dy;
+    if (st->backdrop.n && c->w > 0 && c->h > 0 && (f->has_im == 0)) fx_backdrop(c, st, bx, by);
+    float tx = 0, ty = 0, m[6]; int lin = st->xf.n ? fx_xform_compute(&st->xf, bx, by, c->w, c->h, m, &tx, &ty) : 0;
+    int need = st->filter.n || st->clip.kind || st->mask.kind || lin;
+    Frame g = *f;
+    if (!lin) { g.dx += tx; g.dy += ty; bx += tx; by += ty; }
+    if (!need || g_fxdepth >= 3) { paint_range(&g, i + 1, j, pass); fr_sync(f); return; }
+    float x0 = bx, y0 = by, x1 = bx + c->w, y1 = by + c->h; range_bbox(&g, i, j, pass, &x0, &y0, &x1, &y1);
+    int pad = fx_filter_pad(&st->filter);
+    float rx0 = x0 - pad, ry0 = y0 - pad, rx1 = x1 + pad, ry1 = y1 + pad;
+    if (!lin) { if (rx0 < cl_x0 - pad) rx0 = (float)(cl_x0 - pad); if (ry0 < cl_y0 - pad) ry0 = (float)(cl_y0 - pad); if (rx1 > cl_x1 + pad) rx1 = (float)(cl_x1 + pad); if (ry1 > cl_y1 + pad) ry1 = (float)(cl_y1 + pad); }
+    int ix0 = (int)floorf(rx0), iy0 = (int)floorf(ry0), ix1 = (int)ceilf(rx1), iy1 = (int)ceilf(ry1);
+    if (ix0 < 0) ix0 = 0; if (iy0 < 0) iy0 = 0; if (ix1 > SCREEN_WIDTH) ix1 = SCREEN_WIDTH; if (iy1 > SCREEN_HEIGHT) iy1 = SCREEN_HEIGHT;
+    if (ix1 <= ix0 || iy1 <= iy0) { fr_sync(f); return; }
+    int d = g_fxdepth; if (!lay_get(d, (size_t)SCREEN_WIDTH * (size_t)SCREEN_HEIGHT)) { paint_range(&g, i + 1, j, pass); fr_sync(f); return; }
+    uint32_t* save_bb = back_buffer; int sv[4] = {cl_x0, cl_y0, cl_x1, cl_y1};
+    g_fxdepth++;
+    for (int k = 0; k < 2; k++) {
+        uint32_t* L = g_lay[d][k]; uint32_t bg = k ? 0xFFFFFFu : 0x000000u;
+        for (int y = iy0; y < iy1; y++) { uint32_t* row = L + (size_t)y * SCREEN_WIDTH; for (int x = ix0; x < ix1; x++) row[x] = bg; }
+        back_buffer = L; Frame h = g; h.cx0 = ix0; h.cy0 = iy0; h.cx1 = ix1; h.cy1 = iy1; paint_range(&h, i + 1, j, pass);
+    }
+    g_fxdepth--; back_buffer = save_bb; cl_x0 = sv[0]; cl_y0 = sv[1]; cl_x1 = sv[2]; cl_y1 = sv[3];
+    FxImg* im = fx_img_new(ix0, iy0, ix1 - ix0, iy1 - iy0);
+    if (im) {
+        fx_img_from_passes(im, g_lay[d][0], g_lay[d][1], SCREEN_WIDTH);
+        if (st->filter.n) fx_apply_filters(im, &st->filter);
+        if (st->clip.kind) fx_apply_clip(im, &st->clip, bx, by, c->w, c->h);
+        if (st->mask.kind) fx_apply_mask(im, &st->mask, bx, by, c->w, c->h);
+        fx_composite(im, back_buffer, SCREEN_WIDTH, cl_x0, cl_y0, cl_x1, cl_y1, lin ? m : NULL);
+        fx_img_free(im);
+    }
+    fr_sync(f);
+}
+
+static void paint_pass(int fixed_pass, int base_x0, int base_y0, int base_x1, int base_y1) {
+    Frame f; fr_init(&f, fixed_pass, base_x0, base_y0, base_x1, base_y1); paint_range(&f, 0, l2_dn, fixed_pass);
+}
+
 static uint64_t fingerprint(DOMNode* head) {
     uint64_t h = 1469598103934665603ULL; int n = 0;
     for (DOMNode* p = head; p; p = p->next, n++) { h = (h ^ (uint64_t)(p->type + 1)) * 1099511628211ULL; h = (h ^ (unsigned char)p->text[0]) * 1099511628211ULL; h = (h ^ (unsigned char)p->text[1]) * 1099511628211ULL; h = (h ^ (uint64_t)(p->st.font_size * 10)) * 1099511628211ULL; }
     return h ^ (uint64_t)n ^ (uint64_t)(uintptr_t)head;
 }
 
-void webpage_render(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
+static void webpage_paint_loaded(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
     if (!head) return;
-    g_top = top_offset; g_sx = scroll_x; g_sy = scroll_y; snprintf(g_url, sizeof g_url, "%s", page_url ? page_url : "");
-    int vw = SCREEN_WIDTH - 10, vh = SCREEN_HEIGHT - top_offset; if (vw < 100) vw = 100;
-    uint64_t fp = fingerprint(head); g_last_head = head;
-    if (head != g_head || fp != g_fp || vw != g_lw || vh != g_lh) { l2_layout(head, vw, vh); g_head = head; g_fp = fp; g_lw = vw; g_lh = vh; }
-    /* clamp_page_scroll() считает max = content - SCREEN + top_offset + 20 → подбираем значения так, чтобы низ страницы достижим ровно */
+    g_top = top_offset; g_sx = scroll_x; g_sy = scroll_y;
+    snprintf(g_url, sizeof g_url, "%s", page_url ? page_url : "");
+    g_last_head = head; g_head = head; g_fp = fingerprint(head);
+    g_lw = SCREEN_WIDTH - 10; if (g_lw < 100) g_lw = 100;
+    g_lh = SCREEN_HEIGHT - top_offset;
     if (getenv("WP_DEBUG")) gal_log("INFO", "[wp] doc %.0fx%.0f top=%d scroll=%d", l2_doc_w, l2_doc_h, top_offset, scroll_y);
     layout_content_width = (int)l2_doc_w - 10; layout_content_height = (int)l2_doc_h - 20;
     cl_x0 = 0; cl_y0 = top_offset; cl_x1 = SCREEN_WIDTH; cl_y1 = SCREEN_HEIGHT;
-    fill_rect_i(0, top_offset, SCREEN_WIDTH, SCREEN_HEIGHT, l2_canvas_bg | 0xFF000000u, 1);       /* холст */
+    fill_rect_i(0, top_offset, SCREEN_WIDTH, SCREEN_HEIGHT, l2_canvas_bg | 0xFF000000u, 1);
     paint_pass(0, 0, top_offset, SCREEN_WIDTH, SCREEN_HEIGHT);
     paint_pass(1, 0, top_offset, SCREEN_WIDTH, SCREEN_HEIGHT);
 }
+static void webpage_layout_only(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
+    if (!head) return;
+    g_top = top_offset; g_sx = scroll_x; g_sy = scroll_y;
+    snprintf(g_url, sizeof g_url, "%s", page_url ? page_url : "");
+    int vw = SCREEN_WIDTH - 10, vh = SCREEN_HEIGHT - top_offset; if (vw < 100) vw = 100;
+    l2_layout(head, vw, vh);
+    g_last_head = head; g_head = head; g_fp = fingerprint(head); g_lw = vw; g_lh = vh;
+    layout_content_width = (int)l2_doc_w - 10; layout_content_height = (int)l2_doc_h - 20;
+}
+static void webpage_render_inline(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
+    if (!head) return;
+    g_top = top_offset; g_sx = scroll_x; g_sy = scroll_y; snprintf(g_url, sizeof g_url, "%s", page_url ? page_url : "");
+    int vw = SCREEN_WIDTH - 10, vh = SCREEN_HEIGHT - top_offset; if (vw < 100) vw = 100;
+    if (anim_step(head) & 1) g_head = NULL;
+    uint64_t fp = fingerprint(head); g_last_head = head;
+    if (head != g_head || fp != g_fp || vw != g_lw || vh != g_lh) { l2_layout(head, vw, vh); g_head = head; g_fp = fp; g_lw = vw; g_lh = vh; }
+    webpage_paint_loaded(head, top_offset, page_url, scroll_x, scroll_y);
+}
+
+#ifndef _WIN32
+/* Layout+paint worker: it gets a forked snapshot of the DOM, renders into a
+ * shared pixel mapping, and sends the hit-test display list back over a pipe.
+ * The UI process never runs layout/paint on this path. */
+#define RENDER_IPC_MAGIC 0x52504e31u /* RPN1 */
+typedef struct {
+    uint32_t magic, status, cmd_count, rect_count, scroll_count;
+    int32_t content_width, content_height;
+    uint32_t canvas_bg;
+    float doc_w, doc_h;
+    int32_t worker_pid, layout_pid;
+} RenderIPCHeader;
+typedef struct {
+    Cmd cmd;                 /* node/s/fam pointers are nulled before transmission */
+    int32_t node_idx;
+    uint32_t slen, flen;     /* include terminating NUL */
+} RenderCmdWire;
+typedef struct {
+    Cmd* dl; int dn;
+    float* rects; int nrects;
+    L2ScrollState* scroll; int nscroll;
+    char** strings; int nstrings, string_cap;
+    int32_t* node_ids;
+    RenderIPCHeader h;
+} RenderIPCData;
+static char** g_remote_strings;
+static int g_remote_string_count;
+static pid_t g_layout_child_pid;
+static int g_worker_output_fd = -1;
+static int g_render_isolation_logged;
+static int g_render_fallback_logged;
+
+static int render_ipc_write_all(int fd, const void* data, size_t len) {
+    const unsigned char* p = (const unsigned char*)data;
+    while (len) { ssize_t n = write(fd, p, len); if (n < 0) { if (errno == EINTR) continue; return 0; } if (!n) return 0; p += n; len -= (size_t)n; }
+    return 1;
+}
+static int render_ipc_read_all(int fd, void* data, size_t len) {
+    unsigned char* p = (unsigned char*)data;
+    while (len) { ssize_t n = read(fd, p, len); if (n < 0) { if (errno == EINTR) continue; return 0; } if (!n) return 0; p += n; len -= (size_t)n; }
+    return 1;
+}
+static int render_child_send(int fd, DOMNode* head) {
+    RenderIPCHeader h; memset(&h, 0, sizeof h);
+    h.magic = RENDER_IPC_MAGIC; h.status = 1;
+    h.worker_pid = (int32_t)getpid(); h.layout_pid = (int32_t)g_layout_child_pid;
+    if (l2_dn < 0 || l2_dn > 2000000 || l2_nrects < 0 || l2_nrects > 1000000) h.status = 0;
+    h.cmd_count = h.status ? (uint32_t)l2_dn : 0;
+    h.rect_count = h.status ? (uint32_t)l2_nrects : 0;
+    int sc = l2_scroll_state_export(head, NULL, 0);
+    if (sc < 0 || sc > 1000000) h.status = 0; else h.scroll_count = h.status ? (uint32_t)sc : 0;
+    h.content_width = layout_content_width; h.content_height = layout_content_height;
+    h.canvas_bg = l2_canvas_bg; h.doc_w = l2_doc_w; h.doc_h = l2_doc_h;
+    if (!render_ipc_write_all(fd, &h, sizeof h) || !h.status) return 0;
+    for (int i = 0; i < l2_dn; i++) {
+        const Cmd* c = &l2_dl[i]; RenderCmdWire w; memset(&w, 0, sizeof w);
+        memcpy(&w.cmd, c, sizeof(Cmd)); w.cmd.node = NULL; w.cmd.s = NULL; w.cmd.fam = NULL;
+        w.node_idx = c->node ? c->node->idx : -1;
+        size_t sl = c->s ? strlen(c->s) + 1 : 0, fl = c->fam ? strlen(c->fam) + 1 : 0;
+        if (sl > 16u*1024u*1024u || fl > 1024u*1024u) return 0;
+        w.slen = (uint32_t)sl; w.flen = (uint32_t)fl;
+        if (!render_ipc_write_all(fd, &w, sizeof w)) return 0;
+        if (sl && !render_ipc_write_all(fd, c->s, sl)) return 0;
+        if (fl && !render_ipc_write_all(fd, c->fam, fl)) return 0;
+    }
+    if (h.rect_count && (!l2_rects || !render_ipc_write_all(fd, l2_rects, (size_t)h.rect_count * 4 * sizeof(float)))) return 0;
+    if (h.scroll_count) {
+        size_t bytes = (size_t)h.scroll_count * sizeof(L2ScrollState);
+        L2ScrollState* state = malloc(bytes); if (!state) return 0;
+        int n = l2_scroll_state_export(head, state, (int)h.scroll_count);
+        int ok = n == (int)h.scroll_count && render_ipc_write_all(fd, state, bytes);
+        free(state); if (!ok) return 0;
+    }
+    return 1;
+}
+static void render_ipc_data_clear(RenderIPCData* d) {
+    if (!d) return;
+    for (int i = 0; i < d->nstrings; i++) free(d->strings[i]);
+    free(d->strings); free(d->dl); free(d->rects); free(d->scroll); free(d->node_ids); memset(d, 0, sizeof *d);
+}
+static int render_ipc_add_string(RenderIPCData* d, const char* s) {
+    if (!s) return 1;
+    if (d->nstrings >= d->string_cap) {
+        int cap = d->string_cap ? d->string_cap * 2 : 256;
+        if (cap < d->string_cap || cap > 4000000) return 0;
+        char** v = realloc(d->strings, (size_t)cap * sizeof(*v)); if (!v) return 0;
+        d->strings = v; d->string_cap = cap;
+    }
+    d->strings[d->nstrings++] = (char*)s; return 1;
+}
+static int render_parent_read(int fd, RenderIPCData* d) {
+    memset(d, 0, sizeof *d);
+    if (!render_ipc_read_all(fd, &d->h, sizeof d->h) || d->h.magic != RENDER_IPC_MAGIC || !d->h.status ||
+        d->h.cmd_count > 2000000 || d->h.rect_count > 1000000 || d->h.scroll_count > 1000000) return 0;
+    d->dn = (int)d->h.cmd_count; d->nrects = (int)d->h.rect_count; d->nscroll = (int)d->h.scroll_count;
+    if (d->dn) {
+        d->dl = calloc((size_t)d->dn, sizeof(*d->dl));
+        d->node_ids = malloc((size_t)d->dn * sizeof(*d->node_ids));
+        if (!d->dl || !d->node_ids) return 0;
+    }
+    if (d->nrects) { d->rects = malloc((size_t)d->nrects * 4 * sizeof(float)); if (!d->rects) return 0; }
+    if (d->nscroll) { d->scroll = malloc((size_t)d->nscroll * sizeof(*d->scroll)); if (!d->scroll) return 0; }
+    for (int i = 0; i < d->dn; i++) {
+        RenderCmdWire w;
+        if (!render_ipc_read_all(fd, &w, sizeof w) || w.slen > 16u*1024u*1024u || w.flen > 1024u*1024u) return 0;
+        Cmd* c = &d->dl[i]; memcpy(c, &w.cmd, sizeof *c); c->node = NULL; c->s = NULL; c->fam = NULL;
+        /* Keep strings separately allocated: Cmds reference them for hit-testing and copy selection. */
+        if (w.slen) {
+            char* str = malloc(w.slen); if (!str) return 0;
+            if (!render_ipc_read_all(fd, str, w.slen)) { free(str); return 0; }
+            str[w.slen - 1] = 0; if (!render_ipc_add_string(d, str)) { free(str); return 0; } c->s = str;
+        }
+        if (w.flen) {
+            char* str = malloc(w.flen); if (!str) return 0;
+            if (!render_ipc_read_all(fd, str, w.flen)) { free(str); return 0; }
+            str[w.flen - 1] = 0; if (!render_ipc_add_string(d, str)) { free(str); return 0; } c->fam = str;
+        }
+        c->mate = (c->mate < -1 || c->mate >= d->dn) ? -1 : c->mate;
+        d->node_ids[i] = w.node_idx;
+    }
+    if (d->nrects && !render_ipc_read_all(fd, d->rects, (size_t)d->nrects * 4 * sizeof(float))) return 0;
+    if (d->nscroll && !render_ipc_read_all(fd, d->scroll, (size_t)d->nscroll * sizeof(*d->scroll))) return 0;
+    return 1;
+}
+static int render_ipc_install(DOMNode* head, RenderIPCData* d) {
+    int max_idx = -1;
+    for (DOMNode* n = head; n; n = n->next) if (n->idx > max_idx) max_idx = n->idx;
+    int map_count = max_idx + 1;
+    DOMNode** map = calloc((size_t)(map_count > 0 ? map_count : 1), sizeof(*map));
+    if (!map) return 0;
+    for (DOMNode* n = head; n; n = n->next) if (n->idx >= 0 && n->idx < map_count) map[n->idx] = n;
+    for (int i = 0; i < d->dn; i++) {
+        int ni = d->node_ids ? d->node_ids[i] : -1;
+        if (ni >= 0 && ni < map_count) d->dl[i].node = map[ni]; else d->dl[i].node = NULL;
+    }
+    free(map);
+    for (int i = 0; i < g_remote_string_count; i++) free(g_remote_strings[i]);
+    free(g_remote_strings); g_remote_strings = d->strings; g_remote_string_count = d->nstrings; d->strings = NULL; d->nstrings = d->string_cap = 0;
+    l2_release();
+    l2_dl = d->dl; l2_dn = d->dn; d->dl = NULL; d->dn = 0;
+    l2_rects = d->rects; l2_nrects = d->nrects; d->rects = NULL; d->nrects = 0;
+    l2_canvas_bg = d->h.canvas_bg; l2_doc_w = d->h.doc_w; l2_doc_h = d->h.doc_h;
+    layout_content_width = d->h.content_width; layout_content_height = d->h.content_height;
+    if (d->nscroll > 0) l2_scroll_state_import(d->scroll, d->nscroll, head);
+    return 1;
+}
+static int webpage_layout_subprocess(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
+    int fds[2] = {-1, -1};
+    g_layout_child_pid = 0;
+    if (pipe(fds) != 0) return 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        if (g_worker_output_fd >= 0 && g_worker_output_fd != fds[1]) close(g_worker_output_fd);
+        g_layout_child_pid = 0;
+        webpage_layout_only(head, top_offset, page_url, scroll_x, scroll_y);
+        int ok = render_child_send(fds[1], head); close(fds[1]); _exit(ok ? 0 : 127);
+    }
+    close(fds[1]);
+    if (pid < 0) { close(fds[0]); return 0; }
+    RenderIPCData data; int ok = render_parent_read(fds[0], &data);
+    close(fds[0]); int st = 0; pid_t wr; do { wr = waitpid(pid, &st, 0); } while (wr < 0 && errno == EINTR);
+    if (ok && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok = render_ipc_install(head, &data);
+    else ok = 0;
+    render_ipc_data_clear(&data);
+    if (ok) g_layout_child_pid = pid;
+    return ok;
+}
+static void webpage_render_worker(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
+    g_layout_child_pid = 0;
+    if (!webpage_layout_subprocess(head, top_offset, page_url, scroll_x, scroll_y)) {
+        webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y);
+        return;
+    }
+    webpage_paint_loaded(head, top_offset, page_url, scroll_x, scroll_y);
+}
+void webpage_render(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
+    if (!head) return;
+    const char* mode = getenv("MLB_RENDER_INLINE");
+    if ((mode && mode[0] == '1') || SCREEN_WIDTH <= 0 || SCREEN_HEIGHT <= 0 || !back_buffer) {
+        webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y); return;
+    }
+    size_t pixels = (size_t)SCREEN_WIDTH * (size_t)SCREEN_HEIGHT;
+    if (pixels > (size_t)128 * 1024 * 1024 / sizeof(uint32_t)) { webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y); return; }
+    size_t bytes = pixels * sizeof(uint32_t);
+    uint32_t* shared = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) { webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y); return; }
+    memcpy(shared, back_buffer, bytes);
+    int fds[2] = {-1, -1};
+    if (pipe(fds) != 0) { munmap(shared, bytes); webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y); return; }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]); back_buffer = shared; g_worker_output_fd = fds[1];
+        webpage_render_worker(head, top_offset, page_url, scroll_x, scroll_y);
+        int ok = render_child_send(fds[1], head); close(fds[1]); _exit(ok ? 0 : 127);
+    }
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]); munmap(shared, bytes); webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y); return;
+    }
+    RenderIPCData data; int ok = render_parent_read(fds[0], &data);
+    close(fds[0]); int st = 0; pid_t wr; do { wr = waitpid(pid, &st, 0); } while (wr < 0 && errno == EINTR);
+    if (ok && WIFEXITED(st) && WEXITSTATUS(st) == 0) ok = render_ipc_install(head, &data);
+    else ok = 0;
+    if (ok) {
+        memcpy(back_buffer, shared, bytes);
+        g_top = top_offset; g_sx = scroll_x; g_sy = scroll_y;
+        snprintf(g_url, sizeof g_url, "%s", page_url ? page_url : "");
+        g_last_head = head; g_head = head; g_fp = fingerprint(head);
+        g_lw = SCREEN_WIDTH - 10; if (g_lw < 100) g_lw = 100; g_lh = SCREEN_HEIGHT - top_offset;
+        if (data.h.layout_pid > 0 && !g_render_isolation_logged) {
+            gal_log("INFO", "[render] layout process pid=%d; paint process pid=%d", data.h.layout_pid, data.h.worker_pid);
+            g_render_isolation_logged = 1;
+        } else if (data.h.layout_pid <= 0 && !g_render_fallback_logged) {
+            gal_log("WARN", "[render] separate layout process failed; renderer used its inline fallback");
+            g_render_fallback_logged = 1;
+        }
+    } else {
+        if (!g_render_fallback_logged) { gal_log("WARN", "[render] child render IPC failed; using inline fallback for this frame"); g_render_fallback_logged = 1; }
+        render_ipc_data_clear(&data);
+        webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y);
+    }
+    render_ipc_data_clear(&data); munmap(shared, bytes);
+}
+#else
+void webpage_render(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
+    webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y);
+}
+#endif
 
 /* ══════════════ взаимодействие ══════════════ */
 DOMNode* webpage_hit_test(DOMNode* head, int mx, int my) {
@@ -488,9 +859,9 @@ DOMNode* webpage_hit_test(DOMNode* head, int mx, int my) {
         const Cmd* c = &l2_dl[i]; int k = c->fixed ? 1 : 0; Frame* f = &fr[k];
         if (fr_is_ctl(c)) { fr_ctl(f, c); continue; }
         if (c->t != C_HIT) continue;
-        if (mx < f->cx0 || mx >= f->cx1 || my < f->cy0 || my >= f->cy1) continue;     /* скрыто отсечением overflow */
-        float x0 = c->x + f->dx, y0 = c->y + f->dy;
-        if (mx >= x0 && mx < x0 + c->w && my >= y0 && my < y0 + c->h) best[k] = c->node;
+        if (!fr_in_clip(f, mx, my)) continue;     /* скрыто отсечением overflow */
+        float x0 = c->x + f->dx, y0 = c->y + f->dy, hx, hy; fr_map(f, mx, my, &hx, &hy);
+        if (hx >= x0 && hx < x0 + c->w && hy >= y0 && hy < y0 + c->h) best[k] = c->node;
     }
     return best[1] ? best[1] : best[0];
 }
@@ -597,8 +968,16 @@ int webpage_click(DOMNode* head, DOMNode* n, char* url, int cap) {
 void webpage_invalidate_layout(void) { g_head = NULL; }
 void webpage_force_layout(void) {
     if (!g_last_head) return;
-    int vw = g_lw > 0 ? g_lw : SCREEN_WIDTH - 10, vh = g_lh > 0 ? g_lh : SCREEN_HEIGHT - 80;
-    l2_layout(g_last_head, vw, vh); g_head = g_last_head; g_fp = fingerprint(g_head); g_lw = vw; g_lh = vh;
+    webpage_force_layout_for(g_last_head);
+}
+void webpage_force_layout_for(DOMNode* head) {
+    if (!head) return;
+    if (g_top <= 0 || g_top >= SCREEN_HEIGHT) g_top = 80;
+    int vw = SCREEN_WIDTH - 10, vh = SCREEN_HEIGHT - g_top;
+    if (vw < 100) vw = 100; if (vh < 50) vh = 50;
+    g_last_head = head; g_head = NULL;
+    l2_layout(head, vw, vh); g_head = head; g_fp = fingerprint(head); g_lw = vw; g_lh = vh;
+    layout_content_width = (int)l2_doc_w - 10; layout_content_height = (int)l2_doc_h - 20;
 }
 void webpage_get_scroll(int* x, int* y, int* vw, int* vh) { *x = g_sx; *y = g_sy; *vw = SCREEN_WIDTH - 10; *vh = SCREEN_HEIGHT - g_top; }
 
@@ -632,9 +1011,9 @@ DOMNode* webpage_hit_element(DOMNode* head, int mx, int my) {
         if (fr_is_ctl(c)) { fr_ctl(f, c); continue; }
         if (c->t != C_MARK && c->t != C_TEXT && c->t != C_IMG && c->t != C_CTRL) continue;
         if (!c->node || (c->t == C_TEXT && c->node->parent < 0)) continue;
-        if (mx < f->cx0 || mx >= f->cx1 || my < f->cy0 || my >= f->cy1) continue;
-        float x0 = c->x + f->dx, y0 = c->y + f->dy;
-        if (mx >= x0 && mx < x0 + c->w && my >= y0 && my < y0 + c->h) best[k] = c;
+        if (!fr_in_clip(f, mx, my)) continue;
+        float x0 = c->x + f->dx, y0 = c->y + f->dy, hx, hy; fr_map(f, mx, my, &hx, &hy);
+        if (hx >= x0 && hx < x0 + c->w && hy >= y0 && hy < y0 + c->h) best[k] = c;
     }
     const Cmd* c = best[1] ? best[1] : best[0]; if (!c) return NULL;
     if (c->t == C_TEXT) { int par = c->node->parent; DOMNode* q = head; for (int k = 0; k < par && q; k++) q = q->next; return q; }
@@ -650,7 +1029,7 @@ int webpage_scroll_at(int mx, int my, int dx, int dy) {
     for (int i = 0; i < l2_dn; i++) {
         const Cmd* c = &l2_dl[i]; if (!fr_is_ctl(c)) continue;
         int k = c->fixed ? 1 : 0; Frame* f = &fr[k]; fr_ctl(f, c);
-        if (f->scroller && nc[k] < 64 && mx >= f->cx0 && mx < f->cx1 && my >= f->cy0 && my < f->cy1) { cand[k][nc[k]].n = f->scroller; cand[k][nc[k]].fl = f->scroller_fl; nc[k]++; }
+        if (f->scroller && nc[k] < 64 && fr_in_clip(f, mx, my)) { cand[k][nc[k]].n = f->scroller; cand[k][nc[k]].fl = f->scroller_fl; nc[k]++; }
     }
     for (int pass = 1; pass >= 0; pass--) for (int j = nc[pass] - 1; j >= 0; j--) {
         const DOMNode* n = cand[pass][j].n; unsigned fl = cand[pass][j].fl; float x, y, mxs, mys; l2_scroll_get(n, &x, &y); l2_scroll_max(n, &mxs, &mys);

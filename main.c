@@ -901,6 +901,8 @@ int main(int argc, char** argv) {
         if (active_tab_idx >= 0 && tabs[active_tab_idx].js_page) {                /* таймеры/промисы страницы, навигация и прокрутка из JS */
             void* jp = tabs[active_tab_idx].js_page;
             if (webpage_js_tick(jp)) needs_redraw = 1;
+            if (webpage_dyn_pending()) { webpage_dyn_clear_pending(); webpage_js_restyle(jp); needs_redraw = 1; }
+            if (webpage_anim_tick()) { needs_redraw = 1; webpage_js_anim_events(jp); }
             const char* jnav = webpage_js_take_nav(jp);
             if (jnav) {
                 char nbuf[1200]; snprintf(nbuf, sizeof(nbuf), "%s", jnav); BrowserTab* jt = &tabs[active_tab_idx];
@@ -983,6 +985,10 @@ int main(int argc, char** argv) {
             }
 
             if (ev.type == GAL_EVENT_MOUSE_DOWN) {
+#ifdef HAVE_RENDER
+                if (active_tab_idx >= 0 && tabs[active_tab_idx].dom_tree && ((DOMNode*)tabs[active_tab_idx].dom_tree)->v2 && webpage_uses_dyn())
+                    webpage_set_active(webpage_hit_element((DOMNode*)tabs[active_tab_idx].dom_tree, ev.mouse_x, ev.mouse_y));
+#endif
 #ifdef HAVE_UI
                 if (ev.mouse_button == GAL_MOUSE_LEFT) {
                     select_start_x = ev.mouse_x;
@@ -998,6 +1004,10 @@ int main(int argc, char** argv) {
 #endif
             }
             else if (ev.type == GAL_EVENT_MOUSE_MOVE) {
+#ifdef HAVE_RENDER
+                if (active_tab_idx >= 0 && tabs[active_tab_idx].dom_tree && ((DOMNode*)tabs[active_tab_idx].dom_tree)->v2 && webpage_uses_dyn())
+                    webpage_set_hover(webpage_hit_element((DOMNode*)tabs[active_tab_idx].dom_tree, ev.mouse_x, ev.mouse_y));
+#endif
 #ifdef HAVE_UI
                 if (selecting_text) {
                     layout_selection_x1 = select_start_x;
@@ -1009,6 +1019,9 @@ int main(int argc, char** argv) {
 #endif
             }
             else if (ev.type == GAL_EVENT_MOUSE_UP) {
+#ifdef HAVE_RENDER
+                webpage_set_active(NULL);
+#endif
 #ifdef HAVE_UI
                 if (ev.mouse_button == GAL_MOUSE_LEFT) {
                     selecting_text = 0;

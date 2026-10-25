@@ -1,13 +1,23 @@
 # --- Compilation Variables ---
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 $(shell pkg-config --cflags freetype2 libpng 2>/dev/null || echo "")
-LIBS = -lz -lm -lsqlite3 $(shell pkg-config --libs freetype2 libpng 2>/dev/null || echo "")
-# libwebp: декодирование WebP-картинок (stb_image его не умеет, а большинство сайтов, включая Wikipedia, отдают WebP).
-# Собирается опционально: если пакета нет, декодер WebP просто отключается (см. images.c), сборка не ломается.
-HAS_WEBP := $(shell pkg-config --exists libwebp && echo yes)
-ifeq ($(HAS_WEBP),yes)
-    CFLAGS += -DHAVE_WEBP $(shell pkg-config --cflags libwebp)
-    LIBS += $(shell pkg-config --libs libwebp)
+CFLAGS = -Wall -Wextra -O2 $(shell pkg-config --cflags freetype2 2>/dev/null) $(shell pkg-config --cflags libpng 2>/dev/null)
+# Detect packages independently: a missing FreeType .pc file must not hide the available libpng linker flags.
+LIBS = -lz -lm -lsqlite3 $(shell pkg-config --libs freetype2 2>/dev/null) $(shell pkg-config --libs libpng 2>/dev/null || echo "-lpng16")
+# WebP/AVIF декодеры необязательны: без пакета остаётся поддержка stb_image.
+# Не подключаем pkg-config библиотеки Linux при сборке Win32/MinGW.
+ifneq ($(OS),Windows_NT)
+ifneq ($(CROSS),win32)
+    HAS_WEBP := $(shell pkg-config --exists libwebp && echo yes)
+    ifeq ($(HAS_WEBP),yes)
+        CFLAGS += -DHAVE_WEBP $(shell pkg-config --cflags libwebp)
+        LIBS += $(shell pkg-config --libs libwebp)
+    endif
+    HAS_AVIF := $(shell pkg-config --exists libavif && echo yes)
+    ifeq ($(HAS_AVIF),yes)
+        CFLAGS += -DHAVE_AVIF $(shell pkg-config --cflags libavif)
+        LIBS += $(shell pkg-config --libs libavif)
+    endif
+endif
 endif
 STRIP = strip
 
@@ -123,8 +133,15 @@ else
 	cd $(PACKAGE_DIR) && tar -czvf ../$(ARCHIVE) .
 endif
 
+# Regression tests for native image decoding + responsive source selection.
+TEST_OBJS = $(filter-out $(OBJDIR)/main.o,$(OBJS))
+test-images: $(TEST_OBJS) tests/images/check.c
+	@mkdir -p $(OBJDIR)
+	$(CC) $(CFLAGS) -DTEST_WEBP_PATH=\"$(CURDIR)/tests/images/red.webp\" -DTEST_AVIF_PATH=\"$(CURDIR)/tests/images/blue.avif\" tests/images/check.c $(TEST_OBJS) -o $(OBJDIR)/images_test $(LIBS)
+	./$(OBJDIR)/images_test
+
 clean:
 	rm -rf $(TARGET) $(COMPILE_DIR) $(OBJDIR) browser.log
 	rm -f my_browser my_browser.exe
 
-.PHONY: all clean package
+.PHONY: all clean package test-images

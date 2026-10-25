@@ -261,6 +261,10 @@ int nal_async_start_ex(const char* method, const char* url, const char* headers_
 }
 
 int nal_async_poll(NalAsyncReq* req, int* out_status, char** out_headers, char** out_body) {
+    return nal_async_poll_ex(req, out_status, out_headers, out_body, NULL);
+}
+
+int nal_async_poll_ex(NalAsyncReq* req, int* out_status, char** out_headers, char** out_body, size_t* out_body_len) {
     if (!req->used) return 0;
     int status = 0; pid_t r = waitpid(req->pid, &status, WNOHANG);
     if (r == 0) return 0;                                          /* ещё выполняется */
@@ -273,19 +277,19 @@ int nal_async_poll(NalAsyncReq* req, int* out_status, char** out_headers, char**
         snprintf(cin_tpl, sizeof cin_tpl, "%s", l1); snprintf(cout_tpl, sizeof cout_tpl, "%s", l2); snprintf(req_tpl, sizeof req_tpl, "%s", l3); unlink(side); }
 
     int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    char* hdrs = NULL; char* body = NULL; int http_status = 0;
+    char* hdrs = NULL; char* body = NULL; size_t body_n = 0; int http_status = 0;
     if (ok) {
         FILE* hf = fopen(req->hdr_path, "rb");
         if (hf) { fseek(hf, 0, SEEK_END); long sz = ftell(hf); fseek(hf, 0, SEEK_SET); if (sz > 0 && sz < 1 << 20) { hdrs = malloc((size_t)sz + 1); size_t rd = fread(hdrs, 1, (size_t)sz, hf); hdrs[rd] = 0; } fclose(hf); }
         if (hdrs) { const char* sp = strchr(hdrs, ' '); if (sp) http_status = atoi(sp + 1); }
         FILE* bf = fopen(req->body_path, "rb");
-        if (bf) { fseek(bf, 0, SEEK_END); long sz = ftell(bf); fseek(bf, 0, SEEK_SET); body = malloc((size_t)sz + 1); if (body) { size_t rd = fread(body, 1, (size_t)sz, bf); body[rd] = 0; } fclose(bf); }
+        if (bf) { fseek(bf, 0, SEEK_END); long sz = ftell(bf); fseek(bf, 0, SEEK_SET); if (sz < 0) sz = 0; body = malloc((size_t)sz + 1); if (body) { size_t rd = fread(body, 1, (size_t)sz, bf); body[rd] = 0; body_n = rd; } fclose(bf); }
         if (cout_tpl[0]) db_import_cookies_from_file(active_profile_id, cout_tpl);
     }
     unlink(req->body_path); unlink(req->hdr_path);
     if (cin_tpl[0]) unlink(cin_tpl); if (cout_tpl[0]) unlink(cout_tpl); if (req_tpl[0]) unlink(req_tpl);
 
-    *out_status = ok ? http_status : 0; *out_headers = hdrs ? hdrs : strdup(""); *out_body = body ? body : strdup("");
+    *out_status = ok ? http_status : 0; *out_headers = hdrs ? hdrs : strdup(""); *out_body = body ? body : strdup(""); if (out_body_len) *out_body_len = body ? body_n : 0;
     return 1;
 }
 

@@ -50,6 +50,22 @@ int db_ls_remove(const char* origin, const char* key);
 int db_ls_clear(const char* origin);
 char* db_ls_list_json(const char* origin);   // {"key":"value",...} для гидратации Storage; вызывающий обязан free()
 
+// IndexedDB: метаданные и записи хранятся отдельно от localStorage, с изоляцией по профилю и origin.
+char* db_idb_meta_list(const char* origin);
+char* db_idb_meta_get(const char* origin, const char* name);
+int db_idb_meta_set(const char* origin, const char* name, int version, const char* stores_json);
+int db_idb_delete_database(const char* origin, const char* name);
+char* db_idb_list(const char* origin, const char* name, const char* store);
+char* db_idb_get(const char* origin, const char* name, const char* store, const char* key);
+int db_idb_put(const char* origin, const char* name, const char* store, const char* key, const char* value_json);
+int db_idb_remove(const char* origin, const char* name, const char* store, const char* key);
+int db_idb_clear(const char* origin, const char* name, const char* store);
+
+// Реестр Service Worker: регистрация переживает загрузки страниц и перезапуск.
+char* db_sw_list(const char* origin);
+int db_sw_set(const char* origin, const char* scope, const char* script_url);
+int db_sw_remove(const char* origin, const char* scope);
+
 int db_add_download(const char* url, const char* path, const char* filename, long long total_size);
 void db_update_download_progress(int id, long long downloaded, const char* status);
 char* db_generate_downloads_html(void);
@@ -82,6 +98,18 @@ static inline int db_ls_set(const char* o, const char* k, const char* v) { (void
 static inline int db_ls_remove(const char* o, const char* k) { (void)o;(void)k; return 0; }
 static inline int db_ls_clear(const char* o) { (void)o; return 0; }
 static inline char* db_ls_list_json(const char* o) { (void)o; return strdup("{}"); }
+static inline char* db_idb_meta_list(const char* o) { (void)o; return strdup("[]"); }
+static inline char* db_idb_meta_get(const char* o, const char* n) { (void)o;(void)n; return NULL; }
+static inline int db_idb_meta_set(const char* o,const char* n,int v,const char* s) { (void)o;(void)n;(void)v;(void)s; return 0; }
+static inline int db_idb_delete_database(const char* o,const char* n) { (void)o;(void)n; return 0; }
+static inline char* db_idb_list(const char* o,const char* n,const char* s) { (void)o;(void)n;(void)s; return strdup("[]"); }
+static inline char* db_idb_get(const char* o,const char* n,const char* s,const char* k) { (void)o;(void)n;(void)s;(void)k; return NULL; }
+static inline int db_idb_put(const char* o,const char* n,const char* s,const char* k,const char* v) { (void)o;(void)n;(void)s;(void)k;(void)v; return 0; }
+static inline int db_idb_remove(const char* o,const char* n,const char* s,const char* k) { (void)o;(void)n;(void)s;(void)k; return 0; }
+static inline int db_idb_clear(const char* o,const char* n,const char* s) { (void)o;(void)n;(void)s; return 0; }
+static inline char* db_sw_list(const char* o) { (void)o; return strdup("[]"); }
+static inline int db_sw_set(const char* o,const char* s,const char* u) { (void)o;(void)s;(void)u; return 0; }
+static inline int db_sw_remove(const char* o,const char* s) { (void)o;(void)s; return 0; }
 static inline int db_add_download(const char* u, const char* p, const char* f, long long t) { (void)u;(void)p;(void)f;(void)t; return -1; }
 static inline void db_update_download_progress(int i, long long d, const char* s) { (void)i;(void)d;(void)s; }
 static inline char* db_generate_downloads_html(void) { return strdup("<p>Downloads disabled.</p>"); }

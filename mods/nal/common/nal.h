@@ -60,6 +60,10 @@ int nal_async_start_ex(const char* method, const char* url, const char* headers_
    вызывающий обязан free()); также освобождает временные файлы. */
 int nal_async_poll(NalAsyncReq* req, int* out_status, char** out_headers, char** out_body);
 
+/* То же, что nal_async_poll, но возвращает ещё и длину тела (*out_body_len): тело бинарное и может содержать '\0'.
+   *out_body всегда с завершающим '\0' (не входит в длину). */
+int nal_async_poll_ex(NalAsyncReq* req, int* out_status, char** out_headers, char** out_body, size_t* out_body_len);
+
 /* Отменяет ещё не завершённый запрос (SIGKILL дочернему процессу) и подчищает временные файлы. */
 void nal_async_cancel(NalAsyncReq* req);
 

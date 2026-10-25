@@ -6,7 +6,9 @@
 /* Растеризатор SVG (подмножество SVG 1.1): path/rect/circle/ellipse/line/polyline/polygon, g/a/switch, use/symbol/defs,
    вложенный svg с viewBox и preserveAspectRatio, transform, fill/stroke (цвета, currentColor, linearGradient/radialGradient),
    fill-rule, opacity, stroke-width/linecap/linejoin/miterlimit/dasharray, style="..." и <style> с простыми селекторами.
-   Не поддерживается: text, image, filter, mask, clip-path (игнорируются), pattern, marker, анимации. */
+   Также: text/tspan (через встроенный TTF renderer), filter (Gaussian blur, offset, color matrix, flood, blend,
+   composite, merge, drop shadow), mask и clip-path. Ограниченное подмножество SVG-фильтров; image, pattern, marker,
+   textPath, текст по кривой и анимации не реализованы. */
 
 /* Похоже ли содержимое буфера на SVG (для распознавания файлов, скачанных без расширения) */
 int  svg_looks_like(const char* buf, size_t n);

@@ -64,6 +64,8 @@ typedef struct DOMNode {
     char text[512];
     char href[512]; // Будем сохранять ссылки для кликов
     char src[512];  // Путь к изображению для <img>
+    char srcset[1024]; /* исходный набор кандидатов для <img>/<source> */
+    char sizes[256];  /* slot size для responsive images */
     int hit_x, hit_y, hit_w, hit_h; // Координаты на экране для детекции клика
     
     // Style and interaction attributes

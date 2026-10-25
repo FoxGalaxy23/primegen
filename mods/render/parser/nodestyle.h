@@ -20,6 +20,32 @@ enum { JC_START, JC_END, JC_CENTER, JC_BETWEEN, JC_AROUND, JC_EVENLY };
 enum { AI_STRETCH, AI_START, AI_END, AI_CENTER, AI_BASELINE, AI_AUTO };
 enum { BS_NONE, BS_SOLID, BS_DASHED, BS_DOTTED };
 
+
+/* ── Эффекты: filter / backdrop-filter / clip-path / mask / transform, transition / animation (см. webpage/fx.c, anim.c) ── */
+typedef struct { float px, pct; } FxLen;                         /* длина: px + % от размера бокса */
+enum { FXO_BLUR = 1, FXO_BRIGHT, FXO_CONTRAST, FXO_GRAY, FXO_SEPIA, FXO_SAT, FXO_HUE, FXO_INVERT, FXO_OPACITY, FXO_SHADOW };
+typedef struct { uint8_t kind; float v, x, y, blur; uint32_t color; } FxOp;   /* v: основное число (blur: px, hue: градусы, прочие: 0..n); shadow: x,y,blur,color */
+typedef struct { uint8_t n; FxOp op[6]; } FxList;
+enum { CP_NONE = 0, CP_INSET, CP_CIRCLE, CP_ELLIPSE, CP_POLYGON };
+typedef struct {
+    uint8_t kind, n, evenodd;                                    /* n — число вершин polygon */
+    FxLen a[4];                                                  /* inset: top,right,bottom,left; circle: r,cx,cy; ellipse: rx,ry,cx,cy */
+    float rad[4];                                                /* inset(... round r): радиусы, px */
+    FxLen pt[16][2];                                             /* polygon */
+} FxClip;
+enum { XF_TRANSLATE = 1, XF_SCALE, XF_ROTATE, XF_SKEWX, XF_SKEWY, XF_MATRIX };
+typedef struct { uint8_t kind; float v[6]; FxLen t[2]; } FxXfOp;  /* translate: t[0],t[1]; scale: v[0],v[1]; rotate/skew: v[0] (градусы); matrix: v[0..5] */
+typedef struct { uint8_t n; FxXfOp op[6]; FxLen ox, oy; uint8_t has_origin; } FxXform;
+enum { MK_NONE = 0, MK_LINEAR, MK_RADIAL, MK_IMAGE };
+typedef struct {
+    uint8_t kind, n, rep, size_mode;                             /* rep: 0 repeat, 1 x, 2 y, 3 no-repeat; size_mode: 0 auto, 1 cover, 2 contain, 3 явный */
+    float angle; uint8_t a[6]; float p[6];                       /* остановки: альфа 0..255 и позиция 0..100 */
+    Len w, h, px, py; char url[192];
+} FxMask;
+typedef struct { uint8_t kind; float a, b, c, d; } FxEase;      /* kind 0: cubic-bezier(a,b,c,d); 1: steps(a, b=0 end/1 start) */
+typedef struct { uint64_t mask; float dur, delay; FxEase ease; } FxTrans;   /* mask: набор анимируемых свойств (0 — запись пуста) */
+typedef struct { char name[40]; float dur, delay, iter; FxEase ease; uint8_t dir, fill, paused; } FxAnim;   /* iter < 0 — infinite */
+
 typedef struct NodeStyle {
     uint8_t display, position, float_, clear, visibility, overflow_hidden, text_align, white_space;
     uint8_t deco, bold, italic, vertical_align, box_sizing, list_style, text_transform;
@@ -48,7 +74,24 @@ typedef struct NodeStyle {
     float bg_grad_angle;                        /* градусы, для linear */
     uint32_t bg_grad_c[4];                       /* цвета остановок, 0xAARRGGBB */
     float bg_grad_p[4];                          /* позиции остановок, 0..100 */
-    Len tr_x, tr_y;                              /* transform: translate()/translateX()/translateY() */
+    Len tr_x, tr_y;                              /* (устарело: теперь transform разбирается в xf) */
+    /* эффекты и движение */
+    FxList  filter, backdrop;
+    FxClip  clip;
+    FxMask  mask;
+    FxXform xf;
+    float   op_own;                              /* собственная opacity до умножения на родительскую (нужна анимации) */
+    FxTrans tr[4]; uint8_t tr_n;                 /* transition: записи (свойства + длительность/задержка/функция) */
+    float   tp_dur[4], tp_del[4]; FxEase tp_ease[4]; uint8_t tp_dur_n, tp_del_n, tp_ease_n;   /* сырые списки longhand-ов */
+    uint64_t tp_prop[4]; uint8_t tp_prop_n;
+    FxAnim  an[3]; uint8_t an_n;                 /* animation: до трёх одновременных */
+    /* grid */
+    char    grid_rows[160];                      /* grid-template-rows */
+    char    grid_auto_r[48], grid_auto_c[48];    /* grid-auto-rows / grid-auto-columns */
+    char    grid_row_s[24], grid_row_e[24], grid_col_s[24], grid_col_e[24];   /* grid-row/column-start/end у элемента (число, span N, имя) */
+    uint8_t grid_flow;                           /* 0 row, 1 column; бит 2 — dense */
+    uint8_t justify_items, justify_self, align_content;   /* AI_* (justify_*), JC_* (align_content) */
+    uint8_t has_fx;                              /* есть filter/backdrop/clip-path/mask/transform → слой */
 } NodeStyle;
 
 

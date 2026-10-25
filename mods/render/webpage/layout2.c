@@ -4,6 +4,7 @@
 #include "l2.h"
 #include "css_int.h"
 #include "font_manager.h"
+#include "fx.h"
 #include "gal.h"
 #include <stdlib.h>
 #include <string.h>
@@ -53,7 +54,7 @@ static int dl_add(Cmd c) {
     c.fixed = (uint8_t)g_fixed; l2_dl[l2_dn] = c; return l2_dn++;
 }
 static void dl_shift(int s, int e, float dx, float dy) {
-    for (int i = s; i < e; i++) { l2_dl[i].x += dx; l2_dl[i].y += dy; if (l2_dl[i].t == C_STK) { l2_dl[i].ex[1] += dy; l2_dl[i].ex[2] += dy; } }
+    for (int i = s; i < e; i++) { l2_dl[i].x += dx; l2_dl[i].y += dy; if (l2_dl[i].t == C_STK) { l2_dl[i].ex[1] += dy; l2_dl[i].ex[2] += dy; l2_dl[i].ex[6] += dx; l2_dl[i].ex[7] += dx; } }
 }
 void l2_release(void) { free(l2_dl); l2_dl = NULL; l2_dn = g_dcap = 0; free(l2_rects); l2_rects = NULL; l2_nrects = 0; }
 
@@ -170,7 +171,7 @@ static void stk_reorder(void) {
 }
 
 /* ══════════════ прокрутка внутри элементов (overflow:auto|scroll) ══════════════ */
-typedef struct { float x, y, mx, my, sw, sh, cw, ch; uint8_t is; } ScSt;
+typedef L2ScrollState ScSt;
 static ScSt* g_scr; static int g_scrn; static DOMNode* g_scr_head;
 static float sc_clamp(float v, float mx) { return v < 0 ? 0 : v > mx ? mx : v; }
 static void sc_prepare(DOMNode* head, int n) {
@@ -207,6 +208,26 @@ int l2_scroll_size(const DOMNode* n, float* sw, float* sh, float* cw, float* ch)
 void l2_scroll_set(const DOMNode* n, float x, float y) {
     if (!n || !g_scr || n->idx < 0 || n->idx >= g_scrn) return;
     ScSt* e = &g_scr[n->idx]; e->x = x < 0 ? 0 : x; e->y = y < 0 ? 0 : y;
+}
+int l2_scroll_state_export(const DOMNode* head, L2ScrollState* out, int cap) {
+    if (!head || g_scr_head != head || !g_scr || g_scrn <= 0) return 0;
+    if (!out) return g_scrn;
+    if (cap <= 0) return 0;
+    int n = g_scrn < cap ? g_scrn : cap;
+    if (n > 0) memcpy(out, g_scr, (size_t)n * sizeof(*out));
+    return n;
+}
+void l2_scroll_state_import(const L2ScrollState* in, int count, DOMNode* head) {
+    if (!head || count < 0) return;
+    if (count > g_scrn) {
+        ScSt* nv = realloc(g_scr, (size_t)count * sizeof(*nv));
+        if (!nv) return;
+        for (int i = g_scrn; i < count; i++) memset(&nv[i], 0, sizeof nv[i]);
+        g_scr = nv; g_scrn = count;
+    }
+    if (in && count > 0) memcpy(g_scr, in, (size_t)count * sizeof(*in));
+    for (int i = count; i < g_scrn; i++) { g_scr[i].is = 0; g_scr[i].mx = g_scr[i].my = g_scr[i].sw = g_scr[i].sh = g_scr[i].cw = g_scr[i].ch = 0; }
+    g_scr_head = (DOMNode*)head;
 }
 void l2_scroll_offset_of_ancestors(const DOMNode* n, float* ox, float* oy) {
     *ox = *oy = 0; if (!n || !g_scr) return;
@@ -862,6 +883,7 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
     int stkslot = -1;                                   /* position:sticky: границы блока для смещения при отрисовке */
     if (s->sticky && !b->anon && b->n && b->kind != K_INLINE && !b->oof) { Cmd sc0; memset(&sc0, 0, sizeof sc0); sc0.t = C_STK; sc0.node = b->n; stkslot = dl_add(sc0); }
     int markslot = -1; if (!b->anon && b->n && b->n->v2) { Cmd mc; memset(&mc, 0, sizeof mc); mc.t = C_MARK; mc.node = b->n; markslot = dl_add(mc); }
+    int fxslot = -1; if (!b->anon && b->n && s->has_fx && b->kind != K_INLINE) { Cmd fc; memset(&fc, 0, sizeof fc); fc.t = C_FX; fc.node = b->n; fxslot = dl_add(fc); }
     edges(b, avail_w);
     int shrink = forced_w < 0 && (b->kind == K_ATOM || b->flt || b->oof || (b->n && !b->anon && s->display == DSP_TABLE)) && !s->width.set;
     float ex_w = b->pl + b->pr + b->bl + b->br, ex_h = b->pt + b->pb + b->bt + b->bb;
@@ -936,6 +958,7 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
     for (StkRef* r = b->stk; r; r = r->next)             /* sticky-потомки: контейнер = content-box этого блока */
         if (r->slot >= 0 && r->slot < l2_dn && l2_dl[r->slot].t == C_STK && l2_dl[r->slot].node == r->node) {
             l2_dl[r->slot].ex[1] = y + b->bt + b->pt; l2_dl[r->slot].ex[2] = y + bh - b->bb - b->pb;
+            l2_dl[r->slot].ex[6] = bx + b->bl + b->pl; l2_dl[r->slot].ex[7] = bx + bw - b->br - b->pr;
         }
     if (slot >= 0) { Cmd* c = &l2_dl[slot]; c->x = bx; c->y = y; c->w = bw; c->h = bh; }
     if (bgslot >= 0) { Cmd* c = &l2_dl[bgslot]; c->x = bx; c->y = y; c->w = bw; c->h = bh; }
@@ -970,7 +993,7 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
         cc->ex[0] = sw; cc->ex[1] = sh; cc->ex[2] = s->sc_x && sw > pw ? sw - pw : 0; cc->ex[3] = s->sc_y && sh > ph ? sh - ph : 0;
         /* sticky-дети самого контейнера ограничены не его высотой, а всей прокручиваемой областью */
         for (StkRef* r = b->stk; r; r = r->next)
-            if (r->slot >= 0 && r->slot < l2_dn && l2_dl[r->slot].t == C_STK && l2_dl[r->slot].node == r->node && l2_dl[r->slot].ex[2] < py0 + sh - b->pb) l2_dl[r->slot].ex[2] = py0 + sh - b->pb;
+            if (r->slot >= 0 && r->slot < l2_dn && l2_dl[r->slot].t == C_STK && l2_dl[r->slot].node == r->node && l2_dl[r->slot].ex[2] < py0 + sh - b->pb) { l2_dl[r->slot].ex[2] = py0 + sh - b->pb; if (l2_dl[r->slot].ex[7] < px0 + sw - b->pr) l2_dl[r->slot].ex[7] = px0 + sw - b->pr; }
     }
     if (clip >= 0) { Cmd c; memset(&c, 0, sizeof c); c.t = C_UNCLIP; dl_add(c); }
     if (b->click && !b->anon && b->n && (b->kind != K_INLINE) && !b->repl && (b->n->type == TAG_A || b->n->onclick[0] || b->n->type == TAG_BUTTON)) {
@@ -998,11 +1021,17 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
         if (s->inset[0].set) dy = lenpx(&s->inset[0], ch_def >= 0 ? ch_def : 0); else if (s->inset[2].set) dy = -lenpx(&s->inset[2], ch_def >= 0 ? ch_def : 0);
         if (dx != 0 || dy != 0) { dl_shift(start, l2_dn, dx, dy); b->x += dx; b->y += dy; if (b->fb > -1e8f) b->fb += dy; }
     }
+    if (fxslot >= 0) {                                   /* слой эффектов: border-box уже с учётом relative-сдвига */
+        Cmd* fc = &l2_dl[fxslot]; fc->x = b->x; fc->y = b->y; fc->w = b->w; fc->h = b->h;
+        Cmd e; memset(&e, 0, sizeof e); e.t = C_ENDFX; e.node = b->n; int ei = dl_add(e); if (ei >= 0) { l2_dl[ei].mate = fxslot; l2_dl[fxslot].mate = ei; }
+    }
     if (stkslot >= 0) {                                  /* sticky: итоговый border-box + смещения top/bottom; контейнер допишет родитель */
         Cmd* sk = &l2_dl[stkslot]; sk->x = b->x; sk->y = b->y; sk->w = b->w; sk->h = b->h; sk->flags = 0;
         if (s->inset[0].set) { sk->flags |= SF_TOP; sk->ex[0] = lenpx(&s->inset[0], VH); }
         if (s->inset[2].set) { sk->flags |= SF_BOTTOM; sk->ex[3] = lenpx(&s->inset[2], VH); }
-        sk->ex[1] = 0; sk->ex[2] = 1e9f;
+        if (s->inset[3].set) { sk->flags |= SF_LEFT; sk->ex[4] = lenpx(&s->inset[3], VW); }
+        if (s->inset[1].set) { sk->flags |= SF_RIGHT; sk->ex[5] = lenpx(&s->inset[1], VW); }
+        sk->ex[1] = 0; sk->ex[2] = 1e9f; sk->ex[6] = -1e9f; sk->ex[7] = 1e9f;
         Box* sp = b->parent; while (sp && (sp->anon || !sp->n)) sp = sp->parent;
         if (sp) { StkRef* r = la(sizeof(StkRef)); if (r) { r->slot = stkslot; r->node = b->n; r->next = sp->stk; sp->stk = r; } }
         Cmd e; memset(&e, 0, sizeof e); e.t = C_ENDSTK; dl_add(e);
@@ -1010,7 +1039,7 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
     if (!b->anon && b->n) {                              /* стекинг-контекст */
         int is_ctx = 0, zg = 0; int item = b->parent && is_flex_box(b->parent);
         if (s->has_z && (s->position != POS_STATIC || item)) { zg = s->z_index; is_ctx = 1; }
-        else if (s->position == POS_FIXED || b->n->idx == 0 || s->sticky) is_ctx = 1;
+        else if (s->position == POS_FIXED || b->n->idx == 0 || s->sticky || fxslot >= 0) is_ctx = 1;
         if (is_ctx) grp_record(start, cstart, cend, l2_dn, zg, clip >= 0, s->sticky && b->n->idx != 0);
     }
 }
@@ -1030,8 +1059,6 @@ static void place_positioned(Box* c, float sx, float sy, float px, float py, flo
     float bx = has_l ? px + l + c->ml : has_r ? px + pw - r - c->mr - c->w : sx + c->ml;
     float by = has_t ? py + t + c->mt : has_b ? py + ph - bt2 - c->mb - c->h : sy + c->mt;
     if (c->mla && c->mra && has_l && has_r) bx = px + l + (pw - l - r - c->w) / 2;
-    if (s->tr_x.set) bx += lenpx(&s->tr_x, c->w);
-    if (s->tr_y.set) by += lenpx(&s->tr_y, c->h);
     dl_shift(s0, l2_dn, bx - c->x, by - c->y); c->x = bx; c->y = by;
     g_fixed = save_fixed;
 }
@@ -1069,6 +1096,8 @@ void l2_layout(DOMNode* head, int vw, int vh) {
     float mt = mt_eff(root, VW);
     lbb(root, 0, mt, VW, -1, -1, VH, &ls);
     stk_reorder();                                                  /* порядок рисования по z-index */
+    { int* st = malloc((size_t)(l2_dn + 1) * sizeof(int)); int sp = 0;     /* пары C_FX/C_ENDFX после перестановки */
+      if (st) { for (int i = 0; i < l2_dn; i++) { if (l2_dl[i].t == C_FX) { l2_dl[i].mate = -1; st[sp++] = i; } else if (l2_dl[i].t == C_ENDFX) { if (sp) { int o = st[--sp]; l2_dl[o].mate = i; l2_dl[i].mate = o; } else l2_dl[i].mate = -1; } } free(st); } }
     sc_commit();                                                    /* размеры прокручиваемых контейнеров */
     l2_doc_h = root->y + root->h + mb_eff(root, VW); if (l2_doc_h < 1) l2_doc_h = 1;
     if (root->w > l2_doc_w) l2_doc_w = root->w;

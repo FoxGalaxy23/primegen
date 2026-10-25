@@ -1,6 +1,8 @@
 /* JavaScript для страниц: QuickJS + нативные DOM-примитивы (`__dom`).
    Весь пользовательский API (Element, Event, classList, style, fetch ...) живёт в js_prelude.js. */
 #include "webpage.h"
+#include "l2.h"
+#include "fx.h"
 #include "gal.h"
 #include "nal.h"
 #include "db.h"
@@ -37,6 +39,13 @@ const char* webpage_js_take_title(void* p) { (void)p; return NULL; }
 #else
 
 #include "quickjs.h"
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <errno.h>
+#endif
 #include "ws.h"
 #include "ttf_render.h"
 #include "font_manager.h"
@@ -121,14 +130,18 @@ static void linearize(Page* p) {
     free(order); free(stack); free(endidx); free(pos); p->lin_dirty = 0;
 }
 
+static SheetList sheets_for_page(Page* p, int* base_count);
+static void free_page_sheets(Page* p, SheetList* sheets, int base_count);
 static void flush_style(Page* p) {
     linearize(p);
     if (!p->style_dirty) return;
-    SheetList sl = { p->bundle ? p->bundle->sheets : NULL, p->bundle ? p->bundle->nsheets : 0, p->bundle ? p->bundle->nsheets : 0 };
+    int base_count = 0;
+    SheetList sl = sheets_for_page(p, &base_count);
     webpage_recascade(p->head, &sl, p->bundle ? p->bundle->base : p->url);
+    free_page_sheets(p, &sl, base_count);
     webpage_invalidate_layout(); p->style_dirty = 0;
 }
-static void flush_all(Page* p) { flush_style(p); webpage_force_layout(); }
+static void flush_all(Page* p) { flush_style(p); webpage_force_layout_for(p ? p->head : NULL); }
 
 /* ══════════════ атрибуты ══════════════ */
 static void put(char* d, size_t cap, const char* s) { snprintf(d, cap, "%s", s); }
@@ -156,6 +169,8 @@ static int attr_get(Page* p, DOMNode* n, const char* k, char* out, size_t cap) {
     if (!strcmp(k, "id")) { put(out, cap, n->id); return n->id[0] != 0; }
     if (!strcmp(k, "class")) { put(out, cap, n->class_name); return n->class_name[0] != 0; }
     if (!strcmp(k, "style")) { put(out, cap, n->style_str); return n->style_str[0] != 0; }
+    if (!strcmp(k, "srcset") && n->srcset[0]) { put(out, cap, n->srcset); return 1; }
+    if (!strcmp(k, "sizes") && n->sizes[0]) { put(out, cap, n->sizes); return 1; }
     const char* vs; size_t vl;
     if (attrs_find(n->attrs, k, &vs, &vl)) { size_t l = vl < cap - 1 ? vl : cap - 1; memcpy(out, vs, l); out[l] = 0; return 1; }
     if (!strcmp(k, "href") && n->href[0]) { put(out, cap, n->href); return 1; }
@@ -169,6 +184,8 @@ static void attr_set(Page* p, DOMNode* n, const char* k, const char* v) {
     if (!strcmp(k, "id")) put(n->id, sizeof n->id, v);
     else if (!strcmp(k, "href")) webpage_resolve_url(p->url, v, n->href, sizeof n->href);
     else if (!strcmp(k, "src")) webpage_resolve_url(p->url, v, n->src, sizeof n->src);
+    else if (!strcmp(k, "srcset")) put(n->srcset, sizeof n->srcset, v);
+    else if (!strcmp(k, "sizes")) put(n->sizes, sizeof n->sizes, v);
     else if (!strcmp(k, "value")) put(n->value, sizeof n->value, v);
     else if (!strcmp(k, "name")) put(n->name, sizeof n->name, v);
     else if (!strcmp(k, "type")) { put(n->input_type, sizeof n->input_type, v); for (char* c = n->input_type; *c; c++) *c = (char)tolower((unsigned char)*c); }
@@ -183,7 +200,8 @@ static void attr_set(Page* p, DOMNode* n, const char* k, const char* v) {
 }
 static void attr_remove(DOMNode* n, const char* k) {
     if (!strcmp(k, "class")) n->class_name[0] = 0; else if (!strcmp(k, "style")) n->style_str[0] = 0; else if (!strcmp(k, "id")) n->id[0] = 0;
-    else if (!strcmp(k, "href")) n->href[0] = 0; else if (!strcmp(k, "src")) n->src[0] = 0; else if (!strcmp(k, "value")) n->value[0] = 0;
+    else if (!strcmp(k, "href")) n->href[0] = 0; else if (!strcmp(k, "src")) n->src[0] = 0;
+    else if (!strcmp(k, "srcset")) n->srcset[0] = 0; else if (!strcmp(k, "sizes")) n->sizes[0] = 0; else if (!strcmp(k, "value")) n->value[0] = 0;
     else if (!strcmp(k, "checked")) n->checked = 0; else if (!strcmp(k, "disabled")) n->disabled = 0; else if (!strcmp(k, "selected")) n->selected = 0;
     else if (!strcmp(k, "readonly")) n->readonly = 0; else if (!strcmp(k, "multiple")) n->multiple = 0; else if (!strcmp(k, "onclick")) n->onclick[0] = 0;
     attrs_del(n, k);
@@ -195,6 +213,45 @@ static void text_of(Page* p, int id, Buf* b) {
     if (n->type == TAG_TEXT) { b_str(b, n->text); return; }
     if (p->lk[id].first < 0 && n->text[0]) { b_str(b, n->text); return; }     /* title/textarea/script: текст хранится в узле */
     for (int c = p->lk[id].first; c >= 0; c = p->lk[c].next) text_of(p, c, b);
+}
+static int has_shadow_host(Page* p, int id) {
+    for (int par = p->lk[id].parent; par >= 0; par = p->lk[par].parent) {
+        const char* value = NULL; size_t length = 0;
+        if (attrs_find(p->nodes[par]->attrs, "data-ml-shadow-root", &value, &length)) return 1;
+    }
+    return 0;
+}
+static SheetList sheets_for_page(Page* p, int* base_count) {
+    int nbase = p->bundle ? p->bundle->nsheets : 0, extra = 0;
+    SheetSrc* base = p->bundle ? p->bundle->sheets : NULL;
+    for (int i = 0; i < p->nn; i++) {
+        DOMNode* n = p->nodes[i];
+        if (n && n->idx >= 0 && !strcmp(n->tag, "style") && has_shadow_host(p, i)) extra++;
+    }
+    SheetSrc* all = calloc((size_t)nbase + (size_t)extra + 1, sizeof(SheetSrc));
+    if (!all) { *base_count = nbase; return (SheetList){ base, nbase, nbase }; }
+    if (nbase && base) memcpy(all, base, (size_t)nbase * sizeof(SheetSrc));
+    int out = nbase;
+    for (int i = 0; i < p->nn; i++) {
+        DOMNode* n = p->nodes[i];
+        if (!n || n->idx < 0 || strcmp(n->tag, "style") || !has_shadow_host(p, i)) continue;
+        Buf css = {0}; text_of(p, i, &css);
+        all[out].css = css.p ? css.p : strdup(""); all[out].href = NULL;
+        const char* value = NULL; size_t length = 0;
+        if (attrs_find(n->attrs, "media", &value, &length)) {
+            if (length >= sizeof all[out].media) length = sizeof all[out].media - 1;
+            memcpy(all[out].media, value, length); all[out].media[length] = 0;
+        }
+        out++;
+    }
+    *base_count = nbase;
+    return (SheetList){ all, out, out };
+}
+static void free_page_sheets(Page* p, SheetList* sheets, int base_count) {
+    if (!sheets || !sheets->v) return;
+    if (p->bundle && sheets->v == p->bundle->sheets) return;
+    for (int i = base_count; i < sheets->n; i++) free(sheets->v[i].css);
+    free(sheets->v);
 }
 static void esc(Buf* b, const char* s, int attr) {
     for (; *s; s++) { if (*s == '&') b_str(b, "&amp;"); else if (*s == '<') b_str(b, "&lt;"); else if (*s == '>') b_str(b, "&gt;"); else if (attr && *s == '"') b_str(b, "&quot;"); else b_add(b, s, 1); }
@@ -239,8 +296,9 @@ static void import_fragment(Page* p, int parent, int ref, const char* html) {
     DOMNode** nv = malloc((size_t)n * sizeof(DOMNode*)); int* ids = malloc((size_t)n * sizeof(int)); { int i = 0; for (DOMNode* q = tmp; q; q = q->next) nv[i++] = q; }
     int body = -1; for (int i = 1; i < n; i++) if (nv[i]->parent == 0 && !strcmp(nv[i]->tag, "body")) { body = i; break; }
     for (int i = 0; i < n; i++) ids[i] = -1;
+    int body_end = body >= 0 ? nv[body]->subtree_end : -1;           /* до цикла: сам узел body освобождается на своей итерации */
     for (int i = 0; i < n; i++) {
-        DOMNode* q = nv[i]; int inside = body >= 0 && i > body && i <= nv[body]->subtree_end;
+        DOMNode* q = nv[i]; int inside = body >= 0 && i > body && i <= body_end;
         if (!inside) { free(q); continue; }
         q->next = NULL; ids[i] = new_id(p, q);
         int pi = q->parent; int target = pi == body ? parent : ids[pi];
@@ -328,6 +386,9 @@ FN(d_attrNames) {
     if (n->id[0] && !strstr(n->attrs, "id\x01")) JS_SetPropertyUint32(c, a, i++, JS_NewString(c, "id"));
     if (n->class_name[0]) JS_SetPropertyUint32(c, a, i++, JS_NewString(c, "class"));
     if (n->style_str[0]) JS_SetPropertyUint32(c, a, i++, JS_NewString(c, "style"));
+    const char *av; size_t al;
+    if (n->srcset[0] && !attrs_find(n->attrs, "srcset", &av, &al)) JS_SetPropertyUint32(c, a, i++, JS_NewString(c, "srcset"));
+    if (n->sizes[0] && !attrs_find(n->attrs, "sizes", &av, &al)) JS_SetPropertyUint32(c, a, i++, JS_NewString(c, "sizes"));
     for (const char* q = n->attrs; *q;) { const char* sep = strchr(q, 1); if (!sep) break; const char* e = strchr(sep, 2); if (!e) break; char nm[40]; snprintf(nm, sizeof nm, "%.*s", (int)(sep - q), q); JS_SetPropertyUint32(c, a, i++, JS_NewString(c, nm)); q = e + 1; }
     return a;
 }
@@ -435,16 +496,21 @@ FN(d_fetch) {
 }
 
 /* ── асинхронная сеть (fetch/XHR любых методов, не блокирует движок) ──
-   D.fetchStart(method,url,headersRaw,body|null) -> id (int, -1 при ошибке запуска);
-   D.fetchPoll(id) -> null пока не готово, иначе {status, headers, body};
+   D.fetchStart(method,url,headersRaw,body|null[,credentials,mode]) -> id (int, -1 при ошибке запуска); body — ArrayBuffer (или строка);
+   D.fetchPoll(id) -> null пока не готово, иначе {status, headers, body: ArrayBuffer};
    D.fetchCancel(id) — отменить (например AbortController). */
 FN(d_fetchStart) {
     Page* p = P(c);
     const char* method = JS_ToCString(c, argv[0]); const char* url = JS_ToCString(c, argv[1]);
     const char* headers = JS_IsNull(argv[2]) || JS_IsUndefined(argv[2]) ? NULL : JS_ToCString(c, argv[2]);
-    size_t blen = 0; const char* body = NULL;
-    if (!JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) body = JS_ToCStringLen(c, &blen, argv[3]);
-    if (!method || !url) { if (method) JS_FreeCString(c, method); if (url) JS_FreeCString(c, url); if (headers) JS_FreeCString(c, headers); if (body) JS_FreeCString(c, body); return JS_NewInt32(c, -1); }
+    size_t blen = 0; const char* body = NULL; const char* body_str = NULL;
+    /* тело: ArrayBuffer (бинарно-безопасно, основной путь) либо строка (совместимость) */
+    if (argc > 3 && JS_IsString(argv[3])) { body_str = JS_ToCStringLen(c, &blen, argv[3]); body = body_str; }
+    else if (argc > 3 && JS_IsObject(argv[3])) {
+        size_t n = 0; uint8_t* ab = JS_GetArrayBuffer(c, &n, argv[3]);
+        if (ab && n) { body = (const char*)ab; blen = n; } else if (!ab) JS_FreeValue(c, JS_GetException(c));
+    }
+    if (!method || !url) { if (method) JS_FreeCString(c, method); if (url) JS_FreeCString(c, url); if (headers) JS_FreeCString(c, headers); if (body_str) JS_FreeCString(c, body_str); return JS_NewInt32(c, -1); }
     char ab[1100]; webpage_resolve_url(p->url, url, ab, sizeof ab);
     int ok = 0; NalAsyncReq nr;
     /* политика одного источника и CORS: страница-инициатор, режим credentials (0 omit / 1 same-origin / 2 include) и mode (0 cors / 1 no-cors / 2 same-origin) от fetch/XHR */
@@ -452,7 +518,7 @@ FN(d_fetchStart) {
     if (argc > 4 && !JS_IsUndefined(argv[4])) fo.credentials = arg_int(c, argv[4]);
     if (argc > 5 && !JS_IsUndefined(argv[5])) fo.mode = arg_int(c, argv[5]);
     { const char* col = strchr(ab, ':'); const char* sl = strchr(ab, '/'); if (!(col && (!sl || col < sl) && strncmp(ab, "http", 4) != 0)) ok = nal_async_start_ex(method, ab, headers, body, blen, &fo, &nr); }
-    JS_FreeCString(c, method); JS_FreeCString(c, url); if (headers) JS_FreeCString(c, headers); if (body) JS_FreeCString(c, body);
+    JS_FreeCString(c, method); JS_FreeCString(c, url); if (headers) JS_FreeCString(c, headers); if (body_str) JS_FreeCString(c, body_str);
     if (!ok) return JS_NewInt32(c, -1);
     AReq* a = calloc(1, sizeof *a); a->id = ++p->next_areq; a->used = 1; a->nr = nr; a->next = p->areqs; p->areqs = a;
     return JS_NewInt32(c, a->id);
@@ -460,13 +526,13 @@ FN(d_fetchStart) {
 FN(d_fetchPoll) {
     Page* p = P(c); int id = arg_int(c, argv[0]);
     for (AReq* a = p->areqs; a; a = a->next) if (a->id == id && a->used) {
-        int status = 0; char* hdrs = NULL; char* bodytxt = NULL;
-        if (!nal_async_poll(&a->nr, &status, &hdrs, &bodytxt)) return JS_NULL;
+        int status = 0; char* hdrs = NULL; char* bodytxt = NULL; size_t blen = 0;
+        if (!nal_async_poll_ex(&a->nr, &status, &hdrs, &bodytxt, &blen)) return JS_NULL;
         a->used = 0;
         JSValue o = JS_NewObject(c);
         JS_SetPropertyStr(c, o, "status", JS_NewInt32(c, status));
         JS_SetPropertyStr(c, o, "headers", JS_NewString(c, hdrs ? hdrs : ""));
-        JS_SetPropertyStr(c, o, "body", JS_NewString(c, bodytxt ? bodytxt : ""));
+        JS_SetPropertyStr(c, o, "body", JS_NewArrayBufferCopy(c, (const uint8_t*)(bodytxt ? bodytxt : ""), blen));   /* ArrayBuffer: тело бинарное */
         free(hdrs); free(bodytxt);
         return o;
     }
@@ -478,12 +544,34 @@ FN(d_fetchCancel) {
     return JS_UNDEFINED;
 }
 
+/* UTF-8 <-> ArrayBuffer (нативно: быстрее и корректнее JS-реализации; BOM при декодировании снимается, как в Fetch) */
+FN(d_utf8Decode) {
+    size_t n = 0; uint8_t* b = JS_GetArrayBuffer(c, &n, argv[0]);
+    if (!b) { JS_FreeValue(c, JS_GetException(c)); return JS_NewString(c, ""); }
+    if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) { b += 3; n -= 3; }
+    return JS_NewStringLen(c, (const char*)b, n);
+}
+FN(d_utf8Encode) {
+    size_t n = 0; const char* s = JS_ToCStringLen(c, &n, argv[0]); if (!s) return JS_EXCEPTION;
+    JSValue ab = JS_NewArrayBufferCopy(c, (const uint8_t*)s, n); JS_FreeCString(c, s); return ab;
+}
+
 /* ── localStorage (переживает переход на другую страницу и перезапуск браузера) ── */
 static void page_origin(Page* p, char* out, size_t cap) {
-    const char* u = p->url; const char* sch = strstr(u, "://");
-    if (!sch) { snprintf(out, cap, "null"); return; }
-    const char* host_start = sch + 3; const char* p2 = host_start; while (*p2 && *p2 != '/' && *p2 != '?' && *p2 != '#') p2++;
-    size_t n = (size_t)(p2 - u); if (n >= cap) n = cap - 1; memcpy(out, u, n); out[n] = 0;
+    const char* u = p->url; const char* sep = strstr(u, "://");
+    if (!sep || cap < 2) { if (cap) snprintf(out,cap,"null"); return; }
+    size_t sch_n = (size_t)(sep-u); if (!sch_n || sch_n > 15) { snprintf(out,cap,"null"); return; }
+    char scheme[16]; memcpy(scheme,u,sch_n); scheme[sch_n]=0;
+    for (char* q=scheme;*q;q++) *q=(char)tolower((unsigned char)*q);
+    const char* a=sep+3; const char* e=a; while(*e && *e!='/' && *e!='?' && *e!='#') e++;
+    const char* host=a; for(const char* q=a;q<e;q++) if(*q=='@') host=q+1; /* origin не включает userinfo */
+    size_t hn=(size_t)(e-host); if(!hn || hn>=512){snprintf(out,cap,"null");return;}
+    char authority[512]; memcpy(authority,host,hn); authority[hn]=0;
+    for(char* q=authority;*q;q++) *q=(char)tolower((unsigned char)*q);
+    /* Убираем default port и тем самым объединяем варианты одного и того же origin. */
+    if(!strcmp(scheme,"http")){size_t n=strlen(authority);if(n>=3&&!strcmp(authority+n-3,":80"))authority[n-3]=0;}
+    if(!strcmp(scheme,"https")){size_t n=strlen(authority);if(n>=4&&!strcmp(authority+n-4,":443"))authority[n-4]=0;}
+    snprintf(out,cap,"%s://%s",scheme,authority);
 }
 FN(d_lsList) { Page* p = P(c); char origin[512]; page_origin(p, origin, sizeof origin); char* j = db_ls_list_json(origin); JSValue r = JS_NewString(c, j ? j : "{}"); free(j); return r; }
 FN(d_lsSet) {
@@ -493,6 +581,21 @@ FN(d_lsSet) {
 }
 FN(d_lsRemove) { Page* p = P(c); char origin[512]; page_origin(p, origin, sizeof origin); const char* k = JS_ToCString(c, argv[0]); if (k) { db_ls_remove(origin, k); JS_FreeCString(c, k); } return JS_UNDEFINED; }
 FN(d_lsClear) { Page* p = P(c); char origin[512]; page_origin(p, origin, sizeof origin); db_ls_clear(origin); return JS_UNDEFINED; }
+
+/* ── IndexedDB bridge ── */
+FN(d_idbMetaList) { Page* p=P(c); char o[512]; page_origin(p,o,sizeof o); char* j=db_idb_meta_list(o); JSValue r=JS_NewString(c,j?j:"[]"); free(j); return r; }
+FN(d_idbMetaGet) { Page* p=P(c); char o[512]; page_origin(p,o,sizeof o); const char* n=JS_ToCString(c,argv[0]); if(!n)return JS_EXCEPTION; char* j=db_idb_meta_get(o,n); JS_FreeCString(c,n); if(!j)return JS_NULL; JSValue r=JS_NewString(c,j);free(j);return r; }
+FN(d_idbMetaSet) { Page* p=P(c); char o[512];page_origin(p,o,sizeof o);const char* n=JS_ToCString(c,argv[0]);int v=arg_int(c,argv[1]);const char* st=JS_ToCString(c,argv[2]);if(n&&st)db_idb_meta_set(o,n,v,st);if(n)JS_FreeCString(c,n);if(st)JS_FreeCString(c,st);return JS_UNDEFINED; }
+FN(d_idbDeleteDatabase) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);const char* n=JS_ToCString(c,argv[0]);if(n){db_idb_delete_database(o,n);JS_FreeCString(c,n);}return JS_UNDEFINED; }
+FN(d_idbList) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);const char* n=JS_ToCString(c,argv[0]);const char* st=JS_ToCString(c,argv[1]);if(!n||!st){if(n)JS_FreeCString(c,n);if(st)JS_FreeCString(c,st);return JS_EXCEPTION;}char* j=db_idb_list(o,n,st);JSValue r=JS_NewString(c,j?j:"[]");free(j);JS_FreeCString(c,n);JS_FreeCString(c,st);return r; }
+FN(d_idbGet) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);const char* n=JS_ToCString(c,argv[0]);const char* st=JS_ToCString(c,argv[1]);const char* k=JS_ToCString(c,argv[2]);if(!n||!st||!k){if(n)JS_FreeCString(c,n);if(st)JS_FreeCString(c,st);if(k)JS_FreeCString(c,k);return JS_EXCEPTION;}char* j=db_idb_get(o,n,st,k);JS_FreeCString(c,n);JS_FreeCString(c,st);JS_FreeCString(c,k);if(!j)return JS_NULL;JSValue r=JS_NewString(c,j);free(j);return r; }
+FN(d_idbPut) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);const char* n=JS_ToCString(c,argv[0]);const char* st=JS_ToCString(c,argv[1]);const char* k=JS_ToCString(c,argv[2]);const char* v=JS_ToCString(c,argv[3]);if(n&&st&&k&&v)db_idb_put(o,n,st,k,v);if(n)JS_FreeCString(c,n);if(st)JS_FreeCString(c,st);if(k)JS_FreeCString(c,k);if(v)JS_FreeCString(c,v);return JS_UNDEFINED; }
+FN(d_idbRemove) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);const char* n=JS_ToCString(c,argv[0]);const char* st=JS_ToCString(c,argv[1]);const char* k=JS_ToCString(c,argv[2]);if(n&&st&&k)db_idb_remove(o,n,st,k);if(n)JS_FreeCString(c,n);if(st)JS_FreeCString(c,st);if(k)JS_FreeCString(c,k);return JS_UNDEFINED; }
+FN(d_idbClear) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);const char* n=JS_ToCString(c,argv[0]);const char* st=JS_ToCString(c,argv[1]);if(n&&st)db_idb_clear(o,n,st);if(n)JS_FreeCString(c,n);if(st)JS_FreeCString(c,st);return JS_UNDEFINED; }
+FN(d_swList) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);char* j=db_sw_list(o);JSValue r=JS_NewString(c,j?j:"[]");free(j);return r; }
+FN(d_swSet) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);const char* sc=JS_ToCString(c,argv[0]);const char* u=JS_ToCString(c,argv[1]);if(sc&&u)db_sw_set(o,sc,u);if(sc)JS_FreeCString(c,sc);if(u)JS_FreeCString(c,u);return JS_UNDEFINED; }
+FN(d_swRemove) { Page* p=P(c);char o[512];page_origin(p,o,sizeof o);const char* sc=JS_ToCString(c,argv[0]);if(sc){db_sw_remove(o,sc);JS_FreeCString(c,sc);}return JS_UNDEFINED; }
+FN(d_profileId) { (void)argv; (void)argc; return JS_NewInt32(c, active_profile_id); }
 
 /* ── WebSocket (только ws://; wss:// отдаёт событие ошибки — нет TLS) ── */
 FN(d_wsConnect) {
@@ -661,7 +764,10 @@ static const struct { const char* name; JSCFunction* fn; } DOMFN[] = {
     DEF(text), DEF(setText), DEF(innerHTML), DEF(outerHTML), DEF(setInnerHTML), DEF(insertHTML), DEF(attr), DEF(setAttr), DEF(removeAttr), DEF(attrNames), DEF(prop), DEF(setProp),
     DEF(query), DEF(matches), DEF(closest), DEF(byId), DEF(root), DEF(special), DEF(rect), DEF(computed), DEF(mediaMatches), DEF(viewport), DEF(scrollTo), DEF(getScroll), DEF(setScroll),
     DEF(title), DEF(setTitle), DEF(url), DEF(nav), DEF(setUrl), DEF(fetch), DEF(log), DEF(now), DEF(submit), DEF(focus), DEF(active), DEF(curScript), DEF(timerAdd), DEF(timerClear),
-    DEF(fetchStart), DEF(fetchPoll), DEF(fetchCancel), DEF(lsList), DEF(lsSet), DEF(lsRemove), DEF(lsClear),
+    DEF(fetchStart), DEF(fetchPoll), DEF(fetchCancel), DEF(utf8Decode), DEF(utf8Encode), DEF(lsList), DEF(lsSet), DEF(lsRemove), DEF(lsClear),
+    DEF(idbMetaList), DEF(idbMetaGet), DEF(idbMetaSet), DEF(idbDeleteDatabase), DEF(idbList), DEF(idbGet), DEF(idbPut), DEF(idbRemove), DEF(idbClear),
+    DEF(swList), DEF(swSet), DEF(swRemove),
+    DEF(profileId),
     DEF(wsConnect), DEF(wsPoll), DEF(wsSend), DEF(wsClose),
     DEF(workerStart), DEF(workerPoll), DEF(workerPost), DEF(workerTerminate),
     DEF(canvasMeasureText), DEF(canvasText), DEF(imageDecode), DEF(canvasCommit), DEF(canvasToDataURL)
@@ -686,7 +792,7 @@ static void eval_script(Page* p, const char* code, const char* name, int module)
     run_jobs(); g_deadline = 0;
 }
 
-void* webpage_js_attach(DOMNode* head, const char* url, PageBundle* bundle) {
+void* js_local_attach(DOMNode* head, const char* url, PageBundle* bundle) {
     if (!head || !head->v2) { webpage_bundle_free(bundle); return NULL; }
     if (!g_rt) {
         g_rt = JS_NewRuntime(); if (!g_rt) { webpage_bundle_free(bundle); return NULL; }
@@ -717,7 +823,7 @@ void* webpage_js_attach(DOMNode* head, const char* url, PageBundle* bundle) {
     return p;
 }
 
-void webpage_js_free(void* pp) {
+void js_local_free(void* pp) {
     Page* p = pp; if (!p) return;
     for (Timer* t = p->timers; t;) { Timer* nx = t->next; JS_FreeValue(p->ctx, t->fn); free(t); t = nx; }
     for (AReq* a = p->areqs; a;) { AReq* nx = a->next; if (a->used) nal_async_cancel(&a->nr); free(a); a = nx; }     /* не оставляем недобитых curl при переходе на другую страницу */
@@ -729,7 +835,7 @@ void webpage_js_free(void* pp) {
     free(p->nodes); free(p->lk); webpage_bundle_free(p->bundle); free(p);
 }
 
-int webpage_js_tick(void* pp) {
+int js_local_tick(void* pp) {
     Page* p = pp; if (!p) return 0; int did = 0;
     for (int guard = 0; guard < 64; guard++) {
         double now = now_ms(); Timer* best = NULL;
@@ -748,7 +854,7 @@ int webpage_js_tick(void* pp) {
     return did;
 }
 
-int webpage_js_dispatch(void* pp, DOMNode* target, const char* type, const char* key, int mods) {
+int js_local_dispatch(void* pp, DOMNode* target, const char* type, const char* key, int mods) {
     Page* p = pp; if (!p || !target || target->aux == NULL) return 0; JSContext* c = p->ctx;
     JSValue g = JS_GetGlobalObject(c); JSValue fn = JS_GetPropertyStr(c, g, "__dispatch"); int prevented = 0;
     if (JS_IsFunction(c, fn)) {
@@ -760,18 +866,408 @@ int webpage_js_dispatch(void* pp, DOMNode* target, const char* type, const char*
     JS_FreeValue(c, fn); JS_FreeValue(c, g); return prevented;
 }
 
+
+/* :hover/:active изменились — пересчитать стили; события transition/animation — в JS */
+void js_local_restyle(void* pp) { Page* p = pp; if (!p) return; p->style_dirty = 1; flush_style(p); }
+int js_local_anim_events(void* pp) {
+    Page* p = pp; if (!p) return 0; DOMNode* n; int kind; char name[48]; float el; int guard = 0, dispatched = 0;
+    while (guard++ < 32 && anim_pop_event(&n, &kind, name, &el)) {
+        if (!n || n->aux == NULL || kind == AEV_TRANS_RUN) continue;
+        const char* type = kind == AEV_TRANS_END ? "transitionend" : kind == AEV_ANIM_START ? "animationstart" : kind == AEV_ANIM_ITER ? "animationiteration" : "animationend";
+        char key[96]; snprintf(key, sizeof key, "%s|%g", name, el); js_local_dispatch(p, n, type, key, 0); dispatched++;
+    }
+    return dispatched;
+}
+
 /* submit-событие формы перед отправкой; возвращает 1, если отправку можно продолжать */
-int webpage_js_before_submit(void* pp, DOMNode* control) {
+int js_local_before_submit(void* pp, DOMNode* control) {
     Page* p = pp; if (!p || !control || !control->aux) return 1;
     int id = id_of(control);
     while (id >= 0 && id < p->nn && strcmp(p->nodes[id]->tag, "form") != 0) id = p->lk[id].parent;
     if (id < 0 || id >= p->nn) return 1;
-    return !webpage_js_dispatch(p, p->nodes[id], "submit", "", 0);
+    return !js_local_dispatch(p, p->nodes[id], "submit", "", 0);
 }
 
-const char* webpage_js_take_nav(void* pp) { Page* p = pp; if (!p || !p->has_nav) return NULL; p->has_nav = 0; return p->nav; }
-int webpage_js_take_scroll(void* pp, int* x, int* y) { Page* p = pp; if (!p || !p->scroll_req) return 0; p->scroll_req = 0; *x = p->sx; *y = p->sy; return 1; }
-int webpage_js_take_focus(void* pp, DOMNode** node) { Page* p = pp; if (!p || !p->focus_req) return 0; p->focus_req = 0; *node = p->focus_id >= 0 ? N(p, p->focus_id) : NULL; return 1; }
-void webpage_js_set_focus(void* pp, DOMNode* node) { Page* p = pp; if (p) p->active = node ? id_of(node) : -1; }
-const char* webpage_js_take_title(void* pp) { Page* p = pp; if (!p || !p->title_dirty) return NULL; p->title_dirty = 0; return p->title; }
+const char* js_local_take_nav(void* pp) { Page* p = pp; if (!p || !p->has_nav) return NULL; p->has_nav = 0; return p->nav; }
+int js_local_take_scroll(void* pp, int* x, int* y) { Page* p = pp; if (!p || !p->scroll_req) return 0; p->scroll_req = 0; *x = p->sx; *y = p->sy; return 1; }
+int js_local_take_focus(void* pp, DOMNode** node) { Page* p = pp; if (!p || !p->focus_req) return 0; p->focus_req = 0; *node = p->focus_id >= 0 ? N(p, p->focus_id) : NULL; return 1; }
+void js_local_set_focus(void* pp, DOMNode* node) { Page* p = pp; if (p) p->active = node ? id_of(node) : -1; }
+const char* js_local_take_title(void* pp) { Page* p = pp; if (!p || !p->title_dirty) return NULL; p->title_dirty = 0; return p->title; }
+
+/* ── Process-isolated page JS ──────────────────────────────────────────────
+ * Each document gets its own QuickJS process. The UI process owns its DOM nodes;
+ * mutations are returned as pointer-free node snapshots over a pipe. This keeps
+ * QuickJS heaps/timers/worker connections out of the UI process without passing
+ * raw pointers across the process boundary.
+ */
+#ifndef _WIN32
+enum { JSC_TICK=1, JSC_DISPATCH, JSC_SUBMIT, JSC_TAKE_NAV, JSC_TAKE_SCROLL,
+       JSC_TAKE_FOCUS, JSC_SET_FOCUS, JSC_TAKE_TITLE, JSC_RESTYLE,
+       JSC_ANIM_EVENTS, JSC_FREE };
+#define JSIPC_MAGIC 0x4a535031u /* JSP1 */
+typedef struct {
+    uint32_t magic;
+    int32_t op, id, alt_id, mods, flags;
+    int32_t checked, selected, disabled, readonly;
+    char type[32];
+    char key[128];
+    char value[2048];
+} JSIPCCommand;
+typedef struct {
+    uint32_t magic;
+    int32_t status, result, x, y, focus_id, dyn_pending;
+    uint32_t node_count;
+    uint32_t scroll_count;
+    char text[1200];
+} JSIPCReply;
+typedef struct {
+    DOMNode node;                 /* pointers next/aux/pb[] are zeroed before send */
+    uint8_t has_pb0, has_pb1;
+} JSNodeWireHead;
+typedef struct {
+    uint32_t magic;
+    pid_t pid;
+    int cmd_fd, reply_fd, dead;
+    DOMNode* head;
+    DOMNode** nodes_by_id;
+    int node_cap;
+    char text[1200];
+} JSProcess;
+
+static int js_ipc_write_all(int fd, const void* data, size_t len) {
+    const unsigned char* p = (const unsigned char*)data;
+    while (len) { ssize_t n = write(fd, p, len); if (n < 0) { if (errno == EINTR) continue; return 0; } if (n == 0) return 0; p += n; len -= (size_t)n; }
+    return 1;
+}
+static int js_ipc_read_all(int fd, void* data, size_t len) {
+    unsigned char* p = (unsigned char*)data;
+    while (len) { ssize_t n = read(fd, p, len); if (n < 0) { if (errno == EINTR) continue; return 0; } if (n == 0) return 0; p += n; len -= (size_t)n; }
+    return 1;
+}
+static void js_ipc_write_snapshot(int fd, Page* p, JSIPCReply* r) {
+    r->node_count = 0;
+    if (!p) return;
+    /* Keep indices and styles coherent even when a script only changed structure. */
+    flush_style(p);
+    r->node_count = (uint32_t)p->nn;
+    for (int i = 0; i < p->nn; i++) {
+        DOMNode* n = p->nodes[i]; JSNodeWireHead h; memset(&h, 0, sizeof h);
+        memcpy(&h.node, n, sizeof(DOMNode));
+        h.node.next = NULL; h.node.aux = NULL; h.node.pb[0] = h.node.pb[1] = NULL;
+        h.has_pb0 = n->pb[0] != NULL; h.has_pb1 = n->pb[1] != NULL;
+        if (!js_ipc_write_all(fd, &h, sizeof h)) return;
+        if (h.has_pb0 && !js_ipc_write_all(fd, n->pb[0], sizeof(PseudoBox))) return;
+        if (h.has_pb1 && !js_ipc_write_all(fd, n->pb[1], sizeof(PseudoBox))) return;
+    }
+}
+static int js_ipc_send_reply(int fd, JSIPCReply* r, Page* p, int snapshot) {
+    r->magic = JSIPC_MAGIC;
+    r->node_count = r->scroll_count = 0;
+    if (snapshot && p) {
+        /* Flush before the header so node_count and layout state are exact. */
+        flush_style(p);
+        r->node_count = (uint32_t)p->nn;
+        int sc = l2_scroll_state_export(p->head, NULL, 0);
+        if (sc > 0 && sc <= 1000000) r->scroll_count = (uint32_t)sc;
+    }
+    if (!js_ipc_write_all(fd, r, sizeof *r)) return 0;
+    if (snapshot && p) {
+        js_ipc_write_snapshot(fd, p, r);
+        if (r->scroll_count) {
+            size_t bytes = (size_t)r->scroll_count * sizeof(L2ScrollState);
+            L2ScrollState* state = malloc(bytes);
+            if (!state) return 0;
+            int n = l2_scroll_state_export(p->head, state, (int)r->scroll_count);
+            int ok = n == (int)r->scroll_count && js_ipc_write_all(fd, state, bytes);
+            free(state);
+            if (!ok) return 0;
+        }
+    }
+    return 1;
+}
+static void js_ipc_child_loop(int cmd_fd, int reply_fd, Page* page) {
+    for (;;) {
+        JSIPCCommand c; memset(&c, 0, sizeof c);
+        if (!js_ipc_read_all(cmd_fd, &c, sizeof c) || c.magic != JSIPC_MAGIC) break;
+        JSIPCReply r; memset(&r, 0, sizeof r); r.status = page != NULL; r.focus_id = -1;
+        if (!page) { js_ipc_send_reply(reply_fd, &r, NULL, 0); continue; }
+        DOMNode* target = (c.id >= 0 && c.id < page->nn) ? page->nodes[c.id] : NULL;
+        int snapshot = 0;
+        switch (c.op) {
+            case JSC_TICK: {
+                r.result = js_local_tick(page);
+                /* CSS transitions/keyframes must advance beside the animation records,
+                   which live in this JS process, not in the isolated painter. */
+                (void)anim_step(page->head);
+                int anim_running = anim_active();
+                int anim_events = js_local_anim_events(page);
+                /* Keep DOM snapshots near a display-frame cadence instead of
+                   copying the whole DOM on every timer tick. */
+                if (anim_events || (anim_running && webpage_anim_tick())) r.result = 1;
+                snapshot = r.result != 0;
+                break;
+            }
+            case JSC_DISPATCH:
+                if (target && (c.flags & 1)) {
+                    snprintf(target->value, sizeof target->value, "%s", c.value);
+                    target->checked = (uint8_t)!!c.checked; target->selected = (uint8_t)!!c.selected;
+                    target->disabled = (uint8_t)!!c.disabled; target->readonly = (uint8_t)!!c.readonly;
+                }
+                r.result = js_local_dispatch(page, target, c.type, c.key, c.mods);
+                snapshot = 1;
+                break;
+            case JSC_SUBMIT:
+                if (target && (c.flags & 1)) {
+                    snprintf(target->value, sizeof target->value, "%s", c.value);
+                    target->checked = (uint8_t)!!c.checked; target->selected = (uint8_t)!!c.selected;
+                    target->disabled = (uint8_t)!!c.disabled; target->readonly = (uint8_t)!!c.readonly;
+                }
+                r.result = js_local_before_submit(page, target); snapshot = 1;
+                break;
+            case JSC_TAKE_NAV: {
+                const char* v = js_local_take_nav(page); if (v) snprintf(r.text, sizeof r.text, "%s", v); r.result = v != NULL; break;
+            }
+            case JSC_TAKE_SCROLL:
+                r.result = js_local_take_scroll(page, &r.x, &r.y); break;
+            case JSC_TAKE_FOCUS: {
+                DOMNode* n = NULL; r.result = js_local_take_focus(page, &n);
+                r.focus_id = n ? id_of(n) : -1; break;
+            }
+            case JSC_SET_FOCUS: js_local_set_focus(page, target); break;
+            case JSC_TAKE_TITLE: {
+                const char* v = js_local_take_title(page); if (v) snprintf(r.text, sizeof r.text, "%s", v); r.result = v != NULL; break;
+            }
+            case JSC_RESTYLE:
+                webpage_set_hover(c.id >= 0 && c.id < page->nn ? page->nodes[c.id] : NULL);
+                webpage_set_active(c.alt_id >= 0 && c.alt_id < page->nn ? page->nodes[c.alt_id] : NULL);
+                js_local_restyle(page); webpage_dyn_clear_pending(); snapshot = 1; break;
+            case JSC_ANIM_EVENTS: js_local_anim_events(page); snapshot = 1; break;
+            case JSC_FREE:
+                js_local_free(page); page = NULL; r.status = 1;
+                js_ipc_send_reply(reply_fd, &r, NULL, 0);
+                close(cmd_fd); close(reply_fd); _exit(0);
+            default: r.status = 0; break;
+        }
+        r.dyn_pending = webpage_dyn_pending();
+        if (r.dyn_pending) webpage_dyn_clear_pending();
+        if (!js_ipc_send_reply(reply_fd, &r, page, snapshot)) break;
+    }
+    if (page) js_local_free(page);
+    close(cmd_fd); close(reply_fd); _exit(0);
+}
+static int js_proxy_grow_nodes(JSProcess* p, uint32_t count) {
+    if (count <= (uint32_t)p->node_cap) return 1;
+    int cap = p->node_cap ? p->node_cap : 64;
+    while ((uint32_t)cap < count) { if (cap > 1<<26) return 0; cap *= 2; }
+    DOMNode** v = realloc(p->nodes_by_id, (size_t)cap * sizeof(*v)); if (!v) return 0;
+    for (int i = p->node_cap; i < cap; i++) v[i] = NULL;
+    p->nodes_by_id = v; p->node_cap = cap; return 1;
+}
+static int js_proxy_receive_snapshot(JSProcess* p, const JSIPCReply* r) {
+    if (!r->node_count) {
+        if (r->scroll_count) {
+            if (r->scroll_count > 1000000) return 0;
+            size_t bytes = (size_t)r->scroll_count * sizeof(L2ScrollState);
+            L2ScrollState* state = malloc(bytes); if (!state) return 0;
+            int ok = js_ipc_read_all(p->reply_fd, state, bytes);
+            if (ok && p->head) l2_scroll_state_import(state, (int)r->scroll_count, p->head);
+            free(state); return ok;
+        }
+        return 1;
+    }
+    if (!js_proxy_grow_nodes(p, r->node_count)) return 0;
+    int max_idx = -1;
+    /* First pass: read each record, update stable parent-owned node allocations. */
+    for (uint32_t i = 0; i < r->node_count; i++) {
+        JSNodeWireHead h; PseudoBox b0, b1;
+        if (!js_ipc_read_all(p->reply_fd, &h, sizeof h)) return 0;
+        if (h.has_pb0 && !js_ipc_read_all(p->reply_fd, &b0, sizeof b0)) return 0;
+        if (h.has_pb1 && !js_ipc_read_all(p->reply_fd, &b1, sizeof b1)) return 0;
+        DOMNode* n = p->nodes_by_id[i];
+        if (!n) { n = calloc(1, sizeof *n); if (!n) return 0; p->nodes_by_id[i] = n; }
+        dom_free_pseudo(n);
+        memcpy(n, &h.node, sizeof *n); n->next = NULL; n->aux = NULL; n->pb[0] = n->pb[1] = NULL;
+        if (h.has_pb0) { n->pb[0] = malloc(sizeof(PseudoBox)); if (!n->pb[0]) return 0; memcpy(n->pb[0], &b0, sizeof b0); }
+        if (h.has_pb1) { n->pb[1] = malloc(sizeof(PseudoBox)); if (!n->pb[1]) return 0; memcpy(n->pb[1], &b1, sizeof b1); }
+        if (n->idx > max_idx) max_idx = n->idx;
+    }
+    /* Rebuild the renderer's preorder linked list without leaking child-process pointers. */
+    int count = max_idx + 1;
+    DOMNode** order = calloc((size_t)(count > 0 ? count : 1), sizeof(*order));
+    if (!order) return 0;
+    for (uint32_t i = 0; i < r->node_count; i++) {
+        DOMNode* n = p->nodes_by_id[i];
+        if (n && n->idx >= 0 && n->idx < count) order[n->idx] = n;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!order[i]) { free(order); return 0; }
+        order[i]->next = i + 1 < count ? order[i + 1] : NULL;
+    }
+    if (count > 0) p->head = order[0];
+    free(order);
+    if (r->scroll_count) {
+        if (r->scroll_count > 1000000) return 0;
+        size_t bytes = (size_t)r->scroll_count * sizeof(L2ScrollState);
+        L2ScrollState* state = malloc(bytes); if (!state) return 0;
+        int ok = js_ipc_read_all(p->reply_fd, state, bytes);
+        if (ok && p->head) l2_scroll_state_import(state, (int)r->scroll_count, p->head);
+        free(state); if (!ok) return 0;
+    }
+    webpage_invalidate_layout();
+    return 1;
+}
+static int js_proxy_call(JSProcess* p, JSIPCCommand* c, JSIPCReply* r, int* sync_dom) {
+    if (sync_dom) *sync_dom = 0;
+    if (!p || p->magic != JSIPC_MAGIC || p->dead) return 0;
+    c->magic = JSIPC_MAGIC;
+    if (!js_ipc_write_all(p->cmd_fd, c, sizeof *c) || !js_ipc_read_all(p->reply_fd, r, sizeof *r) || r->magic != JSIPC_MAGIC) {
+        p->dead = 1; return 0;
+    }
+    if (r->node_count) {
+        if (!js_proxy_receive_snapshot(p, r)) { p->dead = 1; return 0; }
+        if (sync_dom) *sync_dom = 1;
+    }
+    return r->status;
+}
+static int js_proxy_id(JSProcess* p, const DOMNode* node) {
+    if (!p || !node) return -1;
+    /* IDs are private to the page process; resolve through the stable proxy map. */
+    for (int i = 0; i < p->node_cap; i++) if (p->nodes_by_id[i] == node) return i;
+    return -1;
+}
+static void js_proxy_target_state(JSIPCCommand* c, const DOMNode* n) {
+    if (!n) return; c->flags |= 1; c->checked = n->checked; c->selected = n->selected;
+    c->disabled = n->disabled; c->readonly = n->readonly;
+    snprintf(c->value, sizeof c->value, "%s", n->value);
+}
+static void js_proxy_free(JSProcess* p) {
+    if (!p) return;
+    if (!p->dead) { JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_FREE; (void)js_proxy_call(p,&c,&r,NULL); }
+    if (p->cmd_fd >= 0) close(p->cmd_fd); if (p->reply_fd >= 0) close(p->reply_fd);
+    if (p->pid > 0) { int st; if (p->dead) kill(p->pid, SIGTERM); pid_t w; do { w = waitpid(p->pid, &st, 0); } while (w < 0 && errno == EINTR); }
+    /* Active nodes are owned by the DOM linked list; detached JS-created nodes are not. */
+    for (int i = 0; i < p->node_cap; i++) { DOMNode* n = p->nodes_by_id[i]; if (n && n->idx < 0 && n != p->head) { dom_free_pseudo(n); free(n); } }
+    free(p->nodes_by_id); p->magic = 0; free(p);
+}
+#endif /* !_WIN32 */
+
+/* Public API: Linux/macOS-style targets use one JS child process per document.
+ * Windows keeps the existing in-process path until a CreateProcess transport is added. */
+void* webpage_js_attach(DOMNode* head, const char* url, PageBundle* bundle) {
+    if (!head || !head->v2) { webpage_bundle_free(bundle); return NULL; }
+#ifdef _WIN32
+    return js_local_attach(head, url, bundle);
+#else
+    signal(SIGPIPE, SIG_IGN);
+    JSProcess* p = calloc(1, sizeof *p); if (!p) { webpage_bundle_free(bundle); return NULL; }
+    p->magic = JSIPC_MAGIC; p->cmd_fd = p->reply_fd = -1; p->head = head;
+    int initial = 0; for (DOMNode* n = head; n; n = n->next) initial++;
+    if (!js_proxy_grow_nodes(p, (uint32_t)initial)) { free(p); webpage_bundle_free(bundle); return NULL; }
+    { int i=0; for (DOMNode* n=head; n; n=n->next) p->nodes_by_id[i++] = n; }
+    int to_child[2] = {-1, -1}, from_child[2] = {-1, -1};
+    if (pipe(to_child) != 0 || pipe(from_child) != 0) {
+        if (to_child[0] >= 0) { close(to_child[0]); close(to_child[1]); }
+        if (from_child[0] >= 0) { close(from_child[0]); close(from_child[1]); }
+        free(p->nodes_by_id); free(p); webpage_bundle_free(bundle); return NULL;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(to_child[1]); close(from_child[0]);
+        Page* page = js_local_attach(head, url, bundle);
+        JSIPCReply r; memset(&r, 0, sizeof r); r.status = page != NULL; r.focus_id = -1;
+        if (!js_ipc_send_reply(from_child[1], &r, page, page != NULL)) _exit(111);
+        js_ipc_child_loop(to_child[0], from_child[1], page);
+    }
+    close(to_child[0]); close(from_child[1]);
+    if (pid < 0) {
+        close(to_child[1]); close(from_child[0]); free(p->nodes_by_id); free(p); webpage_bundle_free(bundle); return NULL;
+    }
+    p->pid = pid; p->cmd_fd = to_child[1]; p->reply_fd = from_child[0];
+    webpage_bundle_free(bundle); /* the child owns its forked copy */
+    JSIPCReply r;
+    if (!js_ipc_read_all(p->reply_fd, &r, sizeof r) || r.magic != JSIPC_MAGIC || !r.status ||
+        (r.node_count && !js_proxy_receive_snapshot(p, &r))) {
+        p->dead = 1; js_proxy_free(p); return NULL;
+    }
+    gal_log("INFO", "[JS] isolated page process pid=%ld (%u DOM nodes)", (long)p->pid, r.node_count);
+    return p;
+#endif
+}
+void webpage_js_free(void* page) {
+#ifdef _WIN32
+    js_local_free(page);
+#else
+    JSProcess* p = (JSProcess*)page; if (p && p->magic == JSIPC_MAGIC) js_proxy_free(p);
+#endif
+}
+int webpage_js_tick(void* page) {
+#ifdef _WIN32
+    return js_local_tick(page);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_TICK; return js_proxy_call(p,&c,&r,NULL) ? r.result : 0;
+#endif
+}
+int webpage_js_dispatch(void* page, DOMNode* target, const char* type, const char* key, int mods) {
+#ifdef _WIN32
+    return js_local_dispatch(page,target,type,key,mods);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_DISPATCH; c.id=js_proxy_id(p,target); c.mods=mods; snprintf(c.type,sizeof c.type,"%s",type?type:""); snprintf(c.key,sizeof c.key,"%s",key?key:""); js_proxy_target_state(&c,target); return js_proxy_call(p,&c,&r,NULL) ? r.result : 0;
+#endif
+}
+int webpage_js_before_submit(void* page, DOMNode* control) {
+#ifdef _WIN32
+    return js_local_before_submit(page,control);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_SUBMIT; c.id=js_proxy_id(p,control); js_proxy_target_state(&c,control); return js_proxy_call(p,&c,&r,NULL) ? r.result : 1;
+#endif
+}
+const char* webpage_js_take_nav(void* page) {
+#ifdef _WIN32
+    return js_local_take_nav(page);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_TAKE_NAV; if (!js_proxy_call(p,&c,&r,NULL) || !r.result) return NULL; snprintf(p->text,sizeof p->text,"%s",r.text); return p->text;
+#endif
+}
+int webpage_js_take_scroll(void* page, int* x, int* y) {
+#ifdef _WIN32
+    return js_local_take_scroll(page,x,y);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_TAKE_SCROLL; if (!js_proxy_call(p,&c,&r,NULL) || !r.result) return 0; if(x)*x=r.x; if(y)*y=r.y; return 1;
+#endif
+}
+int webpage_js_take_focus(void* page, DOMNode** node) {
+#ifdef _WIN32
+    return js_local_take_focus(page,node);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_TAKE_FOCUS; if (!js_proxy_call(p,&c,&r,NULL) || !r.result) return 0; if(node)*node=(r.focus_id>=0 && r.focus_id<p->node_cap)?p->nodes_by_id[r.focus_id]:NULL; return 1;
+#endif
+}
+void webpage_js_set_focus(void* page, DOMNode* node) {
+#ifdef _WIN32
+    js_local_set_focus(page,node);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_SET_FOCUS; c.id=js_proxy_id(p,node); (void)js_proxy_call(p,&c,&r,NULL);
+#endif
+}
+const char* webpage_js_take_title(void* page) {
+#ifdef _WIN32
+    return js_local_take_title(page);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_TAKE_TITLE; if (!js_proxy_call(p,&c,&r,NULL) || !r.result) return NULL; snprintf(p->text,sizeof p->text,"%s",r.text); return p->text;
+#endif
+}
+void webpage_js_restyle(void* page) {
+#ifdef _WIN32
+    js_local_restyle(page);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_RESTYLE; c.id=js_proxy_id(p, webpage_hover_node()); c.alt_id=js_proxy_id(p, webpage_active_node()); (void)js_proxy_call(p,&c,&r,NULL); webpage_dyn_clear_pending();
+#endif
+}
+void webpage_js_anim_events(void* page) {
+#ifdef _WIN32
+    js_local_anim_events(page);
+#else
+    JSProcess* p=page; JSIPCCommand c; JSIPCReply r; memset(&c,0,sizeof c); c.op=JSC_ANIM_EVENTS; (void)js_proxy_call(p,&c,&r,NULL);
+#endif
+}
 #endif

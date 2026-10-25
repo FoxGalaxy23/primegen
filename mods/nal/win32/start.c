@@ -196,6 +196,12 @@ int nal_async_poll(NalAsyncReq* req, int* out_status, char** out_headers, char**
     *out_status = r->status; *out_headers = r->headers; *out_body = r->body;
     free(r); req->used = 0; return 1;
 }
+int nal_async_poll_ex(NalAsyncReq* req, int* out_status, char** out_headers, char** out_body, size_t* out_body_len) {
+    int r = nal_async_poll(req, out_status, out_headers, out_body);
+    if (r && out_body_len) *out_body_len = *out_body ? strlen(*out_body) : 0;          /* WinHTTP-путь отдаёт текст */
+    return r;
+}
+
 void nal_async_cancel(NalAsyncReq* req) {
     if (!req->used) return;
     WinAsyncResult* r = (WinAsyncResult*)(intptr_t)req->pid;

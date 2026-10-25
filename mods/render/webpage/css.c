@@ -376,6 +376,7 @@ static size_t read_ident(const char* p, char* dst, size_t cap, int lower) {
     dst[k] = 0; return i;
 }
 
+int css_dyn_seen = 0;                             /* 1 — в разобранных таблицах встретились :hover/:active/:focus */
 static int g_allow_pseudo = 0;                    /* 1 только пока разбираем селекторы правил таблицы стилей */
 static Simple* parse_compound_list(Arena* a, const char* s, size_t n, uint32_t* spec);
 static int parse_nth(const char* s, int* A, int* B) {
@@ -440,7 +441,9 @@ static int parse_compound(Arena* a, const char** pp, Simple* s, uint32_t* spec) 
             else if (!strcmp(nm, "root")) k = PC_ROOT; else if (!strcmp(nm, "empty")) k = PC_EMPTY;
             else if (!strcmp(nm, "link") || !strcmp(nm, "any-link")) k = PC_LINK; else if (!strcmp(nm, "checked")) k = PC_CHECKED;
             else if (!strcmp(nm, "disabled")) k = PC_DISABLED; else if (!strcmp(nm, "enabled")) k = PC_ENABLED;
-            else if (!strcmp(nm, "hover") || !strcmp(nm, "active") || !strcmp(nm, "focus") || !strcmp(nm, "focus-within") || !strcmp(nm, "focus-visible") || !strcmp(nm, "visited") || !strcmp(nm, "target") || !strcmp(nm, "placeholder-shown")) k = PC_NEVER;
+            else if (!strcmp(nm, "hover")) { k = PC_HOVER; css_dyn_seen = 1; } else if (!strcmp(nm, "active")) { k = PC_ACTIVE; css_dyn_seen = 1; }
+            else if (!strcmp(nm, "focus") || !strcmp(nm, "focus-visible")) { k = PC_FOCUS; css_dyn_seen = 1; } else if (!strcmp(nm, "focus-within")) { k = PC_FOCUS + 100; css_dyn_seen = 1; }
+            else if (!strcmp(nm, "visited") || !strcmp(nm, "target") || !strcmp(nm, "placeholder-shown")) k = PC_NEVER;
             else if (!strcmp(nm, "not") || !strcmp(nm, "is") || !strcmp(nm, "where") || !strcmp(nm, "matches") || !strcmp(nm, "any")) {
                 if (s->sub) return 0;
                 uint32_t sp[3] = {0, 0, 0}; int sv = g_allow_pseudo; g_allow_pseudo = 0;
@@ -561,6 +564,7 @@ static void add_rule(RuleSet* rs, Rule* r) {
 static void parse_rule_block(Arena* a, RuleSet* rs, const char* sel, size_t sel_len, const char* body, size_t body_len, int origin) {
     int nd = 0; Decl* decls = css_parse_decls(a, body, body_len, &nd);
     if (!decls) return;
+    for (int i = 0; i < nd; i++) if (decls[i].prop >= P_TRANSITION && decls[i].prop <= P_ANIMATION_PLAY) { rs->has_trans = 1; break; }
     char* selz = astrdup(a, sel, sel_len);                 /* NUL-терминированная копия: scan_until не должен уходить за селектор */
     const char* s = selz; const char* end = selz + sel_len;
     while (s < end) {
@@ -605,6 +609,38 @@ void css_parse_sheet(Arena* a, RuleSet* rs, const char* css, const char* sheet_u
             }
             const char* bend = block_end(semi);
             const char* inner = semi + 1; size_t il = (size_t)(bend - 1 - inner); if (bend <= inner) il = 0;
+            if (nl >= 9 && !strncasecmp(ne - 9, "keyframes", 9)) {                  /* @keyframes / @-webkit-keyframes */
+                const char* q = skip_ws(ne); char nm[48]; size_t k = 0;
+                if (*q == '"' || *q == '\'') { char qc = *q++; while (*q && *q != qc && k < 47) nm[k++] = *q++; }
+                else while (q < semi && !isspace((unsigned char)*q) && k < 47) nm[k++] = *q++;
+                nm[k] = 0;
+                if (nm[0]) {
+                    Keyframes* kf = aalloc(a, sizeof *kf); snprintf(kf->name, sizeof kf->name, "%s", nm);
+                    int cap = 0; const char* r = inner; const char* rend = inner + il;
+                    while (r < rend) {
+                        r = skip_ws(r); if (r >= rend) break;
+                        const char* br = scan_until(r, "{;}"); if (br >= rend || *br != '{') break;
+                        const char* be = block_end(br); const char* in2 = br + 1; size_t il2 = be > in2 ? (size_t)(be - 1 - in2) : 0;
+                        int nd = 0; Decl* dd = css_parse_decls(a, in2, il2, &nd);
+                        char* selz = astrdup(a, r, (size_t)(br - r)); char* tk = selz;
+                        while (*tk) {                                                    /* «0%, 50%» — несколько смещений на один блок */
+                            while (isspace((unsigned char)*tk) || *tk == ',') tk++; if (!*tk) break;
+                            float off = -1; char* te = tk; while (*te && *te != ',' && !isspace((unsigned char)*te)) te++;
+                            char sv = *te; *te = 0;
+                            if (!strcasecmp(tk, "from")) off = 0; else if (!strcasecmp(tk, "to")) off = 1;
+                            else { char* e2; float v = strtof(tk, &e2); if (e2 != tk && *e2 == '%') off = v / 100.0f; }
+                            *te = sv; tk = te;
+                            if (off >= 0 && off <= 1 && nd) {
+                                if (kf->n == cap) { int nc = cap ? cap * 2 : 8; KfFrame* nf = aalloc(a, (size_t)nc * sizeof(KfFrame)); if (kf->n) memcpy(nf, kf->fr, (size_t)kf->n * sizeof(KfFrame)); kf->fr = nf; cap = nc; }
+                                kf->fr[kf->n].off = off; kf->fr[kf->n].decls = dd; kf->fr[kf->n].nd = nd; kf->n++;
+                            }
+                        }
+                        r = be;
+                    }
+                    for (int i = 1; i < kf->n; i++) { KfFrame t = kf->fr[i]; int j = i - 1; while (j >= 0 && kf->fr[j].off > t.off) { kf->fr[j + 1] = kf->fr[j]; j--; } kf->fr[j + 1] = t; }   /* по возрастанию смещения (устойчиво) */
+                    kf->next = rs->kf; rs->kf = kf; rs->has_trans = 1;
+                }
+            } else
             if (nl == 5 && !strncasecmp(ns, "media", 5)) {
                 char q[256]; size_t ql = (size_t)(semi - ne); if (ql > 255) ql = 255; memcpy(q, ne, ql); q[ql] = 0;
                 if (css_media_matches(q)) { char* in = malloc(il + 1); if (in) { memcpy(in, inner, il); in[il] = 0; css_parse_sheet(a, rs, in, sheet_url, origin, depth + 1); free(in); } }

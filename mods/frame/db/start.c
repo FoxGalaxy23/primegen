@@ -86,6 +86,32 @@ int db_init(void) {
         "  UNIQUE(profile_id, origin, key)"
         ");";
 
+    const char* sql_indexed_db_meta =
+        "CREATE TABLE IF NOT EXISTS indexed_db_meta ("
+        "  profile_id INTEGER, origin TEXT, name TEXT, version INTEGER NOT NULL, stores_json TEXT NOT NULL,"
+        "  UNIQUE(profile_id, origin, name)"
+        ");";
+    const char* sql_indexed_db_records =
+        "CREATE TABLE IF NOT EXISTS indexed_db_records ("
+        "  profile_id INTEGER, origin TEXT, db_name TEXT, store_name TEXT, key TEXT, value_json TEXT NOT NULL,"
+        "  UNIQUE(profile_id, origin, db_name, store_name, key)"
+        ");";
+    const char* sql_service_workers =
+        "CREATE TABLE IF NOT EXISTS service_workers ("
+        "  profile_id INTEGER, origin TEXT, scope TEXT, script_url TEXT, updated_at INTEGER DEFAULT 0,"
+        "  UNIQUE(profile_id, origin, scope)"
+        ");";
+    const char* sql_service_worker_caches =
+        "CREATE TABLE IF NOT EXISTS service_worker_caches ("
+        "  profile_id INTEGER, origin TEXT, scope TEXT, cache_name TEXT, created_at INTEGER DEFAULT 0,"
+        "  UNIQUE(profile_id, origin, scope, cache_name)"
+        ");";
+    const char* sql_service_worker_cache_entries =
+        "CREATE TABLE IF NOT EXISTS service_worker_cache_entries ("
+        "  profile_id INTEGER, origin TEXT, scope TEXT, cache_name TEXT, request_key TEXT, response_json TEXT NOT NULL,"
+        "  UNIQUE(profile_id, origin, scope, cache_name, request_key)"
+        ");";
+
     const char* sql_downloads =
         "CREATE TABLE IF NOT EXISTS downloads ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -103,6 +129,11 @@ int db_init(void) {
     sqlite3_exec(db, sql_cookies, NULL, NULL, NULL);
     sqlite3_exec(db, sql_personal, NULL, NULL, NULL);
     sqlite3_exec(db, sql_local_storage, NULL, NULL, NULL);
+    sqlite3_exec(db, sql_indexed_db_meta, NULL, NULL, NULL);
+    sqlite3_exec(db, sql_indexed_db_records, NULL, NULL, NULL);
+    sqlite3_exec(db, sql_service_workers, NULL, NULL, NULL);
+    sqlite3_exec(db, sql_service_worker_caches, NULL, NULL, NULL);
+    sqlite3_exec(db, sql_service_worker_cache_entries, NULL, NULL, NULL);
     sqlite3_exec(db, sql_downloads, NULL, NULL, NULL);
 
     // Insert Default profile if empty
@@ -586,6 +617,97 @@ char* db_ls_list_json(const char* origin) {
     if (len + 2 >= cap) { cap += 2; buf = realloc(buf, cap); }
     buf[len++] = '}'; buf[len] = 0;
     return buf;
+}
+
+/* ── IndexedDB: записи JSON, раздельные по профилю / origin / database / object store ── */
+static void json_reserve(char** buf, size_t* cap, size_t need) {
+    if (*cap >= need) return;
+    size_t nc = *cap ? *cap : 256;
+    while (nc < need) nc *= 2;
+    char* nb = realloc(*buf, nc);
+    if (!nb) return;
+    *buf = nb; *cap = nc;
+}
+static void json_add_raw(char** b, size_t* cap, size_t* len, const char* v) {
+    if (!v) v = "null";
+    size_t n = strlen(v); json_reserve(b, cap, *len + n + 1);
+    if (!*b || *cap < *len + n + 1) return;
+    memcpy(*b + *len, v, n); *len += n; (*b)[*len] = 0;
+}
+char* db_idb_meta_list(const char* origin) {
+    size_t cap = 512, len = 0; char* out = malloc(cap); if (!out) return NULL; out[0] = 0;
+    json_add_raw(&out,&cap,&len,"["); int first = 1; sqlite3_stmt* st = NULL;
+    if (sqlite3_prepare_v2(db,"SELECT name,version,stores_json FROM indexed_db_meta WHERE profile_id=? AND origin=? ORDER BY name;",-1,&st,NULL)==SQLITE_OK) {
+        sqlite3_bind_int(st,1,active_profile_id); sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);
+        while (sqlite3_step(st)==SQLITE_ROW) {
+            const char* n=(const char*)sqlite3_column_text(st,0); const char* stores=(const char*)sqlite3_column_text(st,2); char ver[32]; snprintf(ver,sizeof ver,"%d",sqlite3_column_int(st,1));
+            if (!first) json_add_raw(&out,&cap,&len,","); first=0;
+            json_add_raw(&out,&cap,&len,"{\"name\":"); json_esc_append(&out,&cap,&len,n?n:"");
+            json_add_raw(&out,&cap,&len,",\"version\":"); json_add_raw(&out,&cap,&len,ver);
+            json_add_raw(&out,&cap,&len,",\"stores\":"); json_add_raw(&out,&cap,&len,stores?stores:"[]"); json_add_raw(&out,&cap,&len,"}");
+        } sqlite3_finalize(st);
+    }
+    json_add_raw(&out,&cap,&len,"]"); return out;
+}
+char* db_idb_meta_get(const char* origin, const char* name) {
+    sqlite3_stmt* st=NULL; char* out=NULL;
+    if (sqlite3_prepare_v2(db,"SELECT version,stores_json FROM indexed_db_meta WHERE profile_id=? AND origin=? AND name=?;",-1,&st,NULL)==SQLITE_OK) {
+        sqlite3_bind_int(st,1,active_profile_id); sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);
+        if (sqlite3_step(st)==SQLITE_ROW) { const char* stores=(const char*)sqlite3_column_text(st,1); size_t n=strlen(stores?stores:"[]")+80; out=malloc(n); if(out) snprintf(out,n,"{\"version\":%d,\"stores\":%s}",sqlite3_column_int(st,0),stores?stores:"[]"); }
+        sqlite3_finalize(st);
+    }
+    return out;
+}
+int db_idb_meta_set(const char* origin,const char* name,int version,const char* stores_json) {
+    sqlite3_stmt* st=NULL; const char* q="INSERT OR REPLACE INTO indexed_db_meta(profile_id,origin,name,version,stores_json) VALUES(?,?,?,?,?);";
+    if(sqlite3_prepare_v2(db,q,-1,&st,NULL)!=SQLITE_OK)return 0;
+    sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,4,version);sqlite3_bind_text(st,5,stores_json?stores_json:"[]",-1,SQLITE_TRANSIENT);
+    int ok=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);return ok;
+}
+int db_idb_delete_database(const char* origin,const char* name) {
+    sqlite3_stmt* st=NULL; int ok=1;
+    if(sqlite3_prepare_v2(db,"DELETE FROM indexed_db_records WHERE profile_id=? AND origin=? AND db_name=?;",-1,&st,NULL)==SQLITE_OK){sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);ok=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);} else ok=0;
+    if(sqlite3_prepare_v2(db,"DELETE FROM indexed_db_meta WHERE profile_id=? AND origin=? AND name=?;",-1,&st,NULL)==SQLITE_OK){sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);ok=(sqlite3_step(st)==SQLITE_DONE)&&ok;sqlite3_finalize(st);} else ok=0;
+    return ok;
+}
+char* db_idb_list(const char* origin,const char* name,const char* store) {
+    size_t cap=512,len=0;char* out=malloc(cap);if(!out)return NULL;out[0]=0;json_add_raw(&out,&cap,&len,"[");int first=1;sqlite3_stmt* st=NULL;
+    const char* q="SELECT key,value_json FROM indexed_db_records WHERE profile_id=? AND origin=? AND db_name=? AND store_name=?;";
+    if(sqlite3_prepare_v2(db,q,-1,&st,NULL)==SQLITE_OK){sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,store,-1,SQLITE_TRANSIENT);
+        while(sqlite3_step(st)==SQLITE_ROW){const char* k=(const char*)sqlite3_column_text(st,0);const char* v=(const char*)sqlite3_column_text(st,1);if(!first)json_add_raw(&out,&cap,&len,",");first=0;json_add_raw(&out,&cap,&len,"{\"k\":");json_esc_append(&out,&cap,&len,k?k:"");json_add_raw(&out,&cap,&len,",\"v\":");json_add_raw(&out,&cap,&len,v?v:"null");json_add_raw(&out,&cap,&len,"}");}
+        sqlite3_finalize(st);}
+    json_add_raw(&out,&cap,&len,"]");return out;
+}
+char* db_idb_get(const char* origin,const char* name,const char* store,const char* key) {
+    sqlite3_stmt* st=NULL;char* out=NULL;const char* q="SELECT value_json FROM indexed_db_records WHERE profile_id=? AND origin=? AND db_name=? AND store_name=? AND key=?;";
+    if(sqlite3_prepare_v2(db,q,-1,&st,NULL)==SQLITE_OK){sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,store,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,key,-1,SQLITE_TRANSIENT);if(sqlite3_step(st)==SQLITE_ROW){const char* v=(const char*)sqlite3_column_text(st,0);out=strdup(v?v:"null");}sqlite3_finalize(st);}return out;
+}
+int db_idb_put(const char* origin,const char* name,const char* store,const char* key,const char* value_json) {
+    sqlite3_stmt* st=NULL;const char* q="INSERT OR REPLACE INTO indexed_db_records(profile_id,origin,db_name,store_name,key,value_json) VALUES(?,?,?,?,?,?);";
+    if(sqlite3_prepare_v2(db,q,-1,&st,NULL)!=SQLITE_OK)return 0;sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,store,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,key,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,6,value_json?value_json:"null",-1,SQLITE_TRANSIENT);int ok=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);return ok;
+}
+int db_idb_remove(const char* origin,const char* name,const char* store,const char* key) {
+    sqlite3_stmt* st=NULL;const char* q="DELETE FROM indexed_db_records WHERE profile_id=? AND origin=? AND db_name=? AND store_name=? AND key=?;";
+    if(sqlite3_prepare_v2(db,q,-1,&st,NULL)!=SQLITE_OK)return 0;sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,store,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,5,key,-1,SQLITE_TRANSIENT);int ok=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);return ok;
+}
+int db_idb_clear(const char* origin,const char* name,const char* store) {
+    sqlite3_stmt* st=NULL;const char* q="DELETE FROM indexed_db_records WHERE profile_id=? AND origin=? AND db_name=? AND store_name=?;";
+    if(sqlite3_prepare_v2(db,q,-1,&st,NULL)!=SQLITE_OK)return 0;sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,name,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,store,-1,SQLITE_TRANSIENT);int ok=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);return ok;
+}
+
+/* ── Service Worker registrations ── */
+char* db_sw_list(const char* origin) {
+    size_t cap=512,len=0;char* out=malloc(cap);if(!out)return NULL;out[0]=0;json_add_raw(&out,&cap,&len,"[");int first=1;sqlite3_stmt* st=NULL;
+    if(sqlite3_prepare_v2(db,"SELECT scope,script_url FROM service_workers WHERE profile_id=? AND origin=? ORDER BY scope;",-1,&st,NULL)==SQLITE_OK){sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);while(sqlite3_step(st)==SQLITE_ROW){const char* sc=(const char*)sqlite3_column_text(st,0);const char* su=(const char*)sqlite3_column_text(st,1);if(!first)json_add_raw(&out,&cap,&len,",");first=0;json_add_raw(&out,&cap,&len,"{\"scope\":");json_esc_append(&out,&cap,&len,sc?sc:"");json_add_raw(&out,&cap,&len,",\"scriptURL\":");json_esc_append(&out,&cap,&len,su?su:"");json_add_raw(&out,&cap,&len,"}");}sqlite3_finalize(st);}
+    json_add_raw(&out,&cap,&len,"]");return out;
+}
+int db_sw_set(const char* origin,const char* scope,const char* script_url) {
+    sqlite3_stmt* st=NULL;const char* q="INSERT OR REPLACE INTO service_workers(profile_id,origin,scope,script_url,updated_at) VALUES(?,?,?,?,strftime('%s','now'));";
+    if(sqlite3_prepare_v2(db,q,-1,&st,NULL)!=SQLITE_OK)return 0;sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,scope,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,4,script_url,-1,SQLITE_TRANSIENT);int ok=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);return ok;
+}
+int db_sw_remove(const char* origin,const char* scope) {
+    sqlite3_stmt* st=NULL;const char* q="DELETE FROM service_workers WHERE profile_id=? AND origin=? AND scope=?;";
+    if(sqlite3_prepare_v2(db,q,-1,&st,NULL)!=SQLITE_OK)return 0;sqlite3_bind_int(st,1,active_profile_id);sqlite3_bind_text(st,2,origin,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,3,scope,-1,SQLITE_TRANSIENT);int ok=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);return ok;
 }
 
 int db_add_download(const char* url, const char* path, const char* filename, long long total_size) {
