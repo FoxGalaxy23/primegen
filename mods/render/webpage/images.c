@@ -176,7 +176,7 @@ void webpage_prefetch_images(DOMNode* head) {
     pid_t pids[6]; int np = 0;
     for (int i = 0; i < nu; i++) {
         pid_t pid = fork();
-        if (pid == 0) { char p[600]; webpage_image_path(urls[i], p, sizeof p); if (!nal_download_file(urls[i], p) || !looks_like_image(p)) remove(p); _exit(0); }
+        if (pid == 0) { char p[600]; webpage_image_path(urls[i], p, sizeof p); if (!nal_download_file_kind(urls[i], p, NAL_RESOURCE_IMAGE) || !looks_like_image(p)) remove(p); _exit(0); }
         if (pid > 0) pids[np++] = pid;
         if (np == 6 || (i == nu - 1 && np)) { for (int k = 0; k < np; k++) waitpid(pids[k], NULL, 0); np = 0; }
     }

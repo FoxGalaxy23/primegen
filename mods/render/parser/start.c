@@ -544,7 +544,7 @@ DOMNode* parse_html(const char* html) {
 
 void dom_free_pseudo(DOMNode* n) {
     if (!n) return;
-    free(n->pb[0]); free(n->pb[1]); n->pb[0] = n->pb[1] = NULL;
+    free(n->pb[0]); free(n->pb[1]); free(n->pb[2]); n->pb[0] = n->pb[1] = n->pb[2] = NULL;
 }
 
 void free_dom(DOMNode* head) {
@@ -565,7 +565,7 @@ DOMNode* clone_dom(DOMNode* head) {
         if (!node) break;
         memcpy(node, curr, sizeof(DOMNode));
         node->next = NULL;
-        node->pb[0] = node->pb[1] = NULL;
+        node->pb[0] = node->pb[1] = node->pb[2] = NULL;
         if (!new_head) new_head = node;
         else last->next = node;
         last = node;
@@ -581,7 +581,7 @@ void serialize_dom(DOMNode* head, const char* filename) {
     DOMNode* tmp = malloc(sizeof(DOMNode));
     while (curr && tmp) {
         memcpy(tmp, curr, sizeof(DOMNode));
-        tmp->pb[0] = tmp->pb[1] = NULL;            /* указатели не переживают границу процессов */
+        tmp->pb[0] = tmp->pb[1] = tmp->pb[2] = NULL;            /* указатели не переживают границу процессов */
         fwrite(tmp, sizeof(DOMNode), 1, f);
         curr = curr->next;
     }
@@ -600,7 +600,7 @@ DOMNode* deserialize_dom(const char* filename) {
         if (!node) break;
         memcpy(node, &tmp, sizeof(DOMNode));
         node->next = NULL;
-        node->pb[0] = node->pb[1] = NULL;
+        node->pb[0] = node->pb[1] = node->pb[2] = NULL;
         if (!head) head = node;
         else last->next = node;
         last = node;

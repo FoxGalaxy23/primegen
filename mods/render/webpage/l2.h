@@ -27,6 +27,8 @@ typedef struct {
     float    opacity;
     float    ex[8];         /* доп. параметры для C_CLIP (прокрутка) и C_STK (sticky), см. выше */
     int      mate;          /* C_FX/C_ENDFX: индекс парной команды */
+    uint32_t text_offset;   /* C_TEXT: byte offset into owning DOM text node, when valid */
+    uint8_t  text_offset_valid; /* source text maps byte-for-byte to this C_TEXT run */
 } Cmd;
 
 extern Cmd*  l2_dl;
@@ -38,6 +40,7 @@ extern int   l2_nrects;
 
 typedef struct { float x, y, mx, my, sw, sh, cw, ch; uint8_t is; } L2ScrollState;
 void l2_layout(DOMNode* head, int vw, int vh);   /* строит l2_dl */
+void l2_set_page_scroll(float x, float y); /* viewport scroll used by view()/root scroll timelines */
 void l2_release(void);
 int  l2_scroll_state_export(const DOMNode* head, L2ScrollState* out, int cap); /* out==NULL: вернуть требуемое число записей */
 void l2_scroll_state_import(const L2ScrollState* in, int count, DOMNode* head);
@@ -48,6 +51,7 @@ int  l2_scroll_get(const DOMNode* n, float* x, float* y);            /* теку
 int  l2_scroll_max(const DOMNode* n, float* mx, float* my);          /* максимальное смещение по осям */
 int  l2_scroll_size(const DOMNode* n, float* sw, float* sh, float* cw, float* ch);   /* scrollWidth/Height и clientWidth/Height */
 void l2_scroll_set(const DOMNode* n, float x, float y);              /* абсолютное смещение (обрезается при применении) */
+void l2_scroll_set_raw(const DOMNode* n, float x, float y);         /* промежуточный кадр плавной прокрутки, без snap */
 void l2_scroll_offset_of_ancestors(const DOMNode* n, float* ox, float* oy);   /* сумма смещений прокручиваемых предков (без самого узла) */
 
 int  webpage_ctrl_default_size(DOMNode* n, float* w, float* h);   /* размер контента формы (для layout) */

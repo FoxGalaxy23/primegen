@@ -162,48 +162,8 @@ static char* convert_to_utf8(const char* in) {
     return out;
 }
 
-/* ══════════════ URL ══════════════ */
-void webpage_resolve_url(const char* base, const char* rel, char* out, size_t cap) {
-    out[0] = 0;
-    if (!rel || !*rel) return;
-    while (is_ws(*rel)) rel++;
-    if (ci_prefix(rel, "http://") || ci_prefix(rel, "https://") || ci_prefix(rel, "data:") || ci_prefix(rel, "javascript:") ||
-        ci_prefix(rel, "mailto:") || ci_prefix(rel, "tel:") || rel[0] == '#') { put_str(out, cap, rel, strlen(rel)); return; }
-    int web = base && (ci_prefix(base, "http://") || ci_prefix(base, "https://"));
-    char tmp[2048];
-    if (web) {
-        const char* se = strstr(base, "://"); const char* auth = se + 3; const char* ae = auth + strcspn(auth, "/?#");
-        size_t plen = strcspn(ae, "?#");
-        if (rel[0] == '/' && rel[1] == '/') snprintf(tmp, sizeof tmp, "%.*s:%s", (int)(se - base), base, rel);
-        else if (rel[0] == '/') snprintf(tmp, sizeof tmp, "%.*s%s", (int)(ae - base), base, rel);
-        else if (rel[0] == '?') snprintf(tmp, sizeof tmp, "%.*s%.*s%s", (int)(ae - base), base, (int)plen, ae, rel);
-        else {
-            size_t d = plen; while (d > 0 && ae[d - 1] != '/') d--;
-            if (d == 0) snprintf(tmp, sizeof tmp, "%.*s/%s", (int)(ae - base), base, rel);
-            else snprintf(tmp, sizeof tmp, "%.*s%.*s%s", (int)(ae - base), base, (int)d, ae, rel);
-        }
-        /* убираем ./ и ../ в пути */
-        char* ps = strstr(tmp, "://"); if (ps) { ps += 3; ps += strcspn(ps, "/?#"); }
-        if (ps && *ps == '/') {
-            char* qs = ps + strcspn(ps, "?#"); char* tail = strdup(qs); char* w = ps; const char* r = ps;
-            while (r < qs && tail) {
-                const char* seg = r + 1; const char* se2 = seg; while (se2 < qs && *se2 != '/') se2++;
-                size_t sl = (size_t)(se2 - seg);
-                if (sl == 1 && seg[0] == '.') { if (se2 == qs) *w++ = '/'; }
-                else if (sl == 2 && seg[0] == '.' && seg[1] == '.') { if (w > ps) { w--; while (w > ps && *w != '/') w--; } if (se2 == qs) *w++ = '/'; }
-                else { *w++ = '/'; memmove(w, seg, sl); w += sl; }
-                r = se2;
-            }
-            if (tail) { memmove(w, tail, strlen(tail) + 1); free(tail); }
-        }
-    } else if (base && rel[0] != '/') {                       /* локальный файл */
-        const char* sl = strrchr(base, '/');
-        if (sl) snprintf(tmp, sizeof tmp, "%.*s/%s", (int)(sl - base), base, rel); else snprintf(tmp, sizeof tmp, "%s", rel);
-    } else snprintf(tmp, sizeof tmp, "%s", rel);
-    put_str(out, cap, tmp, strlen(tmp));
-}
+/* URL resolution is implemented in url.c so it can be independently fuzzed. */
 
-/* ══════════════ таблицы тегов ══════════════ */
 static const struct { const char* n; int t; } TAGMAP[] = {
     {"a",TAG_A},{"img",TAG_IMG},{"div",TAG_DIV},{"button",TAG_BUTTON},{"input",TAG_INPUT},{"span",TAG_SPAN},
     {"html",TAG_HTML},{"head",TAG_HEAD},{"body",TAG_BODY},{"title",TAG_TITLE},{"meta",TAG_META},{"link",TAG_LINK},
@@ -226,19 +186,30 @@ static const char* RAW_TAGS    = " script style xmp iframe noembed noframes nosc
 static const char* RCDATA_TAGS = " textarea title ";
 static const char* SKIP_TAGS   = " template canvas math ";
 static const char* P_CLOSERS   = " address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre section summary table ul li dd dt listing xmp ";
-static const char* NO_WS_TEXT  = " html head table thead tbody tfoot tr colgroup select optgroup ul ol dl ";
 static const char* SCOPE_STOP  = " td th table caption html button object marquee ";
+
+/* The compact renderer still stores the DOM as a preorder linked list, but
+ * the tree builder now tracks HTML5 insertion modes and deferred sibling
+ * placement.  Stable creation indices are used until the final flatten pass. */
+typedef enum {
+    IM_INITIAL = 0, IM_BEFORE_HTML, IM_BEFORE_HEAD, IM_IN_HEAD, IM_AFTER_HEAD,
+    IM_IN_BODY, IM_IN_TABLE, IM_IN_TABLE_BODY, IM_IN_ROW, IM_IN_CELL,
+    IM_IN_CAPTION, IM_IN_COLGROUP, IM_IN_SELECT
+} HtmlInsertionMode;
 
 /* ══════════════ бандл страницы ══════════════ */
 static PageBundle g_bundle;
 static void bundle_reset(void) {
     for (int i = 0; i < g_bundle.nsheets; i++) { free(g_bundle.sheets[i].css); free(g_bundle.sheets[i].href); }
-    for (int i = 0; i < g_bundle.nscripts; i++) { free(g_bundle.scripts[i].text); free(g_bundle.scripts[i].url); }
+    for (int i = 0; i < g_bundle.nscripts; i++) { free(g_bundle.scripts[i].text); free(g_bundle.scripts[i].url); free(g_bundle.scripts[i].nonce); }
     free(g_bundle.sheets); free(g_bundle.scripts); memset(&g_bundle, 0, sizeof g_bundle);
 }
-static void bundle_add_script(char* text, char* url, int module, int async_, int defer_, int idx) {
-    g_bundle.scripts = realloc(g_bundle.scripts, (size_t)(g_bundle.nscripts + 1) * sizeof(ScriptSrc));
-    ScriptSrc* sc = &g_bundle.scripts[g_bundle.nscripts++]; sc->text = text; sc->url = url; sc->module = (uint8_t)module; sc->async_ = (uint8_t)async_; sc->defer_ = (uint8_t)defer_; sc->node_idx = idx;
+static void bundle_add_script(char* text, char* url, char* nonce, int module, int async_, int defer_, int idx) {
+    ScriptSrc* nv = realloc(g_bundle.scripts, (size_t)(g_bundle.nscripts + 1) * sizeof(ScriptSrc));
+    if (!nv) { free(text); free(url); free(nonce); return; }
+    g_bundle.scripts = nv;
+    ScriptSrc* sc = &g_bundle.scripts[g_bundle.nscripts++]; memset(sc, 0, sizeof *sc);
+    sc->text = text; sc->url = url; sc->nonce = nonce; sc->module = (uint8_t)module; sc->async_ = (uint8_t)async_; sc->defer_ = (uint8_t)defer_; sc->node_idx = idx;
 }
 
 /* ══════════════ состояние сборки ══════════════ */
@@ -246,6 +217,9 @@ typedef struct {
     DOMNode** v; int n, cap;
     int stack[256]; int sp;              /* индексы открытых элементов */
     int head, body, mode_head;           /* mode_head: ещё не встретили содержимое body */
+    HtmlInsertionMode insertion_mode;
+    int formatting[128], nformatting;    /* active formatting elements */
+    int foster_parenting;
     char base[1024];
     SheetList* sheets;
     int skip_nl;
@@ -253,7 +227,7 @@ typedef struct {
 
 DOMNode* webpage_new_node(const char* tag) {
     DOMNode* n = calloc(1, sizeof(DOMNode)); if (!n) return NULL;
-    n->v2 = 1; n->parent = -1; n->subtree_end = 0; n->attr_w = n->attr_h = -1; n->colspan = n->rowspan = 1;
+    n->v2 = 1; n->parent = -1; n->subtree_end = 0; n->html_before = -1; n->attr_w = n->attr_h = -1; n->colspan = n->rowspan = 1;
     n->bg_color = 0xFFFFFF; n->text_color = 0;
     put_str(n->tag, sizeof n->tag, tag, strlen(tag));
     n->type = TAG_OTHER;
@@ -273,6 +247,12 @@ static DOMNode* mk(PB* pb, int parent, const char* tag) {
     }
     n->idx = pb->n; n->parent = parent; n->subtree_end = pb->n;
     pb->v[pb->n++] = n;
+    return n;
+}
+
+static DOMNode* mk_before(PB* pb, int parent, const char* tag, int before_idx) {
+    DOMNode* n = mk(pb, parent, tag);
+    if (n) n->html_before = before_idx;
     return n;
 }
 
@@ -328,14 +308,16 @@ static void apply_attrs(PB* pb, DOMNode* n, Attr* a, int na) {
     for (int i = 0; i < na; i++) {
         const char* k = a[i].name; const char* v = a[i].val ? a[i].val : "";
         size_t vl = strlen(v);
-        if (strcmp(k, "style") != 0 && strcmp(k, "class") != 0 && vl < 160 && strlen(k) < 32 &&
+        int blocked_inline_event = !strcmp(k, "onclick") && !websec_allows_inline(NAL_RESOURCE_SCRIPT, NULL);
+        int blocked_inline_style = !strcmp(k, "style") && !websec_allows_inline(NAL_RESOURCE_STYLE, NULL);
+        if (strcmp(k, "style") != 0 && strcmp(k, "class") != 0 && !blocked_inline_event && vl < 160 && strlen(k) < 32 &&
             apos + (int)strlen(k) + (int)vl + 3 < (int)sizeof n->attrs) {
             apos += snprintf(n->attrs + apos, sizeof n->attrs - apos, "%s%c%s%c", k, 1, v, 2);
         }
         if (!strcmp(k, "id")) put_str(n->id, sizeof n->id, v, vl);
         else if (!strcmp(k, "class")) put_str(n->class_name, sizeof n->class_name, v, vl);
-        else if (!strcmp(k, "style")) put_str(n->style_str, sizeof n->style_str, v, vl);
-        else if (!strcmp(k, "onclick")) put_str(n->onclick, sizeof n->onclick, v, vl);
+        else if (!strcmp(k, "style")) { if (!blocked_inline_style) put_str(n->style_str, sizeof n->style_str, v, vl); }
+        else if (!strcmp(k, "onclick")) { if (!blocked_inline_event) put_str(n->onclick, sizeof n->onclick, v, vl); }
         else if (!strcmp(k, "name")) put_str(n->name, sizeof n->name, v, vl);
         else if (!strcmp(k, "value")) put_str(n->value, sizeof n->value, v, vl);
         else if (!strcmp(k, "type")) { put_str(n->input_type, sizeof n->input_type, v, vl); for (char* c = n->input_type; *c; c++) *c = (char)tolower((unsigned char)*c); }
@@ -371,7 +353,9 @@ static void apply_attrs(PB* pb, DOMNode* n, Attr* a, int na) {
         else if (!strcmp(k, "face") && !strcmp(tag, "font")) { char b[160]; snprintf(b, sizeof b, "font-family:%s", v); pres_add(n, b); }
         else if (!strcmp(k, "size") && !strcmp(tag, "font")) {
             static const int fs[8] = {10, 10, 13, 16, 18, 24, 32, 48}; int s = atoi(v); if (v[0] == '+' || v[0] == '-') s += 3;
-            if (s < 1) s = 1; if (s > 7) s = 7; char b[40]; snprintf(b, sizeof b, "font-size:%dpx", fs[s]); pres_add(n, b);
+            if (s < 1) s = 1;
+            if (s > 7) s = 7;
+            char b[40]; snprintf(b, sizeof b, "font-size:%dpx", fs[s]); pres_add(n, b);
         }
         else if (!strcmp(k, "align")) {
             if (!strcasecmp(v, "center") || !strcasecmp(v, "left") || !strcasecmp(v, "right")) {
@@ -382,6 +366,13 @@ static void apply_attrs(PB* pb, DOMNode* n, Attr* a, int na) {
             }
         }
         else if (!strcmp(k, "valign")) { char b[48]; snprintf(b, sizeof b, "vertical-align:%s", v); pres_add(n, b); }
+        else if (!strcmp(k, "dir")) {
+            /* HTML direction is a presentational hint; authored CSS direction
+             * still wins in the normal cascade. dir=auto is resolved separately
+             * by the UA in full engines and must not be mistaken for ltr here. */
+            if (!strcasecmp(v, "rtl")) pres_add(n, "direction:rtl");
+            else if (!strcasecmp(v, "ltr")) pres_add(n, "direction:ltr");
+        }
         else if (!strcmp(k, "nowrap")) pres_add(n, "white-space:nowrap");
         else if (!strcmp(k, "border") && (is_tbl || !strcmp(tag, "img")) && atoi(v) > 0) {
             char b[64]; snprintf(b, sizeof b, "border:%dpx %s #808080", atoi(v), is_tbl ? "outset" : "solid"); pres_add(n, b);
@@ -409,6 +400,7 @@ static void ensure_body(PB* pb) {
     pb->mode_head = 0;
     if (pb->body < 0) { DOMNode* b = mk(pb, 0, "body"); pb->body = b ? b->idx : 0; }
     pb->sp = 0; pb->stack[pb->sp++] = pb->body;
+    pb->insertion_mode = IM_IN_BODY;
 }
 
 static int stack_find(PB* pb, const char* tag, const char* stop_list) {
@@ -421,6 +413,380 @@ static int stack_find(PB* pb, const char* tag, const char* stop_list) {
 }
 static void pop_to(PB* pb, int i) { if (i >= 1) pb->sp = i; }                 /* закрывает элемент i и всё, что выше */
 
+static int stack_index_for_node(PB* pb, int node_idx) {
+    for (int i = pb->sp - 1; i >= 0; --i) if (pb->stack[i] == node_idx) return i;
+    return -1;
+}
+
+static void stack_remove_at(PB* pb, int at) {
+    if (at < 0 || at >= pb->sp || at == 0) return;
+    memmove(&pb->stack[at], &pb->stack[at + 1], (size_t)(pb->sp - at - 1) * sizeof pb->stack[0]);
+    pb->sp--;
+}
+
+static HtmlInsertionMode reset_insertion_mode(PB* pb) {
+    if (pb->mode_head) return pb->head >= 0 ? IM_IN_HEAD : IM_BEFORE_HEAD;
+    for (int i = pb->sp - 1; i >= 0; --i) {
+        const char* t = pb->v[pb->stack[i]]->tag;
+        if (!strcmp(t, "select")) return IM_IN_SELECT;
+        if (!strcmp(t, "td") || !strcmp(t, "th")) return IM_IN_CELL;
+        if (!strcmp(t, "tr")) return IM_IN_ROW;
+        if (!strcmp(t, "tbody") || !strcmp(t, "thead") || !strcmp(t, "tfoot")) return IM_IN_TABLE_BODY;
+        if (!strcmp(t, "caption")) return IM_IN_CAPTION;
+        if (!strcmp(t, "colgroup")) return IM_IN_COLGROUP;
+        if (!strcmp(t, "table")) return IM_IN_TABLE;
+        if (!strcmp(t, "head")) return IM_IN_HEAD;
+        if (!strcmp(t, "body")) return IM_IN_BODY;
+        if (!strcmp(t, "html")) return IM_AFTER_HEAD;
+    }
+    return IM_IN_BODY;
+}
+
+static int is_formatting_tag(const char* tag) {
+    return in_list(" a b big code em font i s small strike strong tt u ", tag);
+}
+
+static int active_formatting_index(PB* pb, const char* tag) {
+    /* A marker partitions the list. Elements before the most recent marker
+     * must not participate in reconstruction/adoption for the current scope. */
+    for (int i = pb->nformatting - 1; i >= 0; --i) {
+        int id = pb->formatting[i];
+        if (id < 0) break;
+        if (id < pb->n && !strcmp(pb->v[id]->tag, tag)) return i;
+    }
+    return -1;
+}
+
+static int active_formatting_node_index(PB* pb, int node_idx) {
+    for (int i = pb->nformatting - 1; i >= 0; --i) {
+        if (pb->formatting[i] < 0) break;
+        if (pb->formatting[i] == node_idx) return i;
+    }
+    return -1;
+}
+
+static void active_formatting_remove(PB* pb, int at) {
+    if (at < 0 || at >= pb->nformatting) return;
+    memmove(&pb->formatting[at], &pb->formatting[at + 1], (size_t)(pb->nformatting - at - 1) * sizeof pb->formatting[0]);
+    pb->nformatting--;
+}
+
+static void active_formatting_marker(PB* pb) {
+    if (pb->nformatting < (int)(sizeof pb->formatting / sizeof pb->formatting[0]))
+        pb->formatting[pb->nformatting++] = -1;
+}
+
+static void clear_active_formatting_to_marker(PB* pb) {
+    for (int i = pb->nformatting - 1; i >= 0; --i) {
+        if (pb->formatting[i] == -1) {
+            /* The marker itself and all entries after it are discarded. */
+            pb->nformatting = i;
+            return;
+        }
+    }
+    pb->nformatting = 0;
+}
+
+static int is_special_html_element(const char* tag) {
+    return in_list(" address applet area article aside base basefont bgsound blockquote body br button caption center col colgroup dd details dir div dl dt embed fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html iframe img input li link listing main marquee menu meta nav noembed noframes noscript object ol optgroup option p param plaintext pre script search section select source style summary table tbody td template textarea tfoot th thead title tr track ul wbr xmp ", tag);
+}
+
+static int is_table_stack_tag(const char* tag) {
+    return in_list(" table caption colgroup tbody thead tfoot tr td th ", tag);
+}
+
+/* Return the table whose in-table insertion mode is active, or -1 when the
+ * current node is ordinary body content (for example a foster-parented div). */
+static int table_insertion_target(PB* pb) {
+    if (pb->mode_head || pb->sp <= 0) return -1;
+    const char* top = pb->v[pb->stack[pb->sp - 1]]->tag;
+    if (!is_table_stack_tag(top)) return -1;
+    int table = -1;
+    for (int i = pb->sp - 1; i >= 0; --i) {
+        const char* t = pb->v[pb->stack[i]]->tag;
+        if (!strcmp(t, "td") || !strcmp(t, "th") || !strcmp(t, "caption")) return -1;
+        if (!strcmp(t, "table")) { table = pb->stack[i]; break; }
+    }
+    return table;
+}
+
+static DOMNode* clone_element(PB* pb, int old_idx, int parent) {
+    if (old_idx < 0 || old_idx >= pb->n) return NULL;
+    DOMNode* old = pb->v[old_idx];
+    DOMNode* n = mk(pb, parent, old->tag);
+    if (!n) return NULL;
+    int idx = n->idx;
+    memcpy(n, old, sizeof *n);
+    n->idx = idx; n->parent = parent; n->subtree_end = idx; n->html_before = -1; n->next = NULL;
+    n->aux = NULL; n->pb[0] = n->pb[1] = n->pb[2] = NULL;
+    return n;
+}
+
+/* Recreate formatting elements that remain active after another formatting
+ * element was closed. This is the step missing from the old stack-only parser. */
+static void reconstruct_active_formatting(PB* pb) {
+    if (pb->nformatting <= 0 || pb->mode_head) return;
+    int marker = -1;
+    for (int i = pb->nformatting - 1; i >= 0; --i) {
+        if (pb->formatting[i] < 0) { marker = i; break; }
+    }
+    int first = pb->nformatting - 1;
+    if (first <= marker) return;
+    if (stack_index_for_node(pb, pb->formatting[first]) >= 0) return;
+    while (first > marker + 1 && stack_index_for_node(pb, pb->formatting[first - 1]) < 0) first--;
+    for (int i = first; i < pb->nformatting; ++i) {
+        if (pb->formatting[i] < 0) break;
+        if (pb->sp >= 250) return;
+        DOMNode* n = clone_element(pb, pb->formatting[i], cur_parent(pb));
+        if (!n) return;
+        pb->formatting[i] = n->idx;
+        pb->stack[pb->sp++] = n->idx;
+    }
+}
+
+/* HTML5 adoption-agency algorithm. This implementation preserves stable node
+ * ids while the stack/list entries are replaced, then flatten_html_tree()
+ * materializes the repaired hierarchy as the renderer's preorder list. */
+static void adoption_agency(PB* pb, const char* tag) {
+    for (int outer = 0; outer < 8; ++outer) {
+        int af = active_formatting_index(pb, tag);
+        if (af < 0) return;
+        int formatting = pb->formatting[af];
+        int fp = stack_index_for_node(pb, formatting);
+        if (fp < 0) {
+            active_formatting_remove(pb, af);
+            return;
+        }
+        if (stack_find(pb, tag, SCOPE_STOP) < 0) return;
+
+        /* The furthest block is the first special element encountered when
+         * walking upward from the formatting element through stack order. */
+        int furthest_pos = -1;
+        for (int i = fp + 1; i < pb->sp; ++i) {
+            if (is_special_html_element(pb->v[pb->stack[i]]->tag)) {
+                furthest_pos = i;
+                break;
+            }
+        }
+        if (furthest_pos < 0) {
+            pb->sp = fp; /* pop formatting element and every node above it */
+            af = active_formatting_node_index(pb, formatting);
+            active_formatting_remove(pb, af);
+            return;
+        }
+
+        int furthest = pb->stack[furthest_pos];
+        int common_ancestor = fp > 0 ? pb->stack[fp - 1] : pb->body;
+        int last_node = furthest;
+        int node = furthest;
+        int bookmark = af;
+        int inner = 0;
+        for (;;) {
+            inner++;
+            int node_pos = stack_index_for_node(pb, node);
+            if (node_pos <= fp) break;
+            int previous = pb->stack[node_pos - 1];
+            node = previous;
+            if (node == formatting) break;
+
+            int ai = active_formatting_node_index(pb, node);
+            if (inner > 3 && ai >= 0) {
+                if (ai < bookmark) bookmark--;
+                active_formatting_remove(pb, ai);
+                ai = -1;
+            }
+            if (ai < 0) {
+                int remove_pos = stack_index_for_node(pb, node);
+                if (remove_pos >= 0) stack_remove_at(pb, remove_pos);
+                continue;
+            }
+
+            DOMNode* clone = clone_element(pb, node, -1);
+            if (!clone) return;
+            int node_stack_pos = stack_index_for_node(pb, node);
+            if (node_stack_pos >= 0) pb->stack[node_stack_pos] = clone->idx;
+            pb->formatting[ai] = clone->idx;
+            if (last_node == furthest) bookmark = ai + 1;
+            pb->v[last_node]->parent = clone->idx;
+            pb->v[last_node]->html_before = -1;
+            last_node = clone->idx;
+            node = clone->idx;
+        }
+
+        /* Insert lastNode under the common ancestor. For table-context
+         * ancestors, the spec's foster-parent location is immediately before
+         * the table element. */
+        if (common_ancestor >= 0 && common_ancestor < pb->n &&
+            in_list(" table tbody tfoot thead tr ", pb->v[common_ancestor]->tag)) {
+            int table = -1;
+            for (int i = pb->sp - 1; i >= 0; --i) {
+                if (!strcmp(pb->v[pb->stack[i]]->tag, "table")) { table = pb->stack[i]; break; }
+            }
+            if (table >= 0) {
+                pb->v[last_node]->parent = pb->v[table]->parent;
+                pb->v[last_node]->html_before = table;
+            } else pb->v[last_node]->parent = common_ancestor;
+        } else if (common_ancestor >= 0 && common_ancestor < pb->n) {
+            pb->v[last_node]->parent = common_ancestor;
+            pb->v[last_node]->html_before = -1;
+        }
+
+        DOMNode* replacement = clone_element(pb, formatting, -1);
+        if (!replacement) return;
+        for (int i = 0; i < pb->n; ++i) {
+            if (i != replacement->idx && pb->v[i]->parent == furthest) {
+                pb->v[i]->parent = replacement->idx;
+                pb->v[i]->html_before = -1;
+            }
+        }
+        replacement->parent = furthest;
+
+        af = active_formatting_node_index(pb, formatting);
+        if (af >= 0) {
+            active_formatting_remove(pb, af);
+            if (af < bookmark) bookmark--;
+            if (bookmark < 0) bookmark = 0;
+            if (bookmark > pb->nformatting) bookmark = pb->nformatting;
+            if (pb->nformatting < (int)(sizeof pb->formatting / sizeof pb->formatting[0])) {
+                memmove(&pb->formatting[bookmark + 1], &pb->formatting[bookmark],
+                    (size_t)(pb->nformatting - bookmark) * sizeof pb->formatting[0]);
+                pb->formatting[bookmark] = replacement->idx;
+                pb->nformatting++;
+            }
+        }
+
+        int old_pos = stack_index_for_node(pb, formatting);
+        if (old_pos >= 0) stack_remove_at(pb, old_pos);
+        furthest_pos = stack_index_for_node(pb, furthest);
+        if (furthest_pos >= 0 && pb->sp < 250) {
+            /* Stack positions run from root to current node. Insert the clone
+             * immediately below the furthest block so future tokens are not
+             * accidentally nested inside the reconstructed formatting node. */
+            memmove(&pb->stack[furthest_pos + 1], &pb->stack[furthest_pos],
+                (size_t)(pb->sp - furthest_pos) * sizeof pb->stack[0]);
+            pb->stack[furthest_pos] = replacement->idx;
+            pb->sp++;
+        }
+        return;
+    }
+}
+
+static void push_implied_element(PB* pb, const char* tag) {
+    if (pb->sp >= 250) return;
+    DOMNode* n = mk(pb, cur_parent(pb), tag);
+    if (n) pb->stack[pb->sp++] = n->idx;
+}
+
+static void close_open_table_row(PB* pb) {
+    int i = stack_find(pb, "tr", " table html ");
+    if (i >= 0) pb->sp = i;
+}
+
+static void close_open_table_section(PB* pb) {
+    int i = -1;
+    for (int k = pb->sp - 1; k >= 0; --k) {
+        const char* t = pb->v[pb->stack[k]]->tag;
+        if (!strcmp(t, "tbody") || !strcmp(t, "thead") || !strcmp(t, "tfoot")) { i = k; break; }
+        if (!strcmp(t, "table") || !strcmp(t, "html")) break;
+    }
+    if (i >= 0) pb->sp = i;
+}
+
+/* A small but explicit subset of the in-table/in-table-body/in-row insertion
+ * modes. It handles implied tbody/tr/colgroup and sends invalid table content
+ * through foster parenting instead of making it a child of <table>. */
+static int prepare_table_start(PB* pb, const char* name, Attr* a, int na, int* foster_before) {
+    HtmlInsertionMode mode = reset_insertion_mode(pb);
+    int table = table_insertion_target(pb);
+    *foster_before = -1;
+    if (table < 0) return 0;
+
+    if (!strcmp(name, "table")) {
+        int i = stack_find(pb, "table", " html ");
+        if (i >= 0) pb->sp = i;
+        return 0;
+    }
+
+    if (!strcmp(name, "tbody") || !strcmp(name, "thead") || !strcmp(name, "tfoot") ||
+        !strcmp(name, "caption") || !strcmp(name, "colgroup")) {
+        if (mode == IM_IN_ROW) close_open_table_row(pb);
+        if (mode == IM_IN_TABLE_BODY || mode == IM_IN_ROW) close_open_table_section(pb);
+        return 0;
+    }
+
+    if (!strcmp(name, "tr")) {
+        if (mode == IM_IN_ROW) close_open_table_row(pb);
+        else if (mode == IM_IN_TABLE) push_implied_element(pb, "tbody");
+        return 0;
+    }
+
+    if (!strcmp(name, "td") || !strcmp(name, "th")) {
+        if (mode == IM_IN_CELL) {
+            int i = stack_find(pb, "td", " table html ");
+            if (i < 0) i = stack_find(pb, "th", " table html ");
+            if (i >= 0) pb->sp = i;
+            mode = reset_insertion_mode(pb);
+        }
+        if (mode == IM_IN_TABLE) { push_implied_element(pb, "tbody"); mode = IM_IN_TABLE_BODY; }
+        if (mode == IM_IN_TABLE_BODY) push_implied_element(pb, "tr");
+        return 0;
+    }
+
+    if (!strcmp(name, "col")) {
+        if (mode == IM_IN_TABLE) push_implied_element(pb, "colgroup");
+        else if (mode != IM_IN_COLGROUP) { *foster_before = table; return 1; }
+        return 0;
+    }
+
+    if (in_list(" style script template ", name)) return 0;
+    /* `input type=hidden` is a special in-table token in HTML5. It is kept
+     * inside the table; all other non-structural tokens are foster-parented. */
+    if (!strcmp(name, "input")) {
+        for (int i = 0; i < na; ++i) {
+            if (!strcmp(a[i].name, "type") && a[i].val && !strcasecmp(a[i].val, "hidden")) return 0;
+        }
+    }
+    *foster_before = table;
+    return 1;
+}
+
+/* These table tokens close the current cell/caption and are then reprocessed
+ * in the newly exposed insertion mode, as required by the HTML tree builder. */
+static void prepare_table_context_for_start(PB* pb, const char* name) {
+    HtmlInsertionMode mode = reset_insertion_mode(pb);
+    if (mode == IM_IN_CELL && in_list(" caption col colgroup tbody td tfoot th thead tr ", name)) {
+        int i = stack_find(pb, "td", " table html ");
+        if (i < 0) i = stack_find(pb, "th", " table html ");
+        if (i >= 0) {
+            clear_active_formatting_to_marker(pb);
+            pb->sp = i; /* closes the cell and anything above it */
+        }
+        mode = reset_insertion_mode(pb);
+    }
+    if (mode == IM_IN_CAPTION && in_list(" caption col colgroup tbody td tfoot th thead tr table ", name)) {
+        int i = stack_find(pb, "caption", " table html ");
+        if (i >= 0) {
+            clear_active_formatting_to_marker(pb);
+            pb->sp = i;
+        }
+        mode = reset_insertion_mode(pb);
+    }
+    if (mode == IM_IN_COLGROUP && strcmp(name, "col") != 0 &&
+        !in_list(" html head body script style template ", name)) {
+        int i = stack_find(pb, "colgroup", " table html ");
+        if (i >= 0) pb->sp = i;
+    }
+}
+
+static int open_cell_stack_index(PB* pb) {
+    for (int i = pb->sp - 1; i >= 0; --i) {
+        const char* tag = pb->v[pb->stack[i]]->tag;
+        if (!strcmp(tag, "td") || !strcmp(tag, "th")) return i;
+        if (!strcmp(tag, "table") || !strcmp(tag, "html")) break;
+    }
+    return -1;
+}
+
 static void add_text(PB* pb, const char* s, size_t n, int rcdata_entities, DOMNode* target) {
     if (n == 0) return;
     char* buf = malloc(n + 1); if (!buf) return;
@@ -431,14 +797,16 @@ static void add_text(PB* pb, const char* s, size_t n, int rcdata_entities, DOMNo
     if (len <= st) { free(buf); return; }
     if (!target) {
         if (pb->mode_head) { if (allws) { free(buf); return; } ensure_body(pb); }
-        int par = cur_parent(pb);
-        if (allws && in_list(NO_WS_TEXT, pb->v[par]->tag)) { free(buf); return; }
+        int foster_table = allws ? -1 : table_insertion_target(pb);
+        if (foster_table < 0) reconstruct_active_formatting(pb);
+        int par = foster_table >= 0 ? pb->v[foster_table]->parent : cur_parent(pb);
+        if (par < 0) par = cur_parent(pb);
         /* внутри pre/textarea пробелы значимы; иначе разбиваем длинный текст на узлы <= 500 байт */
         size_t pos = st;
         while (pos < len) {
             size_t take = len - pos;
             if (take > 500) { take = 500; while (take > 100 && !is_ws((unsigned char)buf[pos + take])) take--; while (take > 1 && ((unsigned char)buf[pos + take] & 0xC0) == 0x80) take--; }
-            DOMNode* t = mk(pb, par, "#text"); if (!t) break;
+            DOMNode* t = foster_table >= 0 ? mk_before(pb, par, "#text", foster_table) : mk(pb, par, "#text"); if (!t) break;
             t->type = TAG_TEXT; put_str(t->text, sizeof t->text, buf + pos, take);
             pos += take;
         }
@@ -500,6 +868,17 @@ static void start_tag(PB* pb, const char* name, Attr* a, int na, int selfclose, 
     }
     if (pb->mode_head && !in_list(HEAD_TAGS, name)) ensure_body(pb);
 
+    int foster_before = -1;
+    if (!pb->mode_head) {
+        pb->insertion_mode = reset_insertion_mode(pb);
+        prepare_table_context_for_start(pb, name);
+        pb->insertion_mode = reset_insertion_mode(pb);
+        (void)prepare_table_start(pb, name, a, na, &foster_before);
+        if (foster_before < 0 && is_formatting_tag(name)) reconstruct_active_formatting(pb);
+        if (!strcmp(name, "a") && active_formatting_index(pb, "a") >= 0)
+            adoption_agency(pb, "a");
+    }
+
     if (!pb->mode_head) {                                   /* неявные закрытия */
         if (in_list(P_CLOSERS, name)) close_p_if_open(pb);
         if (!strcmp(name, "li")) { int i = stack_find(pb, "li", " ul ol menu html "); if (i >= 0) pop_to(pb, i); }
@@ -510,12 +889,15 @@ static void start_tag(PB* pb, const char* name, Attr* a, int na, int selfclose, 
         else if (!strcmp(name, "tr")) { int i = stack_find(pb, "tr", " table html "); if (i >= 0) pop_to(pb, i); }
         else if (!strcmp(name, "thead") || !strcmp(name, "tbody") || !strcmp(name, "tfoot")) { for (int k = 0; k < 3; k++) { int i = stack_find(pb, k == 0 ? "tr" : k == 1 ? "tbody" : "thead", " table html "); if (i >= 0) pop_to(pb, i); } }
         else if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) { const char* t = pb->v[cur_parent(pb)]->tag; if (t[0] == 'h' && t[1] >= '1' && t[1] <= '6' && !t[2]) pop_to(pb, pb->sp - 1); }
-        else if (!strcmp(name, "a")) { int i = stack_find(pb, "a", " td th table html button "); if (i >= 0) pop_to(pb, i); }
+        /* Formatting element starts are handled by the active-formatting list
+         * and adoption-agency algorithm above, rather than stack truncation. */
         else if (!strcmp(name, "button")) { int i = stack_find(pb, "button", " td th table html "); if (i >= 0) pop_to(pb, i); }
     }
 
-    int parent = cur_parent(pb);
-    n = mk(pb, parent, name); if (!n) return;
+    int parent = foster_before >= 0 ? pb->v[foster_before]->parent : cur_parent(pb);
+    if (parent < 0) parent = cur_parent(pb);
+    n = foster_before >= 0 ? mk_before(pb, parent, name, foster_before) : mk(pb, parent, name);
+    if (!n) return;
     apply_attrs(pb, n, a, na);
     int is_void = in_list(VOID_TAGS, name);
 
@@ -544,14 +926,15 @@ static void start_tag(PB* pb, const char* name, Attr* a, int na, int selfclose, 
         } else e = find_ci(p, close);
         size_t len = e ? (size_t)(e - p) : strlen(p);
         if (!strcmp(name, "style") && len > 0) {
-            char media[96] = ""; webpage_attr_get(n, "media", media, sizeof media);
-            char* css = malloc(len + 1); if (css) { memcpy(css, p, len); css[len] = 0; add_sheet(pb, css, NULL, media); }
+            char media[96] = "", nonce[256] = ""; webpage_attr_get(n, "media", media, sizeof media); webpage_attr_get(n, "nonce", nonce, sizeof nonce);
+            if (websec_allows_inline(NAL_RESOURCE_STYLE, nonce)) { char* css = malloc(len + 1); if (css) { memcpy(css, p, len); css[len] = 0; add_sheet(pb, css, NULL, media); } }
         } else if (!strcmp(name, "script")) {
             char ty[64] = "", nm[8] = ""; webpage_attr_get(n, "type", ty, sizeof ty); int nomod = webpage_attr_get(n, "nomodule", nm, sizeof nm);
             int is_js = !nomod && (!ty[0] || find_ci(ty, "javascript") || find_ci(ty, "ecmascript") || !strcasecmp(ty, "module"));
             if (is_js && (len > 0 || n->src[0])) {
                 char* text = NULL; if (!n->src[0] && len > 0) { text = malloc(len + 1); if (text) { memcpy(text, p, len); text[len] = 0; } }
-                char t2[8], t3[8], t4[8]; bundle_add_script(text, n->src[0] ? strdup(n->src) : NULL, !strcasecmp(ty, "module"), webpage_attr_get(n, "async", t2, sizeof t2), webpage_attr_get(n, "defer", t3, sizeof t3), n->idx); (void)t4;
+                char t2[8], t3[8], nonce[256] = ""; webpage_attr_get(n, "nonce", nonce, sizeof nonce);
+                bundle_add_script(text, n->src[0] ? strdup(n->src) : NULL, strdup(nonce), !strcasecmp(ty, "module"), webpage_attr_get(n, "async", t2, sizeof t2), webpage_attr_get(n, "defer", t3, sizeof t3), n->idx);
             }
             if (len > 0 && len < 511) put_str(n->text, sizeof n->text, p, len);   /* для старого кода; движок JS берёт полный текст из бандла */
         } else if (!strcmp(name, "svg")) {
@@ -571,20 +954,68 @@ static void start_tag(PB* pb, const char* name, Attr* a, int na, int selfclose, 
     }
     if (selfclose && pb->mode_head == 0 && 0) return;
     if (pb->sp < 250) pb->stack[pb->sp++] = n->idx;
+    if (is_formatting_tag(name) && pb->nformatting < (int)(sizeof pb->formatting / sizeof pb->formatting[0]))
+        pb->formatting[pb->nformatting++] = n->idx;
+    else if (in_list(" applet button caption marquee object td th ", name))
+        active_formatting_marker(pb);
+    pb->insertion_mode = reset_insertion_mode(pb);
     if (!strcmp(name, "pre") || !strcmp(name, "listing")) pb->skip_nl = 1;
 }
 
 static void end_tag(PB* pb, const char* name) {
-    if (!strcmp(name, "html") || !strcmp(name, "body") || !strcmp(name, "head")) return;
+    if (!strcmp(name, "html") || !strcmp(name, "body")) return;
+    if (!strcmp(name, "head")) { ensure_body(pb); return; }
     if (!strcmp(name, "br")) { Attr none[1]; const char* nul = ""; start_tag(pb, "br", none, 0, 1, &nul); return; }
     if (pb->mode_head) return;
+    pb->insertion_mode = reset_insertion_mode(pb);
+
+    if (!strcmp(name, "td") || !strcmp(name, "th")) {
+        int i = open_cell_stack_index(pb);
+        if (i >= 0 && !strcmp(pb->v[pb->stack[i]]->tag, name)) {
+            clear_active_formatting_to_marker(pb);
+            pb->sp = i;
+        }
+        pb->insertion_mode = reset_insertion_mode(pb);
+        return;
+    }
+    if (!strcmp(name, "caption")) {
+        int i = stack_find(pb, "caption", " table html ");
+        if (i >= 0) {
+            clear_active_formatting_to_marker(pb);
+            pb->sp = i;
+        }
+        pb->insertion_mode = reset_insertion_mode(pb);
+        return;
+    }
+    int open_cell = open_cell_stack_index(pb);
+    if (open_cell >= 0 && in_list(" tr tbody thead tfoot ", name)) {
+        clear_active_formatting_to_marker(pb);
+        pb->sp = open_cell; /* reprocess the token with the cell no longer open */
+    } else if (open_cell >= 0 && !strcmp(name, "table")) {
+        clear_active_formatting_to_marker(pb);
+    }
+    if (is_formatting_tag(name) && active_formatting_index(pb, name) >= 0) {
+        adoption_agency(pb, name);
+        pb->insertion_mode = reset_insertion_mode(pb);
+        return;
+    }
     const char* stop = SCOPE_STOP;
     if (!strcmp(name, "table")) stop = " html ";
     else if (!strcmp(name, "td") || !strcmp(name, "th") || !strcmp(name, "tr") || !strcmp(name, "tbody") || !strcmp(name, "thead") || !strcmp(name, "tfoot") || !strcmp(name, "caption")) stop = " table html ";
     else if (in_list(" div span a b i u em strong small font section article nav header footer main ul ol li p label form ", name)) stop = " td th table caption html ";
     int i = stack_find(pb, name, stop);
-    if (i >= 0) pop_to(pb, i);
-    else if (!strcmp(name, "form") || !strcmp(name, "p")) { /* пустой </p> игнорируем */ }
+    if (i >= 0) {
+        if (in_list(" applet button marquee object ", name)) clear_active_formatting_to_marker(pb);
+        pop_to(pb, i);
+    }
+    else if (!strcmp(name, "p")) {
+        /* In HTML5 a stray </p> synthesizes an empty paragraph, then closes it. */
+        Attr none[1]; const char* nul = "";
+        start_tag(pb, "p", none, 0, 0, &nul);
+        i = stack_find(pb, "p", SCOPE_STOP);
+        if (i >= 0) pop_to(pb, i);
+    }
+    pb->insertion_mode = reset_insertion_mode(pb);
 }
 
 /* ── Responsive images: srcset/sizes/picture ─────────────────────────────── */
@@ -815,6 +1246,103 @@ static void select_responsive_images(PB *pb) {
     }
 }
 
+/* Convert the stable-id construction graph into the renderer's preorder list.
+ * Normal children retain source order; foster-parented nodes are moved just
+ * before their table. This makes tree repair visible through the legacy
+ * parent/subtree_end fields without invalidating parser stacks mid-parse. */
+static int flatten_html_tree(PB* pb) {
+    int n = pb->n;
+    if (n <= 0) return 0;
+    int *first = malloc((size_t)n * sizeof(int));
+    int *last = malloc((size_t)n * sizeof(int));
+    int *next = malloc((size_t)n * sizeof(int));
+    int *prev = malloc((size_t)n * sizeof(int));
+    int *map = malloc((size_t)n * sizeof(int));
+    int *walk = malloc((size_t)n * sizeof(int));
+    DOMNode **ordered = malloc((size_t)n * sizeof(DOMNode*));
+    if (!first || !last || !next || !prev || !map || !walk || !ordered) {
+        free(first); free(last); free(next); free(prev); free(map); free(walk); free(ordered);
+        return 0;
+    }
+    for (int i = 0; i < n; ++i) {
+        first[i] = last[i] = next[i] = prev[i] = -1;
+        map[i] = -1;
+    }
+
+    /* Prevent malformed/adoption-corrupted edges from causing cycles. */
+    for (int i = 1; i < n; ++i) {
+        int p = pb->v[i]->parent;
+        int steps = 0, q = p;
+        while (q >= 0 && q < n && steps++ <= n) {
+            if (q == i || steps > n) { p = pb->body >= 0 && pb->body < n ? pb->body : 0; break; }
+            q = pb->v[q]->parent;
+        }
+        if (p < 0 || p >= n || p == i) p = pb->body >= 0 && pb->body < n && i != pb->body ? pb->body : 0;
+        pb->v[i]->parent = p;
+    }
+    pb->v[0]->parent = -1;
+
+    for (int i = 1; i < n; ++i) {
+        int p = pb->v[i]->parent;
+        if (last[p] < 0) first[p] = i;
+        else { next[last[p]] = i; prev[i] = last[p]; }
+        last[p] = i;
+    }
+
+    /* Insert foster-parented children before the table they belong beside. */
+    for (int i = 1; i < n; ++i) {
+        int target = pb->v[i]->html_before;
+        int parent = pb->v[i]->parent;
+        if (target < 0 || target >= n || target == i || pb->v[target]->parent != parent) continue;
+        int before_prev = prev[i], after_next = next[i];
+        if (before_prev >= 0) next[before_prev] = after_next; else first[parent] = after_next;
+        if (after_next >= 0) prev[after_next] = before_prev; else last[parent] = before_prev;
+        int target_prev = prev[target];
+        prev[i] = target_prev; next[i] = target;
+        prev[target] = i;
+        if (target_prev >= 0) next[target_prev] = i; else first[parent] = i;
+        if (last[parent] < 0) last[parent] = i;
+    }
+
+    int used = 0, top = 0;
+    walk[top++] = 0;
+    while (top > 0 && used < n) {
+        int id = walk[--top];
+        if (id < 0 || id >= n || map[id] == -2) continue;
+        map[id] = -2; ordered[used++] = pb->v[id];
+        for (int child = last[id]; child >= 0; child = prev[child]) {
+            if (top < n) walk[top++] = child;
+        }
+    }
+    /* A disconnected node should never happen; keep it in the returned list. */
+    for (int i = 0; i < n && used < n; ++i) if (map[i] != -2) ordered[used++] = pb->v[i];
+    for (int i = 0; i < n; ++i) map[pb->v[i]->idx] = -1;
+    for (int i = 0; i < n; ++i) map[ordered[i]->idx] = i;
+
+    for (int i = 0; i < n; ++i) {
+        DOMNode* node = ordered[i];
+        int old_parent = node->parent;
+        node->idx = i;
+        node->parent = old_parent >= 0 && old_parent < n ? map[old_parent] : -1;
+        node->subtree_end = i;
+        node->html_before = -1;
+        node->next = i + 1 < n ? ordered[i + 1] : NULL;
+    }
+    for (int i = n - 1; i > 0; --i) {
+        int p = ordered[i]->parent;
+        if (p >= 0 && p < n && ordered[i]->subtree_end > ordered[p]->subtree_end)
+            ordered[p]->subtree_end = ordered[i]->subtree_end;
+    }
+    for (int i = 0; i < g_bundle.nscripts; ++i) {
+        int old = g_bundle.scripts[i].node_idx;
+        if (old >= 0 && old < n) g_bundle.scripts[i].node_idx = map[old];
+    }
+
+    free(pb->v); pb->v = ordered; pb->cap = n;
+    free(first); free(last); free(next); free(prev); free(map); free(walk);
+    return 1;
+}
+
 DOMNode* html_build(const char* html, const char* base_url, SheetList* sheets) {
     PB pb; memset(&pb, 0, sizeof pb);
     pb.sheets = sheets; pb.head = pb.body = -1; pb.mode_head = 1;
@@ -876,9 +1404,11 @@ DOMNode* html_build(const char* html, const char* base_url, SheetList* sheets) {
     }
     ensure_body(&pb);
 
-    /* связываем список, считаем subtree_end и выбираем responsive-кандидаты до предзагрузки. */
-    for (int i = 0; i + 1 < pb.n; i++) pb.v[i]->next = pb.v[i + 1];
-    for (int i = pb.n - 1; i > 0; i--) { int par = pb.v[i]->parent; if (par >= 0 && pb.v[i]->subtree_end > pb.v[par]->subtree_end) pb.v[par]->subtree_end = pb.v[i]->subtree_end; }
+    /* Flatten only after tree repair: formatting reconstruction and foster parenting can reparent nodes. */
+    if (!flatten_html_tree(&pb)) {
+        for (int i = 0; i + 1 < pb.n; i++) pb.v[i]->next = pb.v[i + 1];
+        if (pb.n) pb.v[pb.n - 1]->next = NULL;
+    }
     select_responsive_images(&pb);
     DOMNode* head = pb.v[0];
     free(pb.v);
@@ -887,18 +1417,26 @@ DOMNode* html_build(const char* html, const char* base_url, SheetList* sheets) {
 
 /* URL текущего документа — для проверок безопасности ресурсов (смешанное содержимое). Выставляется при разборе (процесс загрузки),
    при каскаде стилей и при создании JS-страницы (основной процесс). */
-static char g_doc_url[1100];
-void webpage_set_doc_url(const char* u) { snprintf(g_doc_url, sizeof g_doc_url, "%s", u ? u : ""); }
+static char g_doc_url[8192];
+void webpage_set_doc_url(const char* u) {
+    /* Let NAL canonicalize HSTS first; mirror the effective value, never a truncated input. */
+    nal_set_document_url(u ? u : "");
+    const char* effective = nal_current_document_url();
+    if (!effective) effective = "";
+    size_t n = strlen(effective);
+    if (n >= sizeof g_doc_url) g_doc_url[0] = 0;
+    else memcpy(g_doc_url, effective, n + 1);
+}
 int webpage_mixed_blocked(const char* url) {
     if (!nal_mixed_content_blocked(g_doc_url, url)) return 0;
     gal_log("WARN", "Mixed Content: заблокирован небезопасный ресурс %s на странице %s", url, g_doc_url); return 1;
 }
 
 /* Текст ресурса: http(s) через NAL, иначе локальный файл. */
-char* webpage_fetch_text(const char* url) {
+char* webpage_fetch_text_kind(const char* url, int resource_kind) {
     if (!url) return NULL;
     if (webpage_mixed_blocked(url)) return NULL;
-    if (ci_prefix(url, "http://") || ci_prefix(url, "https://")) return nal_http_get(url);
+    if (ci_prefix(url, "http://") || ci_prefix(url, "https://")) return nal_http_get_kind(url, resource_kind);
     const char* path = ci_prefix(url, "file://") ? url + 7 : url;
     FILE* f = fopen(path, "rb"); if (!f) return NULL;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
@@ -906,6 +1444,7 @@ char* webpage_fetch_text(const char* url) {
     char* b = malloc((size_t)n + 1); if (!b) { fclose(f); return NULL; }
     size_t got = fread(b, 1, (size_t)n, f); b[got] = 0; fclose(f); return b;
 }
+char* webpage_fetch_text(const char* url) { return webpage_fetch_text_kind(url, NAL_RESOURCE_OTHER); }
 
 PageBundle* webpage_bundle_take(void) {
     PageBundle* b = malloc(sizeof *b); if (!b) return NULL;
@@ -926,7 +1465,7 @@ int webpage_bundle_prefetch_css(void) {
     for (int i = 0; i < g_bundle.nsheets && budget > 0; i++) {
         SheetSrc* s = &g_bundle.sheets[i];
         if (!s->css && s->href && !strncmp(s->href, "http", 4) && !webpage_mixed_blocked(s->href)) {
-            s->css = nal_http_get(s->href);
+            s->css = nal_http_get_kind(s->href, NAL_RESOURCE_STYLE);
             budget--; if (s->css) got++;
         }
     }
@@ -936,7 +1475,7 @@ int webpage_bundle_prefetch_css(void) {
 void webpage_bundle_free(PageBundle* b) {
     if (!b) return;
     for (int i = 0; i < b->nsheets; i++) { free(b->sheets[i].css); free(b->sheets[i].href); }
-    for (int i = 0; i < b->nscripts; i++) { free(b->scripts[i].text); free(b->scripts[i].url); }
+    for (int i = 0; i < b->nscripts; i++) { free(b->scripts[i].text); free(b->scripts[i].url); free(b->scripts[i].nonce); }
     free(b->sheets); free(b->scripts); free(b);
 }
 
@@ -945,21 +1484,21 @@ static char* rd_str(FILE* f) { uint32_t n; if (fread(&n, 4, 1, f) != 1 || n == 0
 
 int webpage_bundle_write(const char* path) {
     FILE* f = fopen(path, "wb"); if (!f) return 0;
-    fwrite("MLB1", 1, 4, f); wr_str(f, g_bundle.base);
+    fwrite("MLB2", 1, 4, f); wr_str(f, g_bundle.base);
     fwrite(&g_bundle.nsheets, 4, 1, f);
     for (int i = 0; i < g_bundle.nsheets; i++) { SheetSrc* s = &g_bundle.sheets[i]; wr_str(f, s->css); wr_str(f, s->href); wr_str(f, s->media); }
     fwrite(&g_bundle.nscripts, 4, 1, f);
-    for (int i = 0; i < g_bundle.nscripts; i++) { ScriptSrc* s = &g_bundle.scripts[i]; wr_str(f, s->text); wr_str(f, s->url); uint8_t fl[3] = {s->module, s->async_, s->defer_}; fwrite(fl, 1, 3, f); fwrite(&s->node_idx, 4, 1, f); }
+    for (int i = 0; i < g_bundle.nscripts; i++) { ScriptSrc* s = &g_bundle.scripts[i]; wr_str(f, s->text); wr_str(f, s->url); wr_str(f, s->nonce); uint8_t fl[3] = {s->module, s->async_, s->defer_}; fwrite(fl, 1, 3, f); fwrite(&s->node_idx, 4, 1, f); }
     fclose(f); return 1;
 }
 
 PageBundle* webpage_bundle_read(const char* path) {
     FILE* f = fopen(path, "rb"); if (!f) return NULL;
-    char m[4]; PageBundle* b = calloc(1, sizeof *b); int ok = b && fread(m, 1, 4, f) == 4 && !memcmp(m, "MLB1", 4);
+    char m[4]; PageBundle* b = calloc(1, sizeof *b); int ok = b && fread(m, 1, 4, f) == 4 && (!memcmp(m, "MLB1", 4) || !memcmp(m, "MLB2", 4)); int v2 = ok && !memcmp(m, "MLB2", 4);
     if (ok) { char* base = rd_str(f); if (base) { snprintf(b->base, sizeof b->base, "%s", base); free(base); } ok = fread(&b->nsheets, 4, 1, f) == 1 && b->nsheets >= 0 && b->nsheets < 1000; }
     if (ok) { b->sheets = calloc((size_t)b->nsheets + 1, sizeof(SheetSrc)); for (int i = 0; ok && i < b->nsheets; i++) { b->sheets[i].css = rd_str(f); b->sheets[i].href = rd_str(f); char* md = rd_str(f); if (md) { snprintf(b->sheets[i].media, sizeof b->sheets[i].media, "%s", md); free(md); } } }
     if (ok) ok = fread(&b->nscripts, 4, 1, f) == 1 && b->nscripts >= 0 && b->nscripts < 1000;
-    if (ok) { b->scripts = calloc((size_t)b->nscripts + 1, sizeof(ScriptSrc)); for (int i = 0; ok && i < b->nscripts; i++) { ScriptSrc* s = &b->scripts[i]; s->text = rd_str(f); s->url = rd_str(f); uint8_t fl[3]; ok = fread(fl, 1, 3, f) == 3 && fread(&s->node_idx, 4, 1, f) == 1; if (ok) { s->module = fl[0]; s->async_ = fl[1]; s->defer_ = fl[2]; } } }
+    if (ok) { b->scripts = calloc((size_t)b->nscripts + 1, sizeof(ScriptSrc)); for (int i = 0; ok && i < b->nscripts; i++) { ScriptSrc* s = &b->scripts[i]; s->text = rd_str(f); s->url = rd_str(f); if (v2) s->nonce = rd_str(f); uint8_t fl[3]; ok = fread(fl, 1, 3, f) == 3 && fread(&s->node_idx, 4, 1, f) == 1; if (ok) { s->module = fl[0]; s->async_ = fl[1]; s->defer_ = fl[2]; } } }
     fclose(f); if (!ok) { webpage_bundle_free(b); return NULL; } return b;
 }
 
@@ -974,7 +1513,7 @@ DOMNode* parse_document(const char* html, const char* base_url) {
         int fetched = 0;
         for (int i = 0; i < g_bundle.nscripts; i++) {
             ScriptSrc* sc = &g_bundle.scripts[i];
-            if (!sc->text && sc->url && fetched < 24) { fetched++; sc->text = webpage_fetch_text(sc->url); if (sc->text && strlen(sc->text) > 4u * 1024 * 1024) { free(sc->text); sc->text = NULL; } }
+            if (!sc->text && sc->url && fetched < 24) { fetched++; sc->text = webpage_fetch_text_kind(sc->url, NAL_RESOURCE_SCRIPT); if (sc->text && strlen(sc->text) > 4u * 1024 * 1024) { free(sc->text); sc->text = NULL; } }
         }
         style_apply(head, &sheets, base_url);
         webpage_prefetch_images(head);

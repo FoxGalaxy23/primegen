@@ -1,3 +1,3 @@
 MOD_NAME := webpage
-MOD_SRCS += $(MOD_PATH)/html.c $(MOD_PATH)/css.c $(MOD_PATH)/style.c $(MOD_PATH)/images.c $(MOD_PATH)/svg.c $(MOD_PATH)/layout2.c $(MOD_PATH)/paint.c $(MOD_PATH)/fx.c $(MOD_PATH)/anim.c $(MOD_PATH)/js.c $(MOD_PATH)/js_prelude.c $(MOD_PATH)/ws.c $(MOD_PATH)/worker.c
+MOD_SRCS += $(MOD_PATH)/html.c $(MOD_PATH)/url.c $(MOD_PATH)/css.c $(MOD_PATH)/style.c $(MOD_PATH)/images.c $(MOD_PATH)/svg.c $(MOD_PATH)/layout2.c $(MOD_PATH)/paint.c $(MOD_PATH)/fx.c $(MOD_PATH)/anim.c $(MOD_PATH)/js.c $(MOD_PATH)/js_prelude.c $(MOD_PATH)/ws.c $(MOD_PATH)/worker.c $(MOD_PATH)/webrtc_backend.c $(MOD_PATH)/webrtc_stun.c $(MOD_PATH)/webrtc_ice.c $(MOD_PATH)/webrtc_ice_agent.c $(MOD_PATH)/webrtc_turn.c $(MOD_PATH)/webrtc_dtls.c $(MOD_PATH)/webrtc_sctp.c $(MOD_PATH)/webrtc_datachannel.c $(MOD_PATH)/media_backend.c $(MOD_PATH)/media_byte_queue.c $(MOD_PATH)/webgl_backend.c $(MOD_PATH)/wasm_binary.c $(MOD_PATH)/wasm_runtime.c $(MOD_PATH)/wasm.c
 MOD_CFLAGS += -DSVG_WITH_TTF

@@ -1,5 +1,7 @@
 #include "gal.h"
 #include <windows.h>
+#include <shellapi.h>
+#include <imm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +25,10 @@ static int last_mouse_y = 0;
 
 static GAL_Event pending_event;
 static int has_pending_event = 0;
+static GAL_Event drop_queue[32]; static int drop_head=0, drop_count=0;
+static void queue_drop(const char* path,int x,int y){if(!path||!path[0]||drop_count>=(int)(sizeof drop_queue/sizeof drop_queue[0]))return;GAL_Event*e=&drop_queue[(drop_head+drop_count)%(int)(sizeof drop_queue/sizeof drop_queue[0])];memset(e,0,sizeof *e);e->type=GAL_EVENT_FILE_DROP;e->mouse_x=x;e->mouse_y=y;snprintf(e->file_path,sizeof e->file_path,"%s",path);drop_count++;}
+static int pop_drop(GAL_Event*e){if(!drop_count)return 0;*e=drop_queue[drop_head];drop_head=(drop_head+1)%(int)(sizeof drop_queue/sizeof drop_queue[0]);drop_count--;return 1;}
+static int ime_to_utf8(HIMC imc,DWORD flag,char*out,size_t cap){if(!out||cap<2)return 0;LONG bytes=ImmGetCompositionStringW(imc,flag,NULL,0);if(bytes<=0||bytes>65536)return 0;WCHAR*w=malloc((size_t)bytes+sizeof(WCHAR));if(!w)return 0;LONG got=ImmGetCompositionStringW(imc,flag,w,(DWORD)bytes);if(got<0){free(w);return 0;}int n=WideCharToMultiByte(CP_UTF8,0,w,got/(LONG)sizeof(WCHAR),out,(int)cap-1,NULL,NULL);free(w);if(n<=0)return 0;out[n]=0;return n;}
 
 void gal_log(const char* level, const char* format, ...) {
 #ifdef HAVE_LOGGER
@@ -42,6 +48,7 @@ void gal_log(const char* level, const char* format, ...) {
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     GAL_Event ev;
+    memset(&ev, 0, sizeof ev);
     ev.type = GAL_EVENT_NONE;
     ev.mouse_x = LOWORD(lParam);
     ev.mouse_y = HIWORD(lParam);
@@ -53,6 +60,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     ev.key_code = 0;
 
     switch (message) {
+        case WM_DROPFILES: {
+            HDROP h=(HDROP)wParam; POINT pt={0,0}; DragQueryPoint(h,&pt); UINT n=DragQueryFileA(h,0xFFFFFFFF,NULL,0); if(n>32)n=32;
+            for(UINT i=0;i<n;i++){char path[1024];UINT got=DragQueryFileA(h,i,path,sizeof path);if(got&&got<sizeof path)queue_drop(path,pt.x,pt.y);}
+            DragFinish(h); if(pop_drop(&pending_event))has_pending_event=1;break;
+        }
+        case WM_IME_STARTCOMPOSITION:
+            ev.type=GAL_EVENT_COMPOSITION;ev.composition_type=0;pending_event=ev;has_pending_event=1;break;
+        case WM_IME_COMPOSITION: {
+            HIMC imc=ImmGetContext(hWnd);if(imc){
+                if(lParam&GCS_RESULTSTR){ev.type=GAL_EVENT_COMPOSITION;ev.composition_type=2;ev.text_len=ime_to_utf8(imc,GCS_RESULTSTR,ev.text,sizeof ev.text);pending_event=ev;has_pending_event=1;}
+                else if(lParam&GCS_COMPSTR){ev.type=GAL_EVENT_COMPOSITION;ev.composition_type=1;ev.text_len=ime_to_utf8(imc,GCS_COMPSTR,ev.text,sizeof ev.text);pending_event=ev;has_pending_event=1;}
+                ImmReleaseContext(hWnd,imc);
+            }break;
+        }
+        case WM_IME_ENDCOMPOSITION:
+            ev.type=GAL_EVENT_COMPOSITION;ev.composition_type=2;pending_event=ev;has_pending_event=1;break;
         case WM_DESTROY:
             PostQuitMessage(0);
             pending_event.type = GAL_EVENT_QUIT;
@@ -112,6 +135,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         case WM_CHAR:
             ev.type = GAL_EVENT_KEY_PRESS;
+            ev.modifiers = 0;
+            if (GetKeyState(VK_CONTROL) & 0x8000) ev.modifiers |= GAL_MOD_CTRL;
+            if (GetKeyState(VK_SHIFT) & 0x8000) ev.modifiers |= GAL_MOD_SHIFT;
+            if (GetKeyState(VK_MENU) & 0x8000) ev.modifiers |= GAL_MOD_ALT;
+            if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) ev.modifiers |= GAL_MOD_SUPER;
             ev.key_char = (char)wParam;
             ev.text[0] = (char)wParam;
             ev.text[1] = '\0';
@@ -124,6 +152,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // For special keys like arrows
             if (wParam >= VK_LEFT && wParam <= VK_DOWN) {
                 ev.type = GAL_EVENT_KEY_PRESS;
+                ev.modifiers = 0;
+                if (GetKeyState(VK_CONTROL) & 0x8000) ev.modifiers |= GAL_MOD_CTRL;
+                if (GetKeyState(VK_SHIFT) & 0x8000) ev.modifiers |= GAL_MOD_SHIFT;
+                if (GetKeyState(VK_MENU) & 0x8000) ev.modifiers |= GAL_MOD_ALT;
                 ev.key_char = 0;
                 // Map Win32 virtual keys to X11-like codes used in main.c
                 // VK_LEFT (25), VK_UP (26), VK_RIGHT (27), VK_DOWN (28)
@@ -134,14 +166,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 else if (wParam == VK_DOWN) ev.key_code = 0xFF54;
                 pending_event = ev;
                 has_pending_event = 1;
+            } else if (wParam >= VK_F1 && wParam <= VK_F12) {
+                ev.type = GAL_EVENT_KEY_PRESS;
+                ev.modifiers = 0;
+                if (GetKeyState(VK_CONTROL) & 0x8000) ev.modifiers |= GAL_MOD_CTRL;
+                if (GetKeyState(VK_SHIFT) & 0x8000) ev.modifiers |= GAL_MOD_SHIFT;
+                if (GetKeyState(VK_MENU) & 0x8000) ev.modifiers |= GAL_MOD_ALT;
+                /* Normalize function keys to X11 keysyms shared by the UI. */
+                ev.key_code = 0xFFBE + (int)(wParam - VK_F1);
+                ev.key_char = 0;
+                pending_event = ev;
+                has_pending_event = 1;
             } else if (wParam == VK_BACK) {
                 ev.type = GAL_EVENT_KEY_PRESS;
+                ev.modifiers = 0;
+                if (GetKeyState(VK_CONTROL) & 0x8000) ev.modifiers |= GAL_MOD_CTRL;
+                if (GetKeyState(VK_SHIFT) & 0x8000) ev.modifiers |= GAL_MOD_SHIFT;
+                if (GetKeyState(VK_MENU) & 0x8000) ev.modifiers |= GAL_MOD_ALT;
                 ev.key_code = 0xFF08; // X11 BackSpace
                 ev.key_char = '\b';
                 pending_event = ev;
                 has_pending_event = 1;
             } else if (wParam == VK_RETURN) {
                 ev.type = GAL_EVENT_KEY_PRESS;
+                ev.modifiers = 0;
+                if (GetKeyState(VK_CONTROL) & 0x8000) ev.modifiers |= GAL_MOD_CTRL;
+                if (GetKeyState(VK_SHIFT) & 0x8000) ev.modifiers |= GAL_MOD_SHIFT;
+                if (GetKeyState(VK_MENU) & 0x8000) ev.modifiers |= GAL_MOD_ALT;
                 ev.key_code = 0xFF0D; // X11 Return
                 ev.key_char = '\r';
                 pending_event = ev;
@@ -181,6 +232,7 @@ int gal_init(void) {
 
     if (!hwnd) return 0;
 
+    DragAcceptFiles(hwnd, TRUE);
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
@@ -221,6 +273,7 @@ void gal_resize(int width, int height) {
 }
 
 GAL_Event gal_poll_event(void) {
+    GAL_Event ev;if(pop_drop(&ev))return ev;
     MSG msg;
     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
@@ -233,12 +286,12 @@ GAL_Event gal_poll_event(void) {
         return pending_event;
     }
 
-    GAL_Event ev;
-    ev.type = GAL_EVENT_NONE;
+    memset(&ev,0,sizeof ev);ev.type = GAL_EVENT_NONE;
     return ev;
 }
 
 GAL_Event gal_wait_event(void) {
+    GAL_Event queued;if(pop_drop(&queued))return queued;
     MSG msg;
     has_pending_event = 0;
     while (!has_pending_event && GetMessage(&msg, NULL, 0, 0)) {

@@ -64,6 +64,7 @@ typedef struct DOMNode {
     char text[512];
     char href[512]; // Будем сохранять ссылки для кликов
     char src[512];  // Путь к изображению для <img>
+    char media_frame_key[48]; /* синтетический URL декодированного видеокадра */
     char srcset[1024]; /* исходный набор кандидатов для <img>/<source> */
     char sizes[256];  /* slot size для responsive images */
     int hit_x, hit_y, hit_w, hit_h; // Координаты на экране для детекции клика
@@ -93,6 +94,7 @@ typedef struct DOMNode {
     /* ── Движок webpage (parse_document): дерево + вычисленный стиль ── */
     uint8_t v2;                     /* 1 = узел создан parse_document */
     uint8_t checked, disabled, readonly, selected, multiple;
+    uint8_t file_selected;          /* set only by the native file picker; never trust a markup-supplied path */
     char    tag[16];                /* имя тега в нижнем регистре */
     char    input_type[16];
     char    placeholder[96];
@@ -101,10 +103,11 @@ typedef struct DOMNode {
     char    attrs[384];             /* "имя\1значение\2..." — для селекторов [attr] */
     char    pres[256];              /* CSS из презентационных атрибутов (bgcolor, align ...) */
     int     idx, parent, subtree_end;   /* позиция в списке, родитель, последний потомок */
+    int     html_before;                /* internal HTML tree-builder hint: insert before sibling index */
     int     attr_w, attr_h, colspan, rowspan, size_attr;
     void*   aux;                    /* движок JS: id узла + 1 (не сериализуется осмысленно) */
     NodeStyle st;
-    PseudoBox* pb[2];               /* ::before / ::after (malloc, владелец — узел; см. dom_free_pseudo) */
+    PseudoBox* pb[3];               /* ::before / ::after / ::marker (malloc, владелец — узел) */
 } DOMNode;
 
 DOMNode* parse_html(const char* html);

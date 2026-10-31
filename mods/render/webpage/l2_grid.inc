@@ -200,18 +200,34 @@ static int g_overlap(int r0, int c0, int rs, int cs) { for (int r = r0; r < r0 +
 static float layout_grid(Box* b, float cx, float cy, float cw, float ch, LS* ls) {
     const NodeStyle* st = b->st; int n = 0;
     for (Box* c = b->first; c; c = c->next) n++;
-    Box** bx = la(sizeof(Box*) * (size_t)(n ? n : 1)); int k = 0;
+    Box** bx = la(sizeof(Box*) * (size_t)(n ? n : 1));
+    if (!bx) return 0;
+    int k = 0;
     for (Box* c = b->first; c; c = c->next) {
         if (c->oof) { register_abs(ls, c, cx, cy); continue; }
         if (c->kind == K_BR || c->kind == K_TEXT) continue;
         bx[k++] = c;
     }
-    if (!k) return 0;
+    if (k <= 0) return 0; /* Не допускаем отрицательный размер после повреждённого/переполненного счётчика. */
+    size_t item_count = (size_t)k;
+    if (item_count > SIZE_MAX / sizeof(GI)) return 0;
     int flow_col = st->grid_flow & 1, dense = (st->grid_flow & 2) != 0; float gapc = st->gap_c, gapr = st->gap_r;
     /* ── явные треки ── */
     GT col_t[GMAXT], row_t[GMAXT]; GLine col_l[GMAXT + 1], row_l[GMAXT + 1]; memset(col_l, 0, sizeof col_l); memset(row_l, 0, sizeof row_l);
-    int ncol_e = st->grid_cols[0] ? grid_parse(st->grid_cols, cw, gapc, col_t, col_l, GMAXT) : 0;
-    int nrow_e = st->grid_rows[0] ? grid_parse(st->grid_rows, ch >= 0 ? ch : -1, gapr, row_t, row_l, GMAXT) : 0;
+    int subgrid_cols = st->grid_subgrid_cols && b->grid_col_size && b->grid_col_count > 0;
+    int subgrid_rows = st->grid_subgrid_rows && b->grid_row_size && b->grid_row_count > 0;
+    int ncol_e = 0;
+    if (subgrid_cols) {
+        ncol_e = b->grid_col_count > GMAXT ? GMAXT : b->grid_col_count;
+        gapc = b->grid_col_gap;
+        for (int t=0; t<ncol_e; t++) { gt_defaults(&col_t[t]); col_t[t].mn_kind=0; col_t[t].mx_kind=0; col_t[t].mn=col_t[t].mx=b->grid_col_size[t]; }
+    } else ncol_e = st->grid_cols[0] ? grid_parse(st->grid_cols, cw, gapc, col_t, col_l, GMAXT) : 0;
+    int nrow_e = subgrid_rows ? (b->grid_row_count > GMAXT ? GMAXT : b->grid_row_count)
+        : (st->grid_rows[0] ? grid_parse(st->grid_rows, ch >= 0 ? ch : -1, gapr, row_t, row_l, GMAXT) : 0);
+    if (subgrid_rows) {
+        gapr = b->grid_row_gap;
+        for (int t=0; t<nrow_e; t++) { gt_defaults(&row_t[t]); row_t[t].mn_kind=0; row_t[t].mx_kind=0; row_t[t].mn=row_t[t].mx=b->grid_row_size[t]; }
+    }
     /* области → неявные линии name-start / name-end */
     static char atoks[16][24][24]; int anr = 0, anc = 0;
     if (st->grid_areas[0]) {
@@ -233,7 +249,9 @@ static float layout_grid(Box* b, float cx, float cy, float cw, float ch, LS* ls)
     GT auto_c[8], auto_r[8]; GLine dummy[9]; memset(dummy, 0, sizeof dummy);
     int nac = st->grid_auto_c[0] ? grid_parse(st->grid_auto_c, cw, gapc, auto_c, dummy, 8) : 0, nar = st->grid_auto_r[0] ? grid_parse(st->grid_auto_r, ch >= 0 ? ch : -1, gapr, auto_r, dummy, 8) : 0;
     /* ── размещение ── */
-    GI* gi = la(sizeof(GI) * (size_t)k); memset(g_occ, 0, sizeof g_occ);
+    GI* gi = la(sizeof(GI) * item_count);
+    if (!gi) return 0;
+    memset(g_occ, 0, sizeof g_occ);
     for (int i = 0; i < k; i++) {
         const NodeStyle* s = bx[i]->st; GI* g = &gi[i]; memset(g, 0, sizeof *g); g->b = bx[i];
         char rs_[24], re_[24], cs_[24], ce_[24]; snprintf(rs_, sizeof rs_, "%s", s->grid_row_s); snprintf(re_, sizeof re_, "%s", s->grid_row_e); snprintf(cs_, sizeof cs_, "%s", s->grid_col_s); snprintf(ce_, sizeof ce_, "%s", s->grid_col_e);
@@ -247,7 +265,9 @@ static float layout_grid(Box* b, float cx, float cy, float cw, float ch, LS* ls)
     }
     int min_n = flow_col ? nrow_e : ncol_e; if (min_n < 1) min_n = 1;
     for (int i = 0; i < k; i++) { int ms = flow_col ? gi[i].rs : gi[i].cs; if (ms > min_n) min_n = ms; }
-    uint8_t* done = la((size_t)k); memset(done, 0, (size_t)k);
+    uint8_t* done = la(item_count);
+    if (!done) return 0;
+    memset(done, 0, item_count);
     for (int i = 0; i < k; i++) if (gi[i].cdef && gi[i].rdef) { g_mark(&gi[i]); done[i] = 1; }
     { int* rowcur = la(sizeof(int) * GMAXT); memset(rowcur, 0, sizeof(int) * GMAXT);                      /* «главная» ось определена, побочная — авто */
       for (int i = 0; i < k; i++) { GI* g = &gi[i]; if (done[i]) continue; if (!(flow_col ? g->cdef : g->rdef)) continue;
@@ -284,6 +304,9 @@ static float layout_grid(Box* b, float cx, float cy, float cw, float ch, LS* ls)
     float colx[GMAXT + 1]; colx[0] = cx + clead; for (int t = 0; t < ncol; t++) colx[t + 1] = colx[t] + col_t[t].size + (col_t[t].collapse ? 0 : gapc + cgap_add);
     /* ── элементы: раскладка по итоговой ширине, замер высоты ── */
     float y0 = cy;
+    /* Keep a rollback point: row-subgrid children must be relaid after the
+       parent has resolved intrinsic/auto/fr track sizes, not only fixed tracks. */
+    int child_cmd_mark = l2_dn, child_group_mark = g_sgn;
     for (int i = 0; i < k; i++) {
         GI* g = &gi[i]; Box* c = g->b; edges(c, cw); int c1 = g->c + g->cs; if (c1 > ncol) c1 = ncol;
         float cellw = colx[c1] - colx[g->c] - (col_t[c1 - 1].collapse ? 0 : gapc + cgap_add); if (cellw < 0) cellw = 0;
@@ -292,6 +315,20 @@ static float layout_grid(Box* b, float cx, float cy, float cw, float ch, LS* ls)
         float fw = cellw - c->fml - c->fmr; if (fw < 0) fw = 0; float forced = fw;
         if (c->st->width.set || c->repl) forced = -1;
         else if (ja != AI_STRETCH || c->mla || c->mra) { float mx = intr(c, 1), mn = intr(c, 0); float w = mx < fw ? mx : fw; if (w < mn) w = mn; forced = w; }
+        if (c->st->grid_subgrid_cols && g->cs > 0) {
+            int span=g->cs; if (span>GMAXT) span=GMAXT;
+            c->grid_col_size=la(sizeof(float)*(size_t)span);
+            if (c->grid_col_size) { for (int t=0;t<span;t++) c->grid_col_size[t]=col_t[g->c+t].size; c->grid_col_count=span; c->grid_col_gap=gapc; c->grid_col_origin=g->c; }
+        }
+        if (c->st->grid_subgrid_rows && g->rs > 0 && g->r >= 0 && g->r + g->rs <= nrow) {
+            int span=g->rs; if (span>GMAXT) span=GMAXT;
+            int definite=1;
+            for(int t=0;t<span;t++) { GT* rt=&row_t[g->r+t]; if(rt->mn_kind!=0 || rt->mx_kind!=0 || fabsf(rt->mn-rt->mx)>0.01f) { definite=0; break; } }
+            if(definite) {
+                c->grid_row_size=la(sizeof(float)*(size_t)span);
+                if(c->grid_row_size) { for(int t=0;t<span;t++) c->grid_row_size[t]=row_t[g->r+t].mn; c->grid_row_count=span; c->grid_row_gap=gapr; c->grid_row_origin=g->r; }
+            }
+        }
         g->s0 = l2_dn; lbb(c, colx[g->c], y0 + c->mt, cw, forced, -1, -1, ls); g->s1 = l2_dn; c->mforce = 0;
         float dx = 0, free_w = cellw - c->w - c->fml - c->fmr;
         if (free_w > 0) { if (c->mla && c->mra) dx = free_w / 2; else if (c->mla) dx = free_w; else if (c->mra) dx = 0; else if (ja == AI_CENTER) dx = free_w / 2; else if (ja == AI_END) dx = free_w; }
@@ -304,10 +341,58 @@ static float layout_grid(Box* b, float cx, float cy, float cw, float ch, LS* ls)
     float rowsum = 0; for (int t = 0; t < nrow; t++) rowsum += row_t[t].size;
     float rfree = ch >= 0 ? ch - rowsum - gapr * (nrow - 1) : 0, rgap_add, rlead; grid_align_off(st->align_content, rfree, nrow, &rgap_add, &rlead);
     float rowy[GMAXT + 1]; rowy[0] = cy + rlead; for (int t = 0; t < nrow; t++) rowy[t + 1] = rowy[t] + row_t[t].size + gapr + rgap_add;
+
+    /* A row subgrid shares its parent's resolved tracks, including auto and fr
+       tracks. The first pass above measured child intrinsic sizes independently;
+       now that parent tracks are final, discard those commands and lay the grid
+       items out once more with the inherited row sizes. This is intentionally a
+       bounded two-pass algorithm: it does not claim full cyclic CSS Grid sizing. */
+    int children_at_row_positions = 0;
+    for (int i = 0; i < k; i++) {
+        GI* g = &gi[i]; Box* c = g->b;
+        if (c->st->grid_subgrid_rows && g->rs > 0 && g->r >= 0 && g->r + g->rs <= nrow) {
+            children_at_row_positions = 1; break;
+        }
+    }
+    if (children_at_row_positions) {
+        l2_dn = child_cmd_mark; grp_trunc(child_group_mark); b->fb = -1e9f;
+        for (int i = 0; i < k; i++) {
+            GI* g = &gi[i]; Box* c = g->b; edges(c, cw);
+            int c1 = g->c + g->cs; if (c1 > ncol) c1 = ncol;
+            float cellw = colx[c1] - colx[g->c] - (col_t[c1 - 1].collapse ? 0 : gapc + cgap_add); if (cellw < 0) cellw = 0;
+            int ja = c->st->justify_self != AI_AUTO ? c->st->justify_self : st->justify_items;
+            c->mforce = 1; c->fml = c->mla ? 0 : c->ml; c->fmr = c->mra ? 0 : c->mr;
+            float fw = cellw - c->fml - c->fmr; if (fw < 0) fw = 0; float forced = fw;
+            if (c->st->width.set || c->repl) forced = -1;
+            else if (ja != AI_STRETCH || c->mla || c->mra) { float mx = intr(c, 1), mn = intr(c, 0); float w = mx < fw ? mx : fw; if (w < mn) w = mn; forced = w; }
+            if (c->st->grid_subgrid_cols && g->cs > 0) {
+                int span = g->cs; if (span > GMAXT) span = GMAXT;
+                c->grid_col_size = la(sizeof(float) * (size_t)span);
+                if (c->grid_col_size) { for (int t = 0; t < span; t++) c->grid_col_size[t] = col_t[g->c + t].size; c->grid_col_count = span; c->grid_col_gap = gapc; c->grid_col_origin = g->c; }
+            }
+            if (c->st->grid_subgrid_rows && g->rs > 0 && g->r >= 0 && g->r + g->rs <= nrow) {
+                int span = g->rs; if (span > GMAXT) span = GMAXT;
+                c->grid_row_size = la(sizeof(float) * (size_t)span);
+                if (c->grid_row_size) {
+                    for (int t = 0; t < span; t++) c->grid_row_size[t] = row_t[g->r + t].size;
+                    c->grid_row_count = span; c->grid_row_gap = gapr; c->grid_row_origin = g->r;
+                }
+            }
+            g->s0 = l2_dn;
+            lbb(c, colx[g->c], rowy[g->r] + c->mt, cw, forced, -1, -1, ls);
+            g->s1 = l2_dn; c->mforce = 0;
+            float free_w = cellw - c->w - c->fml - c->fmr, dx = 0;
+            if (free_w > 0) { if (c->mla && c->mra) dx = free_w / 2; else if (c->mla) dx = free_w; else if (c->mra) dx = 0; else if (ja == AI_CENTER) dx = free_w / 2; else if (ja == AI_END) dx = free_w; }
+            if (dx) shift_box(c, g->s0, g->s1, dx, 0);
+            g->oh = c->mt + c->h + c->mb;
+        }
+    }
+
     for (int i = 0; i < k; i++) {
         GI* g = &gi[i]; Box* c = g->b; int r1 = g->r + g->rs; if (r1 > nrow) r1 = nrow;
         float cell_h = rowy[r1] - rowy[g->r] - gapr - rgap_add; if (cell_h < 0) cell_h = 0;
-        int a = c->st->align_self != AI_AUTO ? c->st->align_self : st->align_items; float dy = rowy[g->r] - y0, oh = g->oh;
+        int a = c->st->align_self != AI_AUTO ? c->st->align_self : st->align_items;
+        float dy = children_at_row_positions ? 0 : rowy[g->r] - y0, oh = g->oh;
         if (a == AI_STRETCH) { if (!c->st->height.set && !c->repl) { float nh = cell_h - c->mt - c->mb; if (nh > c->h) patch_h(c, nh); } }
         else if (a == AI_CENTER) dy += (cell_h - oh) / 2; else if (a == AI_END) dy += cell_h - oh;
         shift_box(c, g->s0, g->s1, 0, dy);

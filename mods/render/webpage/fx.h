@@ -27,6 +27,7 @@ enum {
 
 uint64_t fx_prop_mask(const char* name, size_t n);          /* имя CSS-свойства → биты (all → все; none/неизвестное → 0) */
 float    fx_ease(const FxEase* e, float t);                  /* временная функция: t∈[0,1] → прогресс */
+void     anim_style_apply_mask(NodeStyle* dst, const NodeStyle* a, const NodeStyle* b, uint64_t mask, float t); /* интерполировать выбранные CSS-анимационные свойства */
 int      fx_style_has_fx(const NodeStyle* st);               /* нужен ли слой (проверка по вычисленному стилю) */
 
 
@@ -51,6 +52,7 @@ void     anim_before_node(DOMNode* n);                                      /* �
 typedef uint64_t (*KfBuildFn)(void* ctx, DOMNode* n, const Decl* decls, int nd, NodeStyle* out, float root_fs);
 void     anim_cascade_end(DOMNode** nv, int n, Keyframes* kf, float root_fs, KfBuildFn build, void* ctx);   /* после каскада: запуск transition/animation */
 int      anim_step(DOMNode* head);                                          /* перед раскладкой/отрисовкой: накладывает значения на текущее время; бит 1 — нужна раскладка */
+float    l2_timeline_progress(const DOMNode* n, int timeline, int axis); /* scroll()/view() timeline, normalized to [0,1] */
 int      anim_active(void);                                                 /* 1 — идёт анимация (нужны кадры) */
 void     anim_reset(void);                                                  /* смена документа */
 int      anim_pop_event(DOMNode** node, int* kind, char* name, float* elapsed);   /* очередь transitionend/animationend…: 1 — событие выдано */

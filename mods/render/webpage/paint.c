@@ -4,11 +4,14 @@
 #include "font_manager.h"
 #include "gal.h"
 #include "fx.h"
+#include "../ttf_render/shaping.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <limits.h>
 #include <ctype.h>
+#include <time.h>
 #include <strings.h>
 #ifndef _WIN32
 #include <errno.h>
@@ -23,18 +26,78 @@ extern TTFFont* g_ttf_font;
 static DOMNode* g_head; static DOMNode* g_last_head; static uint64_t g_fp; static int g_lw = -1, g_lh = -1;
 static int g_top, g_sx, g_sy; static char g_url[600];
 static int cl_x0, cl_y0, cl_x1, cl_y1;
+static WebTextPosition g_text_sel_anchor, g_text_sel_focus;
+static int g_text_sel_active;
+static float g_text_sel_preferred_x = NAN;
+static int g_sel_scroll_x, g_sel_scroll_y, g_sel_scroll_seen;
+static DOMNode* g_sel_scroll_head;
+static int text_selection_endpoints_live(DOMNode* head);
+
+/* A bounded renderer-owned viewport snapshot plus optional named-element crops.
+   The compositor implements a CSS-driven subset of the View Transition pseudo-tree:
+   root/group/image-pair/old/new computed styles and opacity/background/transform
+   keyframes. It still is not a complete spec pseudo-element tree/layout engine. */
+static uint32_t* g_vt_snapshot;
+static int g_vt_width, g_vt_height, g_vt_top;
+static DOMNode* g_vt_head;
+static int g_vt_active, g_vt_finished_pending;
+static double g_vt_started_ms, g_vt_last_tick_ms;
+static double g_vt_duration_ms = 240.0;
+/* Named-element shared snapshots are bounded independently from the viewport
+   snapshot. Pixel crops are only captured from the actually visible portion of
+   a named element, and duplicate names are ignored (matching CSS View Transitions). */
+#define VIEW_TRANSITION_MAX_NAMED 24
+#define VIEW_TRANSITION_NAMED_BUDGET (8u * 1024u * 1024u)
+typedef struct {
+    char name[48];
+    int x, y, w, h;                 /* captured viewport crop */
+    int target_x, target_y, target_w, target_h; /* target border-box in document coords */
+    int has_target;
+    uint32_t* pixels;
+    uint32_t* new_pixels;             /* capture from the new page's first clean paint */
+    int new_w, new_h;
+} VTNamedSnapshot;
+static VTNamedSnapshot g_vt_named[VIEW_TRANSITION_MAX_NAMED];
+static int g_vt_named_count, g_vt_named_targets_ready;
+static size_t g_vt_named_bytes;
+#define VIEW_TRANSITION_DURATION_MS 240.0
+
+static double view_transition_now_ms(void) {
+    struct timespec ts;
+#ifdef _WIN32
+    timespec_get(&ts, TIME_UTC);
+#else
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) timespec_get(&ts, TIME_UTC);
+#endif
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 /* ══════════════ примитивы ══════════════ */
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+static int g_blend_mode;
+static inline int blend_channel(int s, int d) {
+    switch (g_blend_mode) {
+        case 1: return s * d / 255;                                  /* multiply */
+        case 2: return 255 - (255 - s) * (255 - d) / 255;            /* screen */
+        case 3: return d < 128 ? (2 * s * d / 255) : 255 - 2 * (255 - s) * (255 - d) / 255;
+        case 4: return s < d ? s : d;
+        case 5: return s > d ? s : d;
+        case 6: return abs(s - d);
+        case 7: return s + d - 2 * s * d / 255;
+        default: return s;
+    }
+}
 static inline void blend(int x, int y, uint32_t rgb, int a) {
     if (a <= 0 || x < cl_x0 || x >= cl_x1 || y < cl_y0 || y >= cl_y1) return;
     uint32_t* p = &back_buffer[(size_t)y * SCREEN_WIDTH + x];
-    if (a >= 255) { *p = rgb & 0xFFFFFF; return; }
     uint32_t d = *p; int ia = 255 - a;
-    *p = ((uint32_t)((((rgb >> 16) & 255) * a + ((d >> 16) & 255) * ia + 127) / 255) << 16) |
-         ((uint32_t)((((rgb >> 8) & 255) * a + ((d >> 8) & 255) * ia + 127) / 255) << 8) |
-          (uint32_t)(((rgb & 255) * a + (d & 255) * ia + 127) / 255);
+    int sr = blend_channel((rgb >> 16) & 255, (d >> 16) & 255);
+    int sg = blend_channel((rgb >> 8) & 255, (d >> 8) & 255);
+    int sb = blend_channel(rgb & 255, d & 255);
+    *p = ((uint32_t)((sr * a + ((d >> 16) & 255) * ia + 127) / 255) << 16) |
+         ((uint32_t)((sg * a + ((d >> 8) & 255) * ia + 127) / 255) << 8) |
+          (uint32_t)((sb * a + (d & 255) * ia + 127) / 255);
 }
 
 static int alpha_of(uint32_t argb, float opacity) { float a = (argb >> 24) * opacity; return a < 0 ? 0 : a > 255 ? 255 : (int)(a + 0.5f); }
@@ -43,6 +106,389 @@ static void fill_rect_i(int x0, int y0, int x1, int y1, uint32_t argb, float opa
     int a = alpha_of(argb, opacity); if (a <= 0) return;
     if (x0 < cl_x0) x0 = cl_x0; if (y0 < cl_y0) y0 = cl_y0; if (x1 > cl_x1) x1 = cl_x1; if (y1 > cl_y1) y1 = cl_y1;
     for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) blend(x, y, argb, a);
+}
+
+static void webpage_view_transition_named_clear(void) {
+    for (int i = 0; i < g_vt_named_count; i++) {
+        free(g_vt_named[i].pixels);
+        free(g_vt_named[i].new_pixels);
+    }
+    memset(g_vt_named, 0, sizeof g_vt_named);
+    g_vt_named_count = g_vt_named_targets_ready = 0;
+    g_vt_named_bytes = 0;
+}
+
+static int webpage_view_transition_name_valid(const char* name) {
+    if (!name || !*name || !strcasecmp(name, "none") || !strcasecmp(name, "auto") ||
+        !strcasecmp(name, "match-element") || !strcasecmp(name, "initial") ||
+        !strcasecmp(name, "inherit") || !strcasecmp(name, "unset") ||
+        !strcasecmp(name, "revert") || !strcasecmp(name, "revert-layer") ||
+        !strcasecmp(name, "default")) return 0;
+    /* The current cascade stores one custom-ident (no CSS escapes yet). */
+    const unsigned char* p = (const unsigned char*)name;
+    if (!(isalpha(*p) || *p == '_' || *p >= 0x80 ||
+          (*p == '-' && (p[1] == '-' || isalpha(p[1]) || p[1] == '_' || p[1] >= 0x80)))) return 0;
+    for (p++; *p; p++)
+        if (!(isalnum(*p) || *p == '_' || *p == '-' || *p >= 0x80)) return 0;
+    return 1;
+}
+
+static void webpage_view_transition_capture_named(DOMNode* head) {
+    typedef struct { DOMNode* node; char name[48]; int count; } SeenName;
+    SeenName seen[VIEW_TRANSITION_MAX_NAMED]; int nseen = 0;
+    if (!head || !l2_rects || l2_nrects <= 0 || !back_buffer) return;
+    /* Gather unique names first; duplicate names must not create ambiguous groups. */
+    for (DOMNode* n = head; n; n = n->next) {
+        const char* name = n->st.view_transition_name;
+        if (!n->v2 || !webpage_view_transition_name_valid(name)) continue;
+        int j = 0; for (; j < nseen; j++) if (!strcmp(seen[j].name, name)) break;
+        if (j < nseen) { seen[j].count++; continue; }
+        if (nseen >= VIEW_TRANSITION_MAX_NAMED) continue;
+        seen[nseen].node = n; snprintf(seen[nseen].name, sizeof seen[nseen].name, "%s", name); seen[nseen].count = 1; nseen++;
+    }
+    for (int i = 0; i < nseen; i++) {
+        DOMNode* n = seen[i].node;
+        if (seen[i].count != 1 || !n || n->idx < 0 || n->idx >= l2_nrects) continue;
+        const float* r = &l2_rects[n->idx * 4];
+        if (!(r[2] > 0.0f && r[3] > 0.0f)) continue;
+        int full_x = (int)floorf(r[0] - g_sx);
+        int full_y = (int)floorf(r[1] - g_sy + g_top);
+        int x0 = full_x, y0 = full_y;
+        int x1 = (int)ceilf(r[0] - g_sx + r[2]);
+        int y1 = (int)ceilf(r[1] - g_sy + g_top + r[3]);
+        if (x0 < 0) x0 = 0;
+        if (y0 < g_top) y0 = g_top;
+        if (x1 > SCREEN_WIDTH) x1 = SCREEN_WIDTH;
+        if (y1 > SCREEN_HEIGHT) y1 = SCREEN_HEIGHT;
+        if (x1 <= x0 || y1 <= y0) continue;
+        int w = x1 - x0, h = y1 - y0;
+        size_t bytes = (size_t)w * (size_t)h * sizeof(uint32_t);
+        if (bytes > VIEW_TRANSITION_NAMED_BUDGET - g_vt_named_bytes) continue;
+        uint32_t* crop = malloc(bytes);
+        if (!crop) continue;
+        for (int y = 0; y < h; y++)
+            memcpy(crop + (size_t)y * (size_t)w,
+                   back_buffer + (size_t)(y0 + y) * (size_t)SCREEN_WIDTH + (size_t)x0,
+                   (size_t)w * sizeof(uint32_t));
+        VTNamedSnapshot* out = &g_vt_named[g_vt_named_count++];
+        memset(out, 0, sizeof *out);
+        snprintf(out->name, sizeof out->name, "%s", seen[i].name);
+        out->x = x0; out->y = y0; out->w = w; out->h = h; out->pixels = crop;
+        out->target_x = x0; out->target_y = y0; out->target_w = w; out->target_h = h;
+        g_vt_named_bytes += bytes;
+    }
+}
+
+void webpage_view_transition_cancel(void) {
+    free(g_vt_snapshot); g_vt_snapshot = NULL;
+    webpage_view_transition_named_clear();
+    g_vt_width = g_vt_height = g_vt_top = 0; g_vt_head = NULL;
+    g_vt_active = 0; g_vt_finished_pending = 0; g_vt_started_ms = g_vt_last_tick_ms = 0.0; g_vt_duration_ms = VIEW_TRANSITION_DURATION_MS;
+}
+
+void webpage_view_transition_capture(DOMNode* head) {
+    /* A first-paint/foreign-document request cannot form a valid old frame. */
+    if (!head || head != g_last_head || !back_buffer || SCREEN_WIDTH <= 0 || SCREEN_HEIGHT <= 0) {
+        webpage_view_transition_cancel();
+        return;
+    }
+    size_t pixels = (size_t)SCREEN_WIDTH * (size_t)SCREEN_HEIGHT;
+    if (pixels > (size_t)128 * 1024 * 1024 / sizeof(uint32_t)) {
+        webpage_view_transition_cancel();
+        return;
+    }
+    size_t bytes = pixels * sizeof(uint32_t);
+    uint32_t* snap = malloc(bytes);
+    if (!snap) { webpage_view_transition_cancel(); return; }
+    memcpy(snap, back_buffer, bytes);
+    free(g_vt_snapshot); g_vt_snapshot = snap;
+    webpage_view_transition_named_clear();
+    g_vt_width = SCREEN_WIDTH; g_vt_height = SCREEN_HEIGHT; g_vt_top = g_top;
+    g_vt_head = head; g_vt_active = 0;
+    g_vt_started_ms = g_vt_last_tick_ms = 0.0; g_vt_duration_ms = VIEW_TRANSITION_DURATION_MS;
+    webpage_view_transition_capture_named(head);
+}
+
+void webpage_view_transition_commit(DOMNode* head) {
+    if (!g_vt_snapshot || !head || head != g_vt_head || head != g_last_head ||
+        g_vt_width != SCREEN_WIDTH || g_vt_height != SCREEN_HEIGHT) {
+        webpage_view_transition_cancel();
+        /* No old-frame snapshot was available (e.g. transition started before
+           the first paint); don't leave JS's finished promise pending forever. */
+        g_vt_finished_pending = 1;
+        return;
+    }
+    g_vt_duration_ms = webpage_view_transition_duration_ms();
+    if (!isfinite(g_vt_duration_ms) || g_vt_duration_ms < 1.0) g_vt_duration_ms = VIEW_TRANSITION_DURATION_MS;
+    if (g_vt_duration_ms > 30000.0) g_vt_duration_ms = 30000.0;
+    g_vt_started_ms = view_transition_now_ms();
+    g_vt_last_tick_ms = 0.0;
+    g_vt_active = 1;
+}
+
+int webpage_view_transition_tick(void) {
+    if (!g_vt_active || !g_vt_snapshot) return 0;
+    double now = view_transition_now_ms();
+    if (g_vt_last_tick_ms > 0.0 && now - g_vt_last_tick_ms < 15.0) return 0;
+    g_vt_last_tick_ms = now;
+    if (now - g_vt_started_ms >= g_vt_duration_ms) {
+        webpage_view_transition_cancel();
+        g_vt_finished_pending = 1;
+        return 1; /* request one final frame containing only the new page */
+    }
+    return 1;
+}
+
+int webpage_view_transition_take_finished(void) {
+    int ready = g_vt_finished_pending;
+    g_vt_finished_pending = 0;
+    return ready;
+}
+
+static void webpage_view_transition_capture_targets(DOMNode* head) {
+    /* Paint workers are forked per frame on POSIX, so recapture the incoming
+       crop on every clean new-page frame instead of relying on child memory to
+       persist into the next render. The inline renderer uses the same path. */
+    for (int i = 0; i < g_vt_named_count; i++) {
+        VTNamedSnapshot* snap = &g_vt_named[i];
+        if (snap->new_pixels) {
+            size_t old_bytes=(size_t)snap->new_w*(size_t)snap->new_h*sizeof(uint32_t);
+            free(snap->new_pixels); snap->new_pixels=NULL; snap->new_w=snap->new_h=0;
+            if (g_vt_named_bytes >= old_bytes) g_vt_named_bytes-=old_bytes; else g_vt_named_bytes=0;
+        }
+        DOMNode* match = NULL; int matches = 0;
+        for (DOMNode* n = head; n; n = n->next) {
+            if (n->v2 && webpage_view_transition_name_valid(n->st.view_transition_name) &&
+                !strcmp(n->st.view_transition_name, snap->name)) { match = n; matches++; if (matches > 1) break; }
+        }
+        snap->has_target=0;
+        if (matches != 1 || !match || !l2_rects || match->idx < 0 || match->idx >= l2_nrects) continue;
+        const float* r = &l2_rects[match->idx * 4];
+        if (!(r[2] > 0.0f && r[3] > 0.0f)) continue;
+        snap->target_x = (int)lrintf(r[0]); snap->target_y = (int)lrintf(r[1]);
+        snap->target_w = (int)lrintf(r[2]); snap->target_h = (int)lrintf(r[3]);
+        if (snap->target_w < 1) snap->target_w = 1;
+        if (snap->target_h < 1) snap->target_h = 1;
+        snap->has_target = 1;
+
+        /* Capture the clean incoming element before the viewport compositor
+           changes the page pixels. Only the visible intersection is stored. */
+        int x0=(int)floorf(r[0]-(float)g_sx), y0=(int)floorf(r[1]-(float)g_sy+(float)g_top);
+        int x1=(int)ceilf(r[0]-(float)g_sx+r[2]), y1=(int)ceilf(r[1]-(float)g_sy+(float)g_top+r[3]);
+        if (x0<0) x0=0; if (y0<g_top) y0=g_top;
+        if (x1>SCREEN_WIDTH) x1=SCREEN_WIDTH; if (y1>SCREEN_HEIGHT) y1=SCREEN_HEIGHT;
+        if (x1<=x0 || y1<=y0) continue;
+        int w=x1-x0,h=y1-y0;
+        if ((size_t)w > SIZE_MAX/(size_t)h/sizeof(uint32_t)) continue;
+        size_t bytes=(size_t)w*(size_t)h*sizeof(uint32_t);
+        if (bytes > VIEW_TRANSITION_NAMED_BUDGET-g_vt_named_bytes) continue;
+        uint32_t* crop=malloc(bytes); if (!crop) continue;
+        for (int y=0;y<h;y++) memcpy(crop+(size_t)y*(size_t)w,
+            back_buffer+(size_t)(y0+y)*(size_t)SCREEN_WIDTH+(size_t)x0,(size_t)w*sizeof(uint32_t));
+        snap->new_pixels=crop; snap->new_w=w; snap->new_h=h; g_vt_named_bytes+=bytes;
+    }
+    g_vt_named_targets_ready = 1;
+}
+
+static void vt_fill_rect_alpha(int x0,int y0,int x1,int y1,uint32_t color,float opacity) {
+    int alpha=alpha_of(color,opacity); if(alpha<=0)return;
+    if(x0<0)x0=0;if(y0<g_top)y0=g_top;
+    if(x1>SCREEN_WIDTH)x1=SCREEN_WIDTH;if(y1>SCREEN_HEIGHT)y1=SCREEN_HEIGHT;
+    if(x1<=x0||y1<=y0)return;
+    unsigned ia=(unsigned)(255-alpha),sr=(color>>16)&255u,sg=(color>>8)&255u,sb=color&255u;
+    for(int y=y0;y<y1;y++) for(int x=x0;x<x1;x++) {
+        uint32_t* dst=&back_buffer[(size_t)y*(size_t)SCREEN_WIDTH+(size_t)x]; uint32_t d=*dst;
+        unsigned dr=(d>>16)&255u,dg=(d>>8)&255u,db=d&255u;
+        *dst=(d&0xFF000000u)|(((sr*(unsigned)alpha+dr*ia+127u)/255u)<<16)|
+              (((sg*(unsigned)alpha+dg*ia+127u)/255u)<<8)|((sb*(unsigned)alpha+db*ia+127u)/255u);
+    }
+}
+
+static void vt_affine_mul(const float a[6], const float b[6], float o[6]) {
+    o[0]=a[0]*b[0]+a[2]*b[1]; o[1]=a[1]*b[0]+a[3]*b[1];
+    o[2]=a[0]*b[2]+a[2]*b[3]; o[3]=a[1]*b[2]+a[3]*b[3];
+    o[4]=a[0]*b[4]+a[2]*b[5]+a[4]; o[5]=a[1]*b[4]+a[3]*b[5]+a[5];
+}
+
+static void vt_scale_clip_for_raster(FxClip* cp, float rx, float ry) {
+    if (!cp) return;
+    if (cp->kind==CP_INSET) {
+        cp->a[0].px*=ry; cp->a[1].px*=rx; cp->a[2].px*=ry; cp->a[3].px*=rx;
+        for (int i=0;i<4;i++) cp->rad[i]*=(rx+ry)*0.5f;
+    } else if (cp->kind==CP_CIRCLE) {
+        cp->a[0].px*=(rx+ry)*0.5f; cp->a[1].px*=rx; cp->a[2].px*=ry;
+    } else if (cp->kind==CP_ELLIPSE) {
+        cp->a[0].px*=rx; cp->a[1].px*=ry; cp->a[2].px*=rx; cp->a[3].px*=ry;
+    } else if (cp->kind==CP_POLYGON) {
+        for (int i=0;i<cp->n && i<16;i++) { cp->pt[i][0].px*=rx; cp->pt[i][1].px*=ry; }
+    }
+}
+
+static void vt_scale_mask_for_raster(FxMask* mask, float rx, float ry) {
+    if (!mask) return;
+    mask->w.px*=rx; mask->h.px*=ry;
+    mask->px.px*=rx; mask->py.px*=ry;
+}
+
+/* Paint a snapshot as a real effect layer. Coordinates are first morphed to the
+   shared-element destination box, then CSS transforms are composed from the
+   leaf pseudo-element outward through image-pair and group. Filters, masks,
+   clip-path and opacity are applied in the corresponding nested-layer order. */
+static void vt_composite_snapshot(const uint32_t* pixels, int sw, int sh,
+                                  float dx, float dy, float dw, float dh,
+                                  float opacity, const NodeStyle* const chain[3], int top_offset) {
+    if (!pixels || sw<1 || sh<1 || !isfinite(dx) || !isfinite(dy) ||
+        !isfinite(dw) || !isfinite(dh) || dw<1.0f || dh<1.0f || opacity<=0.0f) return;
+    if (opacity>1.0f) opacity=1.0f;
+    const float limit=1000000.0f;
+    if (dx < -limit) dx=-limit; if (dx > limit) dx=limit;
+    if (dy < -limit) dy=-limit; if (dy > limit) dy=limit;
+    if (dw>limit) dw=limit; if (dh>limit) dh=limit;
+    /* Bound intermediate memory to 8 MiB even for a CSS box larger than the
+       viewport. A uniform raster scale keeps percentages and shapes sensible. */
+    const double max_px=2.0*1024.0*1024.0;
+    double area=(double)dw*(double)dh; float quality=area>max_px?(float)sqrt(max_px/area):1.0f;
+    int rw=(int)lrintf(dw*quality), rh=(int)lrintf(dh*quality);
+    if (rw<1) rw=1; if (rh<1) rh=1;
+    if ((size_t)rw>SIZE_MAX/(size_t)rh/4u) return;
+    FxImg* im=fx_img_new(0,0,rw,rh); if (!im) return;
+    for (int y=0;y<rh;y++) {
+        int sy=(int)((int64_t)y*sh/rh); if(sy>=sh)sy=sh-1;
+        uint8_t* d=im->px+(size_t)y*(size_t)rw*4u;
+        const uint32_t* src=pixels+(size_t)sy*(size_t)sw;
+        for(int x=0;x<rw;x++,d+=4) {
+            int sx=(int)((int64_t)x*sw/rw); if(sx>=sw)sx=sw-1;
+            uint32_t c=src[sx]; d[0]=(uint8_t)(c>>16); d[1]=(uint8_t)(c>>8); d[2]=(uint8_t)c; d[3]=255;
+        }
+    }
+    float rx=(float)rw/dw, ry=(float)rh/dh;
+    /* Children paint first, then parent pseudo-layer effects. */
+    for (int i=2;i>=0;i--) {
+        const NodeStyle* st=chain?chain[i]:NULL; if (!st) continue;
+        if (st->filter.n) fx_apply_filters(im,&st->filter);
+        if (st->clip.kind) { FxClip cp=st->clip; vt_scale_clip_for_raster(&cp,rx,ry); fx_apply_clip(im,&cp,0,0,(float)rw,(float)rh); }
+        if (st->mask.kind) { FxMask mask=st->mask; vt_scale_mask_for_raster(&mask,rx,ry); fx_apply_mask(im,&mask,0,0,(float)rw,(float)rh); }
+        float op=st->op_own;
+        if (!isfinite(op)) op=1.0f; if(op<0)op=0; if(op>1)op=1;
+        if (op<0.9999f) {
+            for(size_t q=0, n=(size_t)rw*(size_t)rh;q<n;q++) {
+                uint8_t* px=im->px+q*4u;
+                px[0]=(uint8_t)(px[0]*op+0.5f); px[1]=(uint8_t)(px[1]*op+0.5f);
+                px[2]=(uint8_t)(px[2]*op+0.5f); px[3]=(uint8_t)(px[3]*op+0.5f);
+            }
+        }
+    }
+    /* Source-local coordinates -> shared-element box in viewport coordinates. */
+    float m[6]={dw/(float)rw,0,0,dh/(float)rh,dx,dy};
+    /* Each computed style matrix is box-relative. Compose leaf -> root so the
+       root group transform is the outermost operation as in the pseudo tree. */
+    for (int i=2;i>=0;i--) {
+        const NodeStyle* st=chain?chain[i]:NULL; if (!st || !st->xf.n) continue;
+        float q[6]={1,0,0,1,0,0}, tx=0,ty=0;
+        int linear=fx_xform_compute(&st->xf,dx,dy,dw,dh,q,&tx,&ty);
+        if (!linear) { q[0]=q[3]=1; q[1]=q[2]=0; q[4]=tx; q[5]=ty; }
+        float out[6]; vt_affine_mul(q,m,out); memcpy(m,out,sizeof m);
+    }
+    int cy0=top_offset<g_top?g_top:top_offset;
+    if (cy0<0) cy0=0; if (cy0>SCREEN_HEIGHT) cy0=SCREEN_HEIGHT;
+    fx_composite(im,back_buffer,SCREEN_WIDTH,0,cy0,SCREEN_WIDTH,SCREEN_HEIGHT,m);
+    fx_img_free(im);
+}
+
+static int webpage_view_transition_named_pixel(int x, int y, int* incoming) {
+    for (int i=0;i<g_vt_named_count;i++) {
+        VTNamedSnapshot* s=&g_vt_named[i];
+        if (s->pixels && x>=s->x && x<s->x+s->w && y>=s->y && y<s->y+s->h) { *incoming=1; return 1; }
+        if (s->new_pixels && s->has_target) {
+            int tx=s->target_x-g_sx, ty=s->target_y-g_sy+g_top;
+            if (x>=tx && x<tx+s->target_w && y>=ty && y<ty+s->target_h) { *incoming=0; return 1; }
+        }
+    }
+    return 0;
+}
+
+static void webpage_view_transition_composite_named(double progress) {
+    if (g_vt_named_count <= 0) return;
+    double elapsed_ms = progress * g_vt_duration_ms;
+    const NodeStyle* root_style=webpage_view_transition_style_at(NULL,WEBPAGE_VT_PSEUDO_ROOT,elapsed_ms);
+    float root_op=root_style?root_style->op_own:1.0f;
+    if(root_op<0)root_op=0;if(root_op>1)root_op=1;
+    for (int i=0;i<g_vt_named_count;i++) {
+        VTNamedSnapshot* s=&g_vt_named[i];
+        if (!s->pixels || s->w<1 || s->h<1) continue;
+        float x=(float)s->x, y=(float)s->y, w=(float)s->w, h=(float)s->h;
+        if (s->has_target) {
+            float tx=(float)(s->target_x-g_sx), ty=(float)(s->target_y-g_sy+g_top);
+            float tw=(float)s->target_w, th=(float)s->target_h;
+            x += (tx-x)*(float)progress; y += (ty-y)*(float)progress;
+            w += (tw-w)*(float)progress; h += (th-h)*(float)progress;
+        }
+        float oldx=x,oldy=y,oldw=w,oldh=h;
+        const NodeStyle* group_style=webpage_view_transition_style_at(s->name,WEBPAGE_VT_PSEUDO_GROUP,elapsed_ms);
+        const NodeStyle* pair_style=webpage_view_transition_style_at(s->name,WEBPAGE_VT_PSEUDO_IMAGE_PAIR,elapsed_ms);
+        float old_fade=webpage_view_transition_animates_opacity(s->name,WEBPAGE_VT_PSEUDO_OLD)?1.0f:(float)(1.0-progress);
+        const NodeStyle* old_style=webpage_view_transition_style_at(s->name,WEBPAGE_VT_PSEUDO_OLD,elapsed_ms);
+        const NodeStyle* old_chain[3]={group_style,pair_style,old_style};
+        vt_composite_snapshot(s->pixels,s->w,s->h,oldx,oldy,oldw,oldh,
+                              old_fade*root_op,old_chain,g_top);
+        if (s->new_pixels && s->has_target) {
+            float newx=x,newy=y,neww=w,newh=h;
+            float new_fade=webpage_view_transition_animates_opacity(s->name,WEBPAGE_VT_PSEUDO_NEW)?1.0f:(float)progress;
+            const NodeStyle* new_style=webpage_view_transition_style_at(s->name,WEBPAGE_VT_PSEUDO_NEW,elapsed_ms);
+            const NodeStyle* new_chain[3]={group_style,pair_style,new_style};
+            vt_composite_snapshot(s->new_pixels,s->new_w,s->new_h,newx,newy,neww,newh,
+                                  new_fade*root_op,new_chain,g_top);
+        }
+    }
+}
+
+static void webpage_view_transition_composite(int top_offset) {
+    if (!g_vt_active || !g_vt_snapshot) return;
+    if (g_vt_head != g_last_head || g_vt_width != SCREEN_WIDTH || g_vt_height != SCREEN_HEIGHT) {
+        /* Resize/root changes abort the visual effect, but finished must still
+           settle for a live document instead of waiting for a frame that cannot run. */
+        webpage_view_transition_cancel();
+        g_vt_finished_pending = 1;
+        return;
+    }
+    webpage_view_transition_capture_targets(g_last_head);
+    double progress = (view_transition_now_ms() - g_vt_started_ms) / g_vt_duration_ms;
+    if (progress <= 0.0) progress = 0.0;
+    if (progress >= 1.0) return;
+    unsigned old_a = (unsigned)((1.0 - progress) * 255.0 + 0.5);
+    if (old_a > 255) old_a = 255;
+    unsigned new_a = 255u - old_a;
+    double elapsed_ms = progress * g_vt_duration_ms;
+    const NodeStyle* root_style=webpage_view_transition_style_at(NULL,WEBPAGE_VT_PSEUDO_ROOT,elapsed_ms);
+    float root_op=root_style?root_style->op_own:1.0f;
+    if(root_op<0)root_op=0;if(root_op>1)root_op=1;
+    unsigned ra=(unsigned)(root_op*255.0f+0.5f), ria=255u-ra;
+    int y0 = top_offset > g_vt_top ? top_offset : g_vt_top;
+    if (y0 < 0) y0 = 0; if (y0 > SCREEN_HEIGHT) y0 = SCREEN_HEIGHT;
+    for (int y = y0; y < SCREEN_HEIGHT; ++y) {
+        size_t off = (size_t)y * (size_t)SCREEN_WIDTH;
+        for (int x = 0; x < SCREEN_WIDTH; ++x) {
+            uint32_t oldp = g_vt_snapshot[off + (size_t)x], newp = back_buffer[off + (size_t)x];
+            int incoming=0;
+            if (webpage_view_transition_named_pixel(x,y,&incoming)) {
+                /* At the old location expose the new page behind the outgoing
+                   image; at the incoming location expose the old page behind
+                   the incoming image. The two captures are composited below. */
+                back_buffer[off + (size_t)x] = incoming ? newp : oldp;
+                continue;
+            }
+            unsigned or_ = (oldp >> 16) & 255u, og = (oldp >> 8) & 255u, ob = oldp & 255u;
+            unsigned nr = (newp >> 16) & 255u, ng = (newp >> 8) & 255u, nb = newp & 255u;
+            unsigned r = (or_ * old_a + nr * new_a + 127u) / 255u;
+            unsigned g = (og * old_a + ng * new_a + 127u) / 255u;
+            unsigned b = (ob * old_a + nb * new_a + 127u) / 255u;
+            r=(r*ra+nr*ria+127u)/255u; g=(g*ra+ng*ria+127u)/255u; b=(b*ra+nb*ria+127u)/255u;
+            back_buffer[off + (size_t)x] = (newp & 0xFF000000u) | (r << 16) | (g << 8) | b;
+        }
+    }
+    if(root_style && (root_style->bg>>24))
+        vt_fill_rect_alpha(0,top_offset,SCREEN_WIDTH,SCREEN_HEIGHT,root_style->bg,root_op);
+    webpage_view_transition_composite_named(progress);
 }
 
 /* покрытие пикселя скруглённым прямоугольником */
@@ -107,6 +553,7 @@ static void fill_rrect_grad(int x0, int y0, int x1, int y1, const float rad[4], 
         float cov = rr_cov(x + 0.5f, y + 0.5f, (float)x0, (float)y0, w, h, rad); if (cov <= 0) continue;
         float px = (x + 0.5f - x0) - cx, py = (y + 0.5f - y0) - cy, t;
         if (st->bg_grad_type == 2) t = sqrtf(px * px + py * py) / maxr * 100.0f;
+        else if (st->bg_grad_type == 3) { float deg = atan2f(px, -py) * 57.295779513f; if (deg < 0) deg += 360.0f; t = fmodf(deg - st->bg_grad_angle + 360.0f, 360.0f) / 360.0f * 100.0f; }
         else t = ((px * dirx + py * diry) / half * 0.5f + 0.5f) * 100.0f;
         if (t < 0) t = 0; if (t > 100) t = 100;
         uint32_t col = grad_color_at(st, t); int a = alpha_of(col, opacity);
@@ -171,10 +618,15 @@ static uint32_t effective_text_color(uint32_t argb, float opacity, int sx, int s
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
-static void draw_text(TTFFont* f, const char* s, int x, int y, int size, uint32_t argb, float opacity, int style) {
+static void draw_text_mode(TTFFont* f, const char* s, int x, int y, int size, uint32_t argb, float opacity,
+                           int style, int direction, int bidi_override) {
     if (!f || !s[0]) return;
     uint32_t col = effective_text_color(argb, opacity, x + 2, y + size / 2);
-    ttf_render_string_ex(f, s, back_buffer, SCREEN_WIDTH, cl_x0, cl_y0, cl_x1, cl_y1, size, x, y, col, style);
+    ttf_render_string_ex_bidi(f, s, back_buffer, SCREEN_WIDTH, cl_x0, cl_y0, cl_x1, cl_y1,
+                              size, x, y, col, style, direction, bidi_override);
+}
+static void draw_text(TTFFont* f, const char* s, int x, int y, int size, uint32_t argb, float opacity, int style) {
+    draw_text_mode(f,s,x,y,size,argb,opacity,style,0,0);
 }
 
 static int sel_rect(int* sx, int* sy, int* sw, int* sh) {
@@ -183,31 +635,119 @@ static int sel_rect(int* sx, int* sy, int* sw, int* sh) {
     *sy = layout_selection_y1 < layout_selection_y2 ? layout_selection_y1 : layout_selection_y2;
     *sw = abs(layout_selection_x2 - layout_selection_x1); *sh = abs(layout_selection_y2 - layout_selection_y1); return 1;
 }
+static int text_pos_compare(const WebTextPosition* a, const WebTextPosition* b) {
+    if (!a || !b || !a->node || !b->node) return 0;
+    if (a->node->idx != b->node->idx) return a->node->idx < b->node->idx ? -1 : 1;
+    if (a->offset != b->offset) return a->offset < b->offset ? -1 : 1;
+    return 0;
+}
+
+static int text_selection_ordered(WebTextPosition* first, WebTextPosition* last) {
+    if (!g_text_sel_active || !g_text_sel_anchor.node || !g_text_sel_focus.node) return 0;
+    if (text_pos_compare(&g_text_sel_anchor, &g_text_sel_focus) <= 0) {
+        *first = g_text_sel_anchor; *last = g_text_sel_focus;
+    } else { *first = g_text_sel_focus; *last = g_text_sel_anchor; }
+    return 1;
+}
+
+/* Map a C_TEXT run to the selected byte interval in its source DOM text node.
+ * Runs whose display text was normalized (e.g. a multi-space run) can be selected
+ * as a whole when they sit between the endpoint nodes, but are never used as caret
+ * anchors because they do not have a one-to-one source-byte map. */
+static int text_selection_cmd_range(const Cmd* c, size_t n, size_t* out_lo, size_t* out_hi) {
+    WebTextPosition first, last;
+    if (!c || c->t != C_TEXT || !c->node || c->node->idx < 0 || !out_lo || !out_hi ||
+        !text_selection_ordered(&first, &last)) return 0;
+    int idx = c->node->idx, aidx = first.node->idx, bidx = last.node->idx;
+    if (idx < aidx || idx > bidx || n == 0) return 0;
+    if (!c->text_offset_valid) {
+        if ((idx > aidx && idx < bidx) ||
+            (aidx == bidx && idx == aidx && first.offset == 0 && last.offset >= strlen(c->node->text))) {
+            *out_lo = 0; *out_hi = n; return 1;
+        }
+        return 0;
+    }
+    size_t node_len = strlen(c->node->text), begin = c->text_offset;
+    if (begin > node_len || n > node_len - begin) return 0;
+    size_t lo = 0, hi = n;
+    if (idx == aidx && first.offset > begin) lo = (size_t)first.offset - begin;
+    if (idx == bidx) {
+        if (last.offset <= begin) return 0;
+        if ((size_t)last.offset < begin + hi) hi = (size_t)last.offset - begin;
+    }
+    if (lo > n) lo = n; if (hi > n) hi = n;
+    if (hi <= lo) return 0;
+    *out_lo = lo; *out_hi = hi; return 1;
+}
+
 static int rect_hit(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) { return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by; }
+
+static int text_base_direction(const NodeStyle* st) {
+    if (!st) return 0;
+    if (st->bidi_context == 3) return -1;
+    if (st->bidi_context == 2) return 1;
+    if (st->bidi_context == 1) return 0;
+    return st->unicode_bidi == 5 ? -1 : (st->direction ? 1 : 0);
+}
+static int text_bidi_override(const NodeStyle* st) {
+    return st && ((st->bidi_context == 1 || st->bidi_context == 2) || st->unicode_bidi == 3 || st->unicode_bidi == 4);
+}
 
 static void paint_text(const Cmd* c, int dx, int dy) {
     TTFFont* f = font_manager_get_styled(c->fam, c->weight ? c->weight : 400, c->ital); if (!f) return;
     int x = (int)floorf(c->x + dx + 0.5f), y = (int)floorf(c->y + dy + 0.5f);
-    int sx, sy, sw, sh;
-    if (sel_rect(&sx, &sy, &sw, &sh) && rect_hit(x, y, (int)c->w + 1, (int)c->h, sx, sy, sw, sh)) {
-        size_t n = strlen(c->s); int* offs = malloc((n + 1) * sizeof(int));
+    int sx = 0, sy = 0, sw = 0, sh = 0; const NodeStyle* ost = c->node ? &c->node->st : NULL;
+    size_t n = strlen(c->s), sel_lo = 0, sel_hi = 0;
+    int logical_range = g_text_sel_active && (!ost || ost->user_select != 1) &&
+                        text_selection_cmd_range(c, n, &sel_lo, &sel_hi);
+    size_t caret_local = 0;
+    int logical_caret = g_text_sel_active && (!ost || ost->user_select != 1) &&
+        text_pos_compare(&g_text_sel_anchor, &g_text_sel_focus) == 0 &&
+        g_text_sel_focus.node == c->node && c->text_offset_valid &&
+        g_text_sel_focus.offset >= c->text_offset &&
+        (size_t)(g_text_sel_focus.offset - c->text_offset) <= n &&
+        c->text_offset <= strlen(c->node->text) && n <= strlen(c->node->text) - c->text_offset &&
+        memcmp(c->node->text + c->text_offset, c->s, n) == 0;
+    if (logical_caret) caret_local = (size_t)(g_text_sel_focus.offset - c->text_offset);
+    int rect_mode = !g_text_sel_active && (!ost || ost->user_select != 1) && sel_rect(&sx, &sy, &sw, &sh) &&
+                    rect_hit(x, y, (int)c->w + 1, (int)c->h, sx, sy, sw, sh);
+    if (logical_range || rect_mode || logical_caret) {
+        int* offs = n <= (size_t)INT_MAX - 1 ? malloc((n + 1) * sizeof(int)) : NULL;
         if (offs) {
-            ttf_text_offsets_ex(f, c->s, c->size, c->tstyle, offs, (int)n + 1);
+            ttf_text_offsets_ex_bidi(f, c->s, c->size, c->tstyle, offs, (int)n + 1, text_base_direction(ost), text_bidi_override(ost));
             for (size_t i = 0; i < n;) {
                 size_t l = 1; unsigned char ch = (unsigned char)c->s[i]; if (ch >= 0xF0) l = 4; else if (ch >= 0xE0) l = 3; else if (ch >= 0xC0) l = 2; if (i + l > n) l = n - i;
-                int cx0 = x + offs[i], cw = offs[i + l] - offs[i];
-                if (rect_hit(cx0, y, cw, (int)c->h, sx, sy, sw, sh)) fill_rect_i(cx0, y, cx0 + cw, y + (int)c->h, 0xFFBFDBFE, 1);
+                int selected = logical_range ? (i < sel_hi && i + l > sel_lo) : 0;
+                int oa = offs[i], ob = offs[i + l];
+                int cx0 = x + (oa < ob ? oa : ob), cw = abs(ob - oa);
+                if (!logical_range && rect_mode) selected = cw > 0 && rect_hit(cx0, y, cw, (int)c->h, sx, sy, sw, sh);
+                if (selected && cw > 0) fill_rect_i(cx0, y, cx0 + cw, y + (int)c->h, 0xFFBFDBFE, 1);
                 i += l;
+            }
+            if (logical_caret && caret_local <= n) {
+                float cy = (float)y + c->h * 0.5f;
+                float tolerance = fmaxf(8.0f, c->h * 0.55f);
+                if (fabsf(cy - g_text_sel_focus.visual_y) <= tolerance) {
+                    int cx = x + offs[caret_local];
+                    uint32_t caret_color = 0xFF000000u | (effective_text_color(c->color, c->opacity, cx, (int)cy) & 0xFFFFFFu);
+                    fill_rect_i(cx, y, cx + 1, y + (int)fmaxf(1.0f, c->h), caret_color, 1.0f);
+                }
             }
             free(offs);
         }
     }
-    const NodeStyle* ost = c->node ? &c->node->st : NULL;
+    if (ost && (ost->ts_color >> 24) && !(ost->bg_clip_text && ost->bg_grad_type)) {
+        int blur = (int)fminf(4.0f, fmaxf(0.0f, ost->ts_blur));
+        for (int oy = -blur; oy <= blur; oy++) for (int ox = -blur; ox <= blur; ox++) {
+            if (blur && ox*ox + oy*oy > blur*blur) continue;
+            draw_text_mode(f, c->s, x + (int)ost->ts_x + ox, y + (int)ost->ts_y + oy, c->size, ost->ts_color, c->opacity * (blur ? 0.32f : 1.0f), c->tstyle, text_base_direction(ost), text_bidi_override(ost));
+        }
+    }
     if (ost && ost->bg_clip_text && ost->bg_grad_type) {                       /* -webkit-background-clip:text — красим по буквам вдоль градиента */
         size_t n = strlen(c->s); int* offs = malloc((n + 1) * sizeof(int));
         if (offs) {
-            ttf_text_offsets_ex(f, c->s, c->size, c->tstyle, offs, (int)n + 1);
-            float fullw = (float)offs[n]; if (fullw < 1) fullw = 1;
+            int measured_width = ttf_text_offsets_ex_bidi(f, c->s, c->size, c->tstyle, offs, (int)n + 1, text_base_direction(ost), text_bidi_override(ost));
+            float fullw = (float)measured_width; if (fullw < 1) fullw = 1;
             size_t i = 0;
             while (i < n) {
                 size_t l = 1; unsigned char ch = (unsigned char)c->s[i];
@@ -216,12 +756,12 @@ static void paint_text(const Cmd* c, int dx, int dy) {
                 float mid = (offs[i] + offs[i + l]) * 0.5f, t = mid / fullw * 100.0f;
                 uint32_t col = grad_color_at(ost, t);
                 char tmp[8]; size_t cl = l < 7 ? l : 7; memcpy(tmp, c->s + i, cl); tmp[cl] = 0;
-                draw_text(f, tmp, x + offs[i], y, c->size, (col & 0xFFFFFFu) | 0xFF000000u, c->opacity, c->tstyle);
+                draw_text_mode(f, tmp, x + (offs[i] < offs[i + l] ? offs[i] : offs[i + l]), y, c->size, (col & 0xFFFFFFu) | 0xFF000000u, c->opacity, c->tstyle, text_base_direction(ost), text_bidi_override(ost));
                 i += l;
             }
             free(offs);
-        } else draw_text(f, c->s, x, y, c->size, c->color, c->opacity, c->tstyle);
-    } else draw_text(f, c->s, x, y, c->size, c->color, c->opacity, c->tstyle);
+        } else draw_text_mode(f, c->s, x, y, c->size, c->color, c->opacity, c->tstyle, text_base_direction(ost), text_bidi_override(ost));
+    } else draw_text_mode(f, c->s, x, y, c->size, c->color, c->opacity, c->tstyle, text_base_direction(ost), text_bidi_override(ost));
     if (c->deco) {
         int asc = ttf_font_ascent(f, c->size); int base = y + asc; int th = c->size >= 28 ? 2 : 1; int w = (int)(c->w + 0.5f);
         uint32_t col = effective_text_color(c->color, c->opacity, x + 2, y + c->size / 2);
@@ -468,6 +1008,7 @@ static void paint_range(const Frame* fp, int from, int to, int fixed_pass) {
         /* быстрый отказ: вне экрана */
         float sy0 = c->y + dy, sy1 = c->y + c->h + dy, sx0 = c->x + dx, sx1 = c->x + c->w + dx;
         if (c->t != C_HIT && (sy1 < cl_y0 - 40 || sy0 > cl_y1 + 40 || sx1 < cl_x0 - 40 || sx0 > cl_x1 + 40)) { if (c->t != C_BOX || (sy1 < cl_y0 - 400 || sy0 > cl_y1 + 400)) continue; }
+        g_blend_mode = (c->node && c->node->st.blend_mode) ? c->node->st.blend_mode : 0;
         switch (c->t) {
         case C_BOX: {
             const NodeStyle* st = &c->node->st; int x0 = (int)floorf(c->x + dx + 0.5f), y0 = (int)floorf(c->y + dy + 0.5f), x1 = (int)floorf(c->x + c->w + dx + 0.5f), y1 = (int)floorf(c->y + c->h + dy + 0.5f);
@@ -481,6 +1022,13 @@ static void paint_range(const Frame* fp, int from, int to, int fixed_pass) {
             }
             NodeStyle bs = *st; if (c->flags & F_NOLEFT) bs.border_w[3] = 0; if (c->flags & F_NORIGHT) bs.border_w[1] = 0;
             draw_border(&bs, x0, y0, x1, y1, rad, st->opacity);
+            if (st->outline_set && st->outline_w > 0 && st->outline_style != BS_NONE) {
+                int ow = (int)ceilf(st->outline_w); int off = (int)floorf(st->outline_offset + 0.5f);
+                int ox0 = x0 - off - ow, oy0 = y0 - off - ow, ox1 = x1 + off + ow, oy1 = y1 + off + ow;
+                uint32_t oc = st->outline_c ? st->outline_c : st->color;
+                fill_rect_i(ox0, oy0, ox1, oy0 + ow, oc, st->opacity); fill_rect_i(ox0, oy1 - ow, ox1, oy1, oc, st->opacity);
+                fill_rect_i(ox0, oy0 + ow, ox0 + ow, oy1 - ow, oc, st->opacity); fill_rect_i(ox1 - ow, oy0 + ow, ox1, oy1 - ow, oc, st->opacity);
+            }
             break; }
         case C_RECT: {
             int x0 = (int)floorf(c->x + dx + 0.5f), y0 = (int)floorf(c->y + dy + 0.5f); int s = (int)(c->w + 0.5f); float rad[4] = {c->rad, c->rad, c->rad, c->rad};
@@ -491,13 +1039,35 @@ static void paint_range(const Frame* fp, int from, int to, int fixed_pass) {
         case C_IMG: {
             int x0 = (int)floorf(c->x + dx + 0.5f), y0 = (int)floorf(c->y + dy + 0.5f), w = (int)floorf(c->w + 0.5f), h = (int)floorf(c->h + 0.5f); if (w < 1 || h < 1) break;
             webpage_image_set_color(!strcmp(c->node->tag, "svg") ? c->node->st.color : 0xFF000000u);        /* currentColor встроенного svg = CSS color элемента */
-            ImgPix* im = webpage_image_scaled(c->s, w, h); float rad[4]; resolve_radii(&c->node->st, (float)w, (float)h, rad);
-            if (!im) im = webpage_image_get(c->s);
-            blit_img(im, x0, y0, im ? (im->w < w ? im->w : w) : w, im ? (im->h < h ? im->h : h) : h, rad, c->opacity); break; }
+            const NodeStyle* is = &c->node->st; ImgPix* src = webpage_image_get(c->s); if (!src) src = webpage_image_scaled(c->s, w, h);
+            if (!src) break;
+            float ar = src->h > 0 ? (float)src->w / (float)src->h : (float)w / (float)h;
+            int dw = w, dh = h; int fit = is->object_fit;
+            if (fit == 1 || fit == 2 || fit == 4) {
+                float scale = fit == 2 ? fmaxf((float)w / src->w, (float)h / src->h) : fminf((float)w / src->w, (float)h / src->h);
+                if (fit == 4) scale = fminf(1.0f, scale);
+                if (fit == 2) scale = fmaxf((float)w / src->w, (float)h / src->h);
+                dw = (int)fmaxf(1, floorf(src->w * scale + 0.5f)); dh = (int)fmaxf(1, floorf(src->h * scale + 0.5f));
+            } else if (fit == 3) { dw = src->w; dh = src->h; }
+            else { dw = w; dh = h; }
+            (void)ar;
+            int ix = x0 + (int)floorf((w - dw) * is->object_pos_x / 100.0f + 0.5f);
+            int iy = y0 + (int)floorf((h - dh) * is->object_pos_y / 100.0f + 0.5f);
+            ImgPix* im = webpage_image_scaled(c->s, dw, dh); if (!im) im = src;
+            float rad[4]; resolve_radii(is, (float)w, (float)h, rad);
+            if (fit == 2 || dw > w || dh > h || ix < x0 || iy < y0) {
+                int sx0=cl_x0, sy0=cl_y0, sx1=cl_x1, sy1=cl_y1;
+                if (cl_x0 < x0) cl_x0=x0; if (cl_y0 < y0) cl_y0=y0; if (cl_x1 > x0+w) cl_x1=x0+w; if (cl_y1 > y0+h) cl_y1=y0+h;
+                float zero[4]={0,0,0,0}; blit_img(im, ix, iy, dw, dh, zero, c->opacity);
+                cl_x0=sx0; cl_y0=sy0; cl_x1=sx1; cl_y1=sy1;
+                /* rounded border is handled by the element's overflow clip when available */
+            } else blit_img(im, ix, iy, dw, dh, rad, c->opacity);
+            break; }
         case C_BGIMG: paint_bgimg(c, dx, dy); break;
         case C_CTRL: paint_ctrl(c, dx, dy); break;
         default: break;
         }
+        g_blend_mode = 0;
     }
 }
 
@@ -581,10 +1151,57 @@ static void paint_pass(int fixed_pass, int base_x0, int base_y0, int base_x1, in
     Frame f; fr_init(&f, fixed_pass, base_x0, base_y0, base_x1, base_y1); paint_range(&f, 0, l2_dn, fixed_pass);
 }
 
+static int g_fingerprint_nodes;
 static uint64_t fingerprint(DOMNode* head) {
     uint64_t h = 1469598103934665603ULL; int n = 0;
     for (DOMNode* p = head; p; p = p->next, n++) { h = (h ^ (uint64_t)(p->type + 1)) * 1099511628211ULL; h = (h ^ (unsigned char)p->text[0]) * 1099511628211ULL; h = (h ^ (unsigned char)p->text[1]) * 1099511628211ULL; h = (h ^ (uint64_t)(p->st.font_size * 10)) * 1099511628211ULL; }
+    g_fingerprint_nodes = n;
     return h ^ (uint64_t)n ^ (uint64_t)(uintptr_t)head;
+}
+
+typedef struct {
+    int checked, enabled;
+    double window_start;
+    unsigned frames;
+    double frame_total, fingerprint_total, layout_total, paint_total;
+    double frame_max;
+} RenderProfile;
+static RenderProfile g_render_profile;
+
+static int render_profile_enabled(void) {
+    if (!g_render_profile.checked) {
+        const char* value = getenv("MLB_PROFILE_RENDER");
+        g_render_profile.enabled = value && value[0] == '1';
+        g_render_profile.checked = 1;
+        if (g_render_profile.enabled) {
+            g_render_profile.window_start = view_transition_now_ms();
+            gal_log("INFO", "[perf] render profiling enabled; reports once per second");
+        }
+    }
+    return g_render_profile.enabled;
+}
+
+static void render_profile_frame(double frame_ms, double fingerprint_ms,
+                                 double layout_ms, double paint_ms) {
+    RenderProfile* p = &g_render_profile;
+    p->frames++;
+    p->frame_total += frame_ms;
+    p->fingerprint_total += fingerprint_ms;
+    p->layout_total += layout_ms;
+    p->paint_total += paint_ms;
+    if (frame_ms > p->frame_max) p->frame_max = frame_ms;
+    double now = view_transition_now_ms();
+    double elapsed = now - p->window_start;
+    if (elapsed < 1000.0) return;
+    double denom = p->frames ? (double)p->frames : 1.0;
+    gal_log("INFO", "[perf] render %.1f fps | frame avg %.2f ms max %.2f ms | fingerprint %.2f ms | layout %.2f ms | paint %.2f ms | DOM %d | draw-cmds %d | %dx%d",
+            (double)p->frames * 1000.0 / elapsed, p->frame_total / denom, p->frame_max,
+            p->fingerprint_total / denom, p->layout_total / denom, p->paint_total / denom,
+            g_fingerprint_nodes, l2_dn, SCREEN_WIDTH, SCREEN_HEIGHT);
+    p->window_start = now;
+    p->frames = 0;
+    p->frame_total = p->fingerprint_total = p->layout_total = p->paint_total = 0.0;
+    p->frame_max = 0.0;
 }
 
 static void webpage_paint_loaded(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
@@ -600,24 +1217,48 @@ static void webpage_paint_loaded(DOMNode* head, int top_offset, const char* page
     fill_rect_i(0, top_offset, SCREEN_WIDTH, SCREEN_HEIGHT, l2_canvas_bg | 0xFF000000u, 1);
     paint_pass(0, 0, top_offset, SCREEN_WIDTH, SCREEN_HEIGHT);
     paint_pass(1, 0, top_offset, SCREEN_WIDTH, SCREEN_HEIGHT);
+    webpage_view_transition_composite(top_offset);
 }
 static void webpage_layout_only(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
     if (!head) return;
     g_top = top_offset; g_sx = scroll_x; g_sy = scroll_y;
+    l2_set_page_scroll((float)scroll_x,(float)scroll_y);
     snprintf(g_url, sizeof g_url, "%s", page_url ? page_url : "");
     int vw = SCREEN_WIDTH - 10, vh = SCREEN_HEIGHT - top_offset; if (vw < 100) vw = 100;
     l2_layout(head, vw, vh);
     g_last_head = head; g_head = head; g_fp = fingerprint(head); g_lw = vw; g_lh = vh;
     layout_content_width = (int)l2_doc_w - 10; layout_content_height = (int)l2_doc_h - 20;
 }
+static int g_cv_scroll_known; static int g_cv_scroll_x, g_cv_scroll_y;
 static void webpage_render_inline(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
     if (!head) return;
+    int profile = render_profile_enabled();
+    double frame_started = profile ? view_transition_now_ms() : 0.0;
+    l2_set_page_scroll((float)scroll_x,(float)scroll_y);
+    int page_scroll_changed=!g_cv_scroll_known || g_cv_scroll_x!=scroll_x || g_cv_scroll_y!=scroll_y;
+    if(page_scroll_changed) {
+        for(DOMNode* q=head;q;q=q->next) if(q->st.content_visibility==1) { g_head=NULL; break; }
+    }
     g_top = top_offset; g_sx = scroll_x; g_sy = scroll_y; snprintf(g_url, sizeof g_url, "%s", page_url ? page_url : "");
     int vw = SCREEN_WIDTH - 10, vh = SCREEN_HEIGHT - top_offset; if (vw < 100) vw = 100;
     if (anim_step(head) & 1) g_head = NULL;
+    double fingerprint_started = profile ? view_transition_now_ms() : 0.0;
     uint64_t fp = fingerprint(head); g_last_head = head;
-    if (head != g_head || fp != g_fp || vw != g_lw || vh != g_lh) { l2_layout(head, vw, vh); g_head = head; g_fp = fp; g_lw = vw; g_lh = vh; }
+    double fingerprint_ms = profile ? view_transition_now_ms() - fingerprint_started : 0.0;
+    double layout_ms = 0.0;
+    if (head != g_head || fp != g_fp || vw != g_lw || vh != g_lh) {
+        double layout_started = profile ? view_transition_now_ms() : 0.0;
+        l2_layout(head, vw, vh); g_head = head; g_fp = fp; g_lw = vw; g_lh = vh;
+        if (profile) layout_ms = view_transition_now_ms() - layout_started;
+    }
+    g_cv_scroll_known=1; g_cv_scroll_x=scroll_x; g_cv_scroll_y=scroll_y;
+    double paint_started = profile ? view_transition_now_ms() : 0.0;
     webpage_paint_loaded(head, top_offset, page_url, scroll_x, scroll_y);
+    if (profile) {
+        double paint_ms = view_transition_now_ms() - paint_started;
+        render_profile_frame(view_transition_now_ms() - frame_started,
+                             fingerprint_ms, layout_ms, paint_ms);
+    }
 }
 
 #ifndef _WIN32
@@ -797,9 +1438,24 @@ static void webpage_render_worker(DOMNode* head, int top_offset, const char* pag
     webpage_paint_loaded(head, top_offset, page_url, scroll_x, scroll_y);
 }
 void webpage_render(DOMNode* head, int top_offset, const char* page_url, int scroll_x, int scroll_y) {
+    if (g_vt_snapshot && head != g_vt_head) webpage_view_transition_cancel();
+    l2_set_page_scroll((float)scroll_x,(float)scroll_y);
+    if (g_sel_scroll_head != head) { g_sel_scroll_head = head; g_sel_scroll_seen = 0; }
+    if (g_text_sel_active && g_sel_scroll_seen && g_sel_scroll_head == head && g_last_head == head) {
+        float dx = (float)(g_sel_scroll_x - scroll_x), dy = (float)(g_sel_scroll_y - scroll_y);
+        g_text_sel_anchor.visual_x += dx; g_text_sel_focus.visual_x += dx;
+        g_text_sel_anchor.visual_y += dy; g_text_sel_focus.visual_y += dy;
+    }
+    g_sel_scroll_x = scroll_x; g_sel_scroll_y = scroll_y; g_sel_scroll_seen = 1;
+    if (g_last_head != head) webpage_text_selection_clear();
+    else if (g_text_sel_active) (void)text_selection_endpoints_live(head);
     if (!head) return;
-    const char* mode = getenv("MLB_RENDER_INLINE");
-    if ((mode && mode[0] == '1') || SCREEN_WIDTH <= 0 || SCREEN_HEIGHT <= 0 || !back_buffer) {
+    /* Forking layout and paint workers for every frame required a full
+       framebuffer copy, display-list serialization, two process startups,
+       and a synchronous wait. Keep this expensive isolation path opt-in. */
+    const char* isolated = getenv("MLB_RENDER_ISOLATED");
+    if (!(isolated && isolated[0] == '1') ||
+        SCREEN_WIDTH <= 0 || SCREEN_HEIGHT <= 0 || !back_buffer) {
         webpage_render_inline(head, top_offset, page_url, scroll_x, scroll_y); return;
     }
     size_t pixels = (size_t)SCREEN_WIDTH * (size_t)SCREEN_HEIGHT;
@@ -859,6 +1515,7 @@ DOMNode* webpage_hit_test(DOMNode* head, int mx, int my) {
         const Cmd* c = &l2_dl[i]; int k = c->fixed ? 1 : 0; Frame* f = &fr[k];
         if (fr_is_ctl(c)) { fr_ctl(f, c); continue; }
         if (c->t != C_HIT) continue;
+        if (c->node && c->node->st.pointer_events == 1) continue;
         if (!fr_in_clip(f, mx, my)) continue;     /* скрыто отсечением overflow */
         float x0 = c->x + f->dx, y0 = c->y + f->dy, hx, hy; fr_map(f, mx, my, &hx, &hy);
         if (hx >= x0 && hx < x0 + c->w && hy >= y0 && hy < y0 + c->h) best[k] = c->node;
@@ -866,23 +1523,492 @@ DOMNode* webpage_hit_test(DOMNode* head, int mx, int my) {
     return best[1] ? best[1] : best[0];
 }
 
+static int text_position_valid(const WebTextPosition* p) {
+    if (!p || !p->node || p->node->type != TAG_TEXT || p->node->idx < 0) return 0;
+    size_t len = strlen(p->node->text);
+    if ((size_t)p->offset > len) return 0;
+    /* A DOM mutation may leave an old endpoint inside a now-different UTF-8
+       sequence. Reject continuation-byte offsets instead of copying broken UTF-8. */
+    if ((size_t)p->offset < len &&
+        (((unsigned char)p->node->text[p->offset] & 0xC0u) == 0x80u)) return 0;
+    return 1;
+}
+
+void webpage_text_selection_clear(void) {
+    memset(&g_text_sel_anchor, 0, sizeof g_text_sel_anchor);
+    memset(&g_text_sel_focus, 0, sizeof g_text_sel_focus);
+    g_text_sel_active = 0;
+    g_text_sel_preferred_x = NAN;
+}
+
+int webpage_text_selection_active(void) { return g_text_sel_active; }
+
+/* DOM mutation may remove selected text nodes while keeping the same root node.
+ * Validate pointer membership by walking the live flat node list before reading
+ * either endpoint; otherwise a later paint/copy could dereference a stale node. */
+static int text_selection_endpoints_live(DOMNode* head) {
+    if (!g_text_sel_active) return 1;
+    int have_anchor = 0, have_focus = 0;
+    for (DOMNode* n = head; n; n = n->next) {
+        if (n == g_text_sel_anchor.node) have_anchor = 1;
+        if (n == g_text_sel_focus.node) have_focus = 1;
+        if (have_anchor && have_focus) return 1;
+    }
+    webpage_text_selection_clear();
+    return 0;
+}
+
+void webpage_text_selection_set(const WebTextPosition* anchor, const WebTextPosition* focus) {
+    if (!text_position_valid(anchor) || !text_position_valid(focus)) { webpage_text_selection_clear(); return; }
+    g_text_sel_anchor = *anchor; g_text_sel_focus = *focus; g_text_sel_active = 1;
+    g_text_sel_preferred_x = NAN;
+}
+
+int webpage_text_position_at(DOMNode* head, int mx, int my, int allow_nearest, WebTextPosition* out) {
+    if (!head || !out || !l2_dl || head != g_last_head || my < g_top) return 0;
+    Frame fr[2];
+    fr_init(&fr[0], 0, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
+    fr_init(&fr[1], 1, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
+    const Cmd* best = NULL; float best_local_x = 0.0f;
+    float best_x0 = 0.0f, best_y0 = 0.0f;
+    float best_score = INFINITY;
+    for (int i = 0; i < l2_dn; i++) {
+        const Cmd* c = &l2_dl[i];
+        if (fr_is_ctl(c)) { fr_ctl(&fr[0], c); fr_ctl(&fr[1], c); continue; }
+        if (c->t != C_TEXT || !c->node || c->node->type != TAG_TEXT || c->node->idx < 0 ||
+            !c->text_offset_valid || !c->s || c->node->st.user_select == 1 ||
+            c->node->st.pointer_events == 1 || !isfinite(c->x) || !isfinite(c->y) ||
+            !isfinite(c->w) || !isfinite(c->h) || c->w < 0 || c->h <= 0) continue;
+        Frame* f = &fr[c->fixed ? 1 : 0];
+        if (!fr_in_clip(f, mx, my)) continue;
+        float hx, hy; fr_map(f, mx, my, &hx, &hy);
+        float x0 = c->x + f->dx, y0 = c->y + f->dy;
+        float vx = hx < x0 ? x0 - hx : hx > x0 + c->w ? hx - (x0 + c->w) : 0.0f;
+        float vy = hy < y0 ? y0 - hy : hy > y0 + c->h ? hy - (y0 + c->h) : 0.0f;
+        if (!allow_nearest) { if (vx > 14.0f || vy > 10.0f) continue; }
+        else if (vy > fmaxf(c->h * 2.0f, 40.0f)) continue;
+        float score = vy * 4096.0f + vx;
+        if (score < best_score) { best_score = score; best = c; best_local_x = hx - x0; best_x0 = x0; best_y0 = y0; }
+    }
+    if (!best) return 0;
+    TTFFont* font = font_manager_get_styled(best->fam, best->weight ? best->weight : 400, best->ital);
+    if (!font) return 0;
+    size_t n = strlen(best->s), local = 0;
+    if (n > UINT32_MAX - best->text_offset ||
+        (size_t)best->text_offset + n > strlen(best->node->text)) return 0;
+    if (!ttf_text_hit_test_ex_bidi(font, best->s, best->size, best->tstyle, best_local_x,
+                                   text_base_direction(&best->node->st), text_bidi_override(&best->node->st), &local) || local > n) return 0;
+    uint32_t absolute = best->text_offset + (uint32_t)local;
+    if (absolute > strlen(best->node->text)) return 0;
+    out->node = best->node; out->offset = absolute;
+    out->visual_x = best_x0 + best_local_x;
+    out->visual_y = best_y0 + best->h * 0.5f;
+    /* Snap the stored visual point to the exact legal caret if the metrics API is available. */
+    if (n <= (size_t)INT_MAX - 1) {
+        int* caret_offsets = malloc((n + 1) * sizeof(*caret_offsets));
+        if (caret_offsets) {
+            int cw = ttf_text_offsets_ex_bidi(font, best->s, best->size, best->tstyle,
+                caret_offsets, (int)n + 1, text_base_direction(&best->node->st),
+                text_bidi_override(&best->node->st));
+            if (cw >= 0 && local <= n)
+                out->visual_x = best_x0 + caret_offsets[local];
+            free(caret_offsets);
+        }
+    }
+    return 1;
+}
+
+typedef struct {
+    WebTextPosition pos;
+    float x, y, top, bottom, height;
+    int row;
+} WebCaretStop;
+
+static size_t caret_utf8_next(const unsigned char* s, size_t n, size_t i) {
+    if (i >= n) return n;
+    unsigned char c = s[i];
+    size_t step = c < 0x80 ? 1 : (c >= 0xC2 && c <= 0xDF) ? 2 :
+                  (c >= 0xE0 && c <= 0xEF) ? 3 : (c >= 0xF0 && c <= 0xF4) ? 4 : 1;
+    if (step > n - i) return i + 1;
+    for (size_t k = 1; k < step; ++k) if ((s[i + k] & 0xC0u) != 0x80u) return i + 1;
+    if (step == 3 && c == 0xE0 && s[i + 1] < 0xA0) return i + 1;
+    if (step == 3 && c == 0xED && s[i + 1] >= 0xA0) return i + 1;
+    if (step == 4 && c == 0xF0 && s[i + 1] < 0x90) return i + 1;
+    if (step == 4 && c == 0xF4 && s[i + 1] >= 0x90) return i + 1;
+    return i + step;
+}
+
+static int caret_stop_append(WebCaretStop** stops, size_t* count, size_t* cap,
+                             const WebCaretStop* stop) {
+    if (!stops || !count || !cap || !stop || *count >= 250000) return 0;
+    /* A display-list boundary can be emitted by two adjacent runs. Collapse only
+       identical node/offset/visual positions; wrapped copies remain distinct. */
+    if (*count) {
+        const WebCaretStop* last = &(*stops)[*count - 1];
+        if (last->pos.node == stop->pos.node && last->pos.offset == stop->pos.offset &&
+            fabsf(last->x - stop->x) < 0.5f && fabsf(last->y - stop->y) < 0.5f) return 1;
+    }
+    if (*count == *cap) {
+        size_t nc = *cap ? *cap * 2 : 256;
+        if (nc > 250000) nc = 250000;
+        if (nc <= *cap || nc > SIZE_MAX / sizeof(**stops)) return 0;
+        WebCaretStop* v = realloc(*stops, nc * sizeof(*v));
+        if (!v) return 0;
+        *stops = v; *cap = nc;
+    }
+    (*stops)[(*count)++] = *stop;
+    return 1;
+}
+
+static int caret_stop_ycmp(const void* ap, const void* bp) {
+    const WebCaretStop* a = ap; const WebCaretStop* b = bp;
+    if (a->y < b->y) return -1; if (a->y > b->y) return 1;
+    if (a->x < b->x) return -1; if (a->x > b->x) return 1;
+    if (a->pos.node->idx != b->pos.node->idx) return a->pos.node->idx < b->pos.node->idx ? -1 : 1;
+    return a->pos.offset < b->pos.offset ? -1 : a->pos.offset > b->pos.offset;
+}
+static int caret_stop_row_xcmp(const void* ap, const void* bp) {
+    const WebCaretStop* a = ap; const WebCaretStop* b = bp;
+    if (a->row != b->row) return a->row < b->row ? -1 : 1;
+    if (a->x < b->x) return -1; if (a->x > b->x) return 1;
+    if (a->y < b->y) return -1; if (a->y > b->y) return 1;
+    if (a->pos.node->idx != b->pos.node->idx) return a->pos.node->idx < b->pos.node->idx ? -1 : 1;
+    return a->pos.offset < b->pos.offset ? -1 : a->pos.offset > b->pos.offset;
+}
+
+static int collect_web_caret_stops(DOMNode* head, WebCaretStop** out, size_t* out_count) {
+    if (!head || !out || !out_count || !l2_dl || head != g_last_head) return 0;
+    *out = NULL; *out_count = 0;
+    size_t cap = 0;
+    Frame fr[2];
+    fr_init(&fr[0], 0, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
+    fr_init(&fr[1], 1, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
+    for (int ci = 0; ci < l2_dn; ++ci) {
+        const Cmd* c = &l2_dl[ci];
+        if (fr_is_ctl(c)) { fr_ctl(&fr[0], c); fr_ctl(&fr[1], c); continue; }
+        if (c->t != C_TEXT || !c->node || c->node->type != TAG_TEXT || c->node->idx < 0 ||
+            !c->text_offset_valid || !c->s || c->node->st.user_select == 1 ||
+            c->node->st.pointer_events == 1 || !isfinite(c->x) || !isfinite(c->y) ||
+            !isfinite(c->w) || !isfinite(c->h) || c->w < 0 || c->h <= 0) continue;
+        size_t n = strlen(c->s), node_len = strlen(c->node->text);
+        if (!n || n > (size_t)INT_MAX - 1 || c->text_offset > node_len || n > node_len - c->text_offset ||
+            memcmp(c->node->text + c->text_offset, c->s, n) != 0) continue;
+        TTFFont* font = font_manager_get_styled(c->fam, c->weight ? c->weight : 400, c->ital);
+        if (!font) continue;
+        int* offsets = malloc((n + 1) * sizeof(*offsets));
+        if (!offsets) { free(*out); *out = NULL; *out_count = 0; return 0; }
+        if (ttf_text_offsets_ex_bidi(font, c->s, c->size, c->tstyle, offsets, (int)n + 1,
+                                     text_base_direction(&c->node->st), text_bidi_override(&c->node->st)) < 0) {
+            free(offsets); continue;
+        }
+        Frame* f = &fr[c->fixed ? 1 : 0];
+        float x0 = c->x + f->dx, y0 = c->y + f->dy;
+        WebCaretStop stop; memset(&stop, 0, sizeof stop);
+        stop.pos.node = c->node; stop.pos.offset = c->text_offset;
+        stop.top = y0; stop.bottom = y0 + c->h; stop.height = c->h;
+        stop.y = y0 + c->h * 0.5f;
+        stop.x = x0 + offsets[0]; stop.pos.visual_x = stop.x; stop.pos.visual_y = stop.y;
+        if (!caret_stop_append(out, out_count, &cap, &stop)) {
+            free(offsets); free(*out); *out = NULL; *out_count = 0; return 0;
+        }
+        size_t i = 0;
+        while (i < n) {
+            size_t next = caret_utf8_next((const unsigned char*)c->s, n, i);
+            if (next <= i || next > n) break;
+            /* HarfBuzz assigns the same x to every byte in one cluster. A changed
+               caret x marks the next legal cluster boundary; this skips UTF-8
+               continuation bytes, combining marks, and ZWJ interiors. */
+            if (offsets[next] != offsets[i]) {
+                memset(&stop, 0, sizeof stop);
+                stop.pos.node = c->node;
+                stop.pos.offset = c->text_offset + (uint32_t)next;
+                stop.top = y0; stop.bottom = y0 + c->h; stop.height = c->h;
+                stop.y = y0 + c->h * 0.5f; stop.x = x0 + offsets[next];
+                stop.pos.visual_x = stop.x; stop.pos.visual_y = stop.y;
+                if (!caret_stop_append(out, out_count, &cap, &stop)) {
+                    free(offsets); free(*out); *out = NULL; *out_count = 0; return 0;
+                }
+            }
+            i = next;
+        }
+        free(offsets);
+    }
+    if (!*out_count) { free(*out); *out = NULL; return 0; }
+    /* Group text runs on the same visual line, allowing mixed font sizes without
+       merging clearly separate adjacent lines. */
+    qsort(*out, *out_count, sizeof(**out), caret_stop_ycmp);
+    int row = -1; float row_center = 0.0f, row_height = 0.0f;
+    for (size_t i = 0; i < *out_count; ++i) {
+        WebCaretStop* s = &(*out)[i];
+        int same = row >= 0 && fabsf(s->y - row_center) <= 0.44f * fmaxf(s->height, row_height);
+        if (!same) { row++; row_center = s->y; row_height = s->height; }
+        else {
+            float top = fminf(row_center - row_height * 0.5f, s->top);
+            float bottom = fmaxf(row_center + row_height * 0.5f, s->bottom);
+            row_center = (top + bottom) * 0.5f; row_height = bottom - top;
+        }
+        s->row = row;
+    }
+    qsort(*out, *out_count, sizeof(**out), caret_stop_row_xcmp);
+    return 1;
+}
+
+static int caret_stop_for_position(const WebCaretStop* stops, size_t count,
+                                   const WebTextPosition* pos) {
+    if (!stops || !pos || !pos->node) return -1;
+    int best = -1; float best_dist = INFINITY;
+    int coords_valid = isfinite(pos->visual_x) && isfinite(pos->visual_y) &&
+                       (pos->visual_x != 0.0f || pos->visual_y != 0.0f);
+    for (size_t i = 0; i < count; ++i) {
+        if (stops[i].pos.node != pos->node || stops[i].pos.offset != pos->offset) continue;
+        float dist = coords_valid ? fabsf(stops[i].x - pos->visual_x) + 2.0f * fabsf(stops[i].y - pos->visual_y) : 0.0f;
+        if (best < 0 || dist < best_dist) { best = (int)i; best_dist = dist; }
+    }
+    return best;
+}
+
+typedef struct {
+    WebTextPosition pos;
+    int row;
+    int paragraph_id;
+} WebLogicalCaret;
+
+static int logical_caret_cmp(const void* ap, const void* bp) {
+    const WebLogicalCaret* a = ap; const WebLogicalCaret* b = bp;
+    int c = text_pos_compare(&a->pos, &b->pos);
+    if (c) return c;
+    if (a->row != b->row) return a->row < b->row ? -1 : 1;
+    if (a->pos.visual_x < b->pos.visual_x) return -1;
+    if (a->pos.visual_x > b->pos.visual_x) return 1;
+    return 0;
+}
+
+static int caret_block_container(const DOMNode* n) {
+    if (!n || n->type == TAG_TEXT) return 0;
+    switch (n->type) {
+        case TAG_H: case TAG_P: case TAG_DIV: case TAG_HTML: case TAG_BODY:
+        case TAG_MAIN: case TAG_SECTION: case TAG_ARTICLE: case TAG_HEADER:
+        case TAG_FOOTER: case TAG_NAV: case TAG_ASIDE: case TAG_UL: case TAG_OL:
+        case TAG_LI: case TAG_TABLE: case TAG_TR: case TAG_TD: case TAG_TH:
+        case TAG_FORM: case TAG_FIELDSET:
+            return 1;
+        default: break;
+    }
+    const char* t = n->tag;
+    return !strcmp(t, "blockquote") || !strcmp(t, "pre") || !strcmp(t, "address") ||
+           !strcmp(t, "figure") || !strcmp(t, "figcaption") || !strcmp(t, "h1") ||
+           !strcmp(t, "h2") || !strcmp(t, "h3") || !strcmp(t, "h4") ||
+           !strcmp(t, "h5") || !strcmp(t, "h6") || !strcmp(t, "body") || !strcmp(t, "html");
+}
+
+static int caret_paragraph_id(DOMNode** by_idx, size_t node_count, DOMNode* text) {
+    if (!by_idx || !text) return -1;
+    int parent = text->parent;
+    size_t guard = 0;
+    while (parent >= 0 && (size_t)parent < node_count && guard++ < node_count) {
+        DOMNode* p = by_idx[parent];
+        if (!p) break;
+        if (caret_block_container(p)) return p->idx;
+        parent = p->parent;
+    }
+    return text->parent;
+}
+
+static int collect_logical_carets(DOMNode* head, const WebCaretStop* stops, size_t count,
+                                  WebLogicalCaret** out, size_t* out_count) {
+    if (!head || !stops || !count || !out || !out_count) return 0;
+    *out = NULL; *out_count = 0;
+    int max_idx = -1;
+    for (DOMNode* n = head; n; n = n->next) if (n->idx > max_idx) max_idx = n->idx;
+    if (max_idx < 0 || max_idx > 1000000 || (size_t)max_idx + 1 > SIZE_MAX / sizeof(DOMNode*)) return 0;
+    size_t node_count = (size_t)max_idx + 1;
+    DOMNode** by_idx = calloc(node_count, sizeof(*by_idx));
+    WebLogicalCaret* logical = malloc(count * sizeof(*logical));
+    if (!by_idx || !logical) { free(by_idx); free(logical); return 0; }
+    for (DOMNode* n = head; n; n = n->next) if (n->idx >= 0 && (size_t)n->idx < node_count) by_idx[n->idx] = n;
+    for (size_t i = 0; i < count; ++i) {
+        logical[i].pos = stops[i].pos;
+        logical[i].row = stops[i].row;
+        logical[i].paragraph_id = caret_paragraph_id(by_idx, node_count, stops[i].pos.node);
+    }
+    free(by_idx);
+    qsort(logical, count, sizeof(*logical), logical_caret_cmp);
+    size_t n = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (n && text_pos_compare(&logical[n-1].pos, &logical[i].pos) == 0) {
+            /* Keep the topmost display occurrence for wrapped duplicates. The
+               active position is restored to its precise visual occurrence below. */
+            continue;
+        }
+        if (n != i) logical[n] = logical[i];
+        ++n;
+    }
+    *out = logical; *out_count = n;
+    return n > 0;
+}
+
+static int logical_index_for_position(const WebLogicalCaret* logical, size_t count,
+                                      const WebTextPosition* pos) {
+    if (!logical || !pos) return -1;
+    size_t lo = 0, hi = count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = text_pos_compare(&logical[mid].pos, pos);
+        if (cmp < 0) lo = mid + 1; else hi = mid;
+    }
+    return lo < count && text_pos_compare(&logical[lo].pos, pos) == 0 ? (int)lo : -1;
+}
+
+int webpage_text_selection_move_visual(DOMNode* head, int direction, int extend) {
+    if (!head || !g_text_sel_active || !text_selection_endpoints_live(head) || direction == 0) return 0;
+    WebCaretStop* stops = NULL; size_t count = 0;
+    if (!collect_web_caret_stops(head, &stops, &count)) return 0;
+    int ai = caret_stop_for_position(stops, count, &g_text_sel_anchor);
+    int fi = caret_stop_for_position(stops, count, &g_text_sel_focus);
+    if (ai < 0 || fi < 0) { free(stops); return 0; }
+    int collapsed = text_pos_compare(&g_text_sel_anchor, &g_text_sel_focus) == 0;
+    int word_move = direction == -5 || direction == 5;
+    int paragraph_move = direction == -6 || direction == 6;
+    int horizontal = direction == -1 || direction == 1 || word_move;
+    int handled_direction = (direction >= -6 && direction <= 6 && direction != 0);
+    if (!handled_direction) { free(stops); return 0; }
+    int target = fi;
+    int collapse_only = !extend && !collapsed;
+    if (collapse_only) {
+        if (direction == -1 || direction == 1) {
+            target = direction < 0 ? (ai < fi ? ai : fi) : (ai > fi ? ai : fi);
+        } else if (direction == -2 || direction == 2) {
+            int ay = stops[ai].row, fy = stops[fi].row;
+            target = direction < 0 ? (ay < fy ? ai : fi) : (ay > fy ? ai : fi);
+        } else if (word_move || paragraph_move || direction == -4 || direction == 4) {
+            int cmp = text_pos_compare(&g_text_sel_anchor, &g_text_sel_focus);
+            target = direction < 0 ? (cmp <= 0 ? ai : fi) : (cmp >= 0 ? ai : fi);
+        } else if (direction == -3 || direction == 3) {
+            int row = stops[fi].row;
+            for (size_t i = 0; i < count; ++i) if (stops[i].row == row) {
+                if (direction < 0) { target = (int)i; break; }
+                target = (int)i;
+            }
+        }
+    } else if (direction == -4 || direction == 4) {
+        /* Ctrl+Home/End follow source/DOM order, not visual x order. */
+        target = fi;
+        for (size_t i = 0; i < count; ++i) {
+            int cmp = text_pos_compare(&stops[i].pos, &stops[target].pos);
+            if ((direction < 0 && (cmp < 0 || (cmp == 0 && stops[i].y < stops[target].y))) ||
+                (direction > 0 && (cmp > 0 || (cmp == 0 && stops[i].y > stops[target].y)))) target = (int)i;
+        }
+    } else if (direction == -3 || direction == 3) {
+        int row = stops[fi].row; target = fi;
+        for (size_t i = 0; i < count; ++i) if (stops[i].row == row) {
+            if (direction < 0) { target = (int)i; break; }
+            target = (int)i;
+        }
+    } else if (direction == -5 || direction == 5 || direction == -6 || direction == 6) {
+        WebLogicalCaret* logical = NULL; size_t logical_count = 0;
+        if (collect_logical_carets(head, stops, count, &logical, &logical_count)) {
+            int li = logical_index_for_position(logical, logical_count, &stops[fi].pos);
+            if (li >= 0) {
+                /* Restore the exact wrapped occurrence for the active caret. */
+                logical[li].pos.visual_x = stops[fi].x;
+                logical[li].pos.visual_y = stops[fi].y;
+                TTFLogicalCaretPosition* nav = malloc(logical_count * sizeof(*nav));
+                if (nav) {
+                    for (size_t i = 0; i < logical_count; ++i) {
+                        nav[i].utf8 = logical[i].pos.node->text;
+                        nav[i].byte_offset = logical[i].pos.offset;
+                        nav[i].paragraph_id = logical[i].paragraph_id;
+                    }
+                    size_t wanted = (size_t)li;
+                    int ok = word_move ? ttf_logical_caret_move_word(nav, logical_count, (size_t)li,
+                                            direction < 0 ? -1 : 1, &wanted) :
+                        ttf_logical_caret_move_paragraph(nav, logical_count, (size_t)li,
+                                            direction < 0 ? -1 : 1, &wanted);
+                    if (ok && wanted < logical_count) {
+                        int ti = caret_stop_for_position(stops, count, &logical[wanted].pos);
+                        if (ti >= 0) target = ti;
+                    }
+                    free(nav);
+                }
+            }
+            free(logical);
+        }
+    } else if (direction == -1 || direction == 1 || direction == -2 || direction == 2) {
+        TTFVisualCaretStop* visual = malloc(count * sizeof(*visual));
+        if (visual) {
+            for (size_t i = 0; i < count; ++i) {
+                visual[i].x = stops[i].x; visual[i].y = stops[i].y;
+                visual[i].height = stops[i].height; visual[i].row = stops[i].row;
+            }
+            float preferred = isfinite(g_text_sel_preferred_x) ? g_text_sel_preferred_x : stops[fi].x;
+            size_t next = (size_t)fi;
+            if (ttf_visual_caret_step(visual, count, (size_t)fi, direction, preferred, &next)) target = (int)next;
+            free(visual);
+            if (direction == -2 || direction == 2) g_text_sel_preferred_x = preferred;
+        }
+    }
+    if (extend) g_text_sel_focus = stops[target].pos;
+    else g_text_sel_anchor = g_text_sel_focus = stops[target].pos;
+    if (horizontal || direction == -3 || direction == 3 || direction == -4 || direction == 4 || paragraph_move)
+        g_text_sel_preferred_x = stops[target].x;
+    g_text_sel_active = 1;
+    free(stops);
+    return target != fi || collapse_only;
+}
+
+static int webpage_copy_logical_selection(DOMNode* head, char* out, int cap) {
+    WebTextPosition first, last;
+    if (!out || cap < 1 || !text_selection_endpoints_live(head) ||
+        !text_selection_ordered(&first, &last) || text_pos_compare(&first, &last) == 0) return 0;
+    int max_idx = -1;
+    for (DOMNode* n = head; n; n = n->next) if (n->idx > max_idx) max_idx = n->idx;
+    if (max_idx < 0 || (size_t)max_idx >= SIZE_MAX) return 0;
+    unsigned char* rendered = calloc((size_t)max_idx + 1, 1);
+    if (!rendered) return 0;
+    for (int i = 0; i < l2_dn; i++) {
+        const Cmd* c = &l2_dl[i];
+        if (c->t == C_TEXT && c->node && c->node->type == TAG_TEXT && c->node->idx >= 0 && c->node->idx <= max_idx)
+            rendered[c->node->idx] = 1;
+    }
+    size_t o = 0;
+    for (DOMNode* n = head; n && o < (size_t)cap - 1; n = n->next) {
+        if (n->type != TAG_TEXT || n->st.user_select == 1 || n->idx < first.node->idx || n->idx > last.node->idx ||
+            n->idx < 0 || n->idx > max_idx || !rendered[n->idx]) continue;
+        size_t len = strlen(n->text), begin = 0, end = len;
+        if (n->idx == first.node->idx) begin = first.offset;
+        if (n->idx == last.node->idx) end = last.offset;
+        if (begin > len) begin = len; if (end > len) end = len;
+        if (end <= begin) continue;
+        size_t take = end - begin; if (take > (size_t)cap - 1 - o) take = (size_t)cap - 1 - o;
+        memcpy(out + o, n->text + begin, take); o += take;
+    }
+    out[o] = 0; free(rendered); return (int)o;
+}
+
 int webpage_copy_selection(char* out, int cap) {
-    int sx, sy, sw, sh; if (!sel_rect(&sx, &sy, &sw, &sh) || cap < 2) return 0;
+    if (!out || cap < 2) return 0;
+    if (g_text_sel_active) return webpage_copy_logical_selection(g_last_head, out, cap);
+    int sx, sy, sw, sh; if (!sel_rect(&sx, &sy, &sw, &sh)) return 0;
     int o = 0; float last_y = -1e9f; int any = 0;
     Frame fr; fr_init(&fr, 0, 0, g_top, SCREEN_WIDTH, SCREEN_HEIGHT);
     for (int i = 0; i < l2_dn; i++) {
         const Cmd* c = &l2_dl[i]; if (fr_is_ctl(c)) { fr_ctl(&fr, c); continue; }
-        if (c->t != C_TEXT || c->fixed) continue;
+        if (c->t != C_TEXT || c->fixed || (c->node && c->node->st.user_select == 1)) continue;
         int x = (int)(c->x + fr.dx + 0.5f), y = (int)(c->y + fr.dy + 0.5f);
         if (y + (int)c->h <= fr.cy0 || y >= fr.cy1 || x + (int)c->w <= fr.cx0 || x >= fr.cx1) continue;      /* скрытое отсечением */
         if (!rect_hit(x, y, (int)c->w + 1, (int)c->h, sx, sy, sw, sh)) continue;
         TTFFont* f = font_manager_get_styled(c->fam, c->weight ? c->weight : 400, c->ital); if (!f) continue;
         size_t n = strlen(c->s); int* offs = malloc((n + 1) * sizeof(int)); if (!offs) continue;
-        ttf_text_offsets_ex(f, c->s, c->size, c->tstyle, offs, (int)n + 1);
+        const NodeStyle* text_st = c->node ? &c->node->st : NULL;
+        int text_dir = text_base_direction(text_st);
+        int text_override = text_bidi_override(text_st);
+        ttf_text_offsets_ex_bidi(f, c->s, c->size, c->tstyle, offs, (int)n + 1, text_dir, text_override);
         int started = 0;
         for (size_t k = 0; k < n;) {
             size_t l = 1; unsigned char ch = (unsigned char)c->s[k]; if (ch >= 0xF0) l = 4; else if (ch >= 0xE0) l = 3; else if (ch >= 0xC0) l = 2; if (k + l > n) l = n - k;
-            if (rect_hit(x + offs[k], y, offs[k + l] - offs[k], (int)c->h, sx, sy, sw, sh)) {
+            int oa = offs[k], ob = offs[k + l];
+            int ox = oa < ob ? oa : ob, ow = abs(ob - oa);
+            if (ow > 0 && rect_hit(x + ox, y, ow, (int)c->h, sx, sy, sw, sh)) {
                 if (!started && any && o < cap - 2) out[o++] = (c->y - last_y > c->h * 0.5f) ? '\n' : ' ';
                 started = 1; any = 1; for (size_t q = 0; q < l && o < cap - 1; q++) out[o++] = c->s[k + q];
             }
@@ -894,55 +2020,186 @@ int webpage_copy_selection(char* out, int cap) {
     out[o] = 0; return o;
 }
 
-static void url_enc(const char* s, char* out, size_t cap, size_t* o) {
+/* Form submissions are binary-safe so file inputs can produce real multipart bodies. */
+typedef struct { unsigned char* p; size_t n, cap; } FormBuf;
+#define FORM_MAX_BODY ((size_t)64 << 20)
+#define FORM_MAX_FILE ((size_t)32 << 20)
+static int form_buf_add(FormBuf* b, const void* p, size_t n) {
+    if (!b || (!p && n) || n > FORM_MAX_BODY || b->n > FORM_MAX_BODY - n) return 0;
+    size_t need = b->n + n;
+    if (need > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < need) { if (cap > FORM_MAX_BODY / 2) { cap = FORM_MAX_BODY; break; } cap *= 2; }
+        unsigned char* q = realloc(b->p, cap ? cap : 1); if (!q) return 0; b->p = q; b->cap = cap;
+    }
+    if (n) memcpy(b->p + b->n, p, n); b->n += n; return 1;
+}
+static int form_buf_s(FormBuf* b, const char* s) { return form_buf_add(b, s ? s : "", s ? strlen(s) : 0); }
+static int form_buf_c(FormBuf* b, char c) { return form_buf_add(b, &c, 1); }
+static const char* form_basename(const char* path) {
+    if (!path) return "";
+    const char* a = strrchr(path, '/'); const char* b = strrchr(path, '\\');
+    const char* p = !a ? b : (!b ? a : (a > b ? a : b));
+    return p ? p + 1 : path;
+}
+static int form_urlencode(FormBuf* b, const char* s) {
+    static const char hex[] = "0123456789ABCDEF";
+    if (!s) s = "";
     for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
-        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') { if (*o + 1 < cap) out[(*o)++] = (char)c; }
-        else if (c == ' ') { if (*o + 1 < cap) out[(*o)++] = '+'; }
-        else if (*o + 3 < cap) { snprintf(out + *o, cap - *o, "%%%02X", c); *o += 3; }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strchr("-._~", c)) {
+            if (!form_buf_c(b, (char)c)) return 0;
+        } else if (c == ' ') { if (!form_buf_c(b, '+')) return 0; }
+        else { char x[3] = { '%', hex[c >> 4], hex[c & 15] }; if (!form_buf_add(b, x, sizeof x)) return 0; }
     }
-    out[*o] = 0;
+    return 1;
+}
+static int form_mp_quote(FormBuf* b, const char* s) {
+    if (!s) s = "";
+    for (; *s; s++) {
+        if (*s == '\r') { if (!form_buf_s(b, "%0D")) return 0; }
+        else if (*s == '\n') { if (!form_buf_s(b, "%0A")) return 0; }
+        else if (*s == '"') { if (!form_buf_s(b, "%22")) return 0; }
+        else if (!form_buf_c(b, *s)) return 0;
+    }
+    return 1;
+}
+static int form_read_selected_file(const DOMNode* n, FormBuf* file) {
+    if (!n || !n->file_selected || !n->value[0]) return 1; /* empty file control */
+    FILE* f = fopen(n->value, "rb"); if (!f) return 0;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long sz = ftell(f);
+    if (sz < 0 || (unsigned long)sz > FORM_MAX_FILE || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
+    size_t size = (size_t)sz;
+    unsigned char* tmp = malloc(size ? size : 1);
+    if (!tmp) { fclose(f); return 0; }
+    size_t got = size ? fread(tmp, 1, size, f) : 0; int ok = got == size && !ferror(f); fclose(f);
+    if (ok) ok = form_buf_add(file, tmp, size);
+    free(tmp); return ok;
+}
+static int form_add_url_field(FormBuf* b, int* first, const char* name, const char* value) {
+    if (!*first && !form_buf_c(b, '&')) return 0;
+    *first = 0;
+    return form_urlencode(b, name) && form_buf_c(b, '=') && form_urlencode(b, value);
+}
+static int form_add_text_part(FormBuf* b, const char* boundary, const char* name, const char* value) {
+    return form_buf_s(b, "--") && form_buf_s(b, boundary) && form_buf_s(b, "\r\nContent-Disposition: form-data; name=\"") &&
+        form_mp_quote(b, name) && form_buf_s(b, "\"\r\n\r\n") && form_buf_s(b, value) && form_buf_s(b, "\r\n");
+}
+static int form_add_file_part(FormBuf* b, const char* boundary, const DOMNode* input) {
+    const char* path = (input && input->file_selected) ? input->value : "";
+    const char* name = path[0] ? form_basename(path) : "";
+    if (!form_buf_s(b, "--") || !form_buf_s(b, boundary) || !form_buf_s(b, "\r\nContent-Disposition: form-data; name=\"") ||
+        !form_mp_quote(b, input->name) || !form_buf_s(b, "\"; filename=\"") || !form_mp_quote(b, name) ||
+        !form_buf_s(b, "\"\r\nContent-Type: application/octet-stream\r\n\r\n")) return 0;
+    if (path[0] && !form_read_selected_file(input, b)) return 0;
+    return form_buf_s(b, "\r\n");
+}
+static int form_add_text_plain(FormBuf* b, int* first, const char* name, const char* value) {
+    (void)first;
+    return form_buf_s(b, name) && form_buf_c(b, '=') && form_buf_s(b, value) && form_buf_s(b, "\r\n");
 }
 
-int webpage_form_url(DOMNode* control, DOMNode* submitter, char* out, int cap) {
+void webpage_form_submission_free(WebFormSubmission* submission) {
+    if (!submission) return; free(submission->body); memset(submission, 0, sizeof *submission);
+}
+
+int webpage_form_request(DOMNode* control, DOMNode* submitter, WebFormSubmission* out) {
+    if (!out) return 0; memset(out, 0, sizeof *out);
     if (!g_head || !control) return 0;
-    DOMNode* form = control; DOMNode** nv = NULL; int n = 0;
+    DOMNode** nv = NULL; int n = 0;
     for (DOMNode* p = g_head; p; p = p->next) n++;
     nv = malloc((size_t)n * sizeof(DOMNode*)); if (!nv) return 0;
     { int i = 0; for (DOMNode* p = g_head; p; p = p->next) nv[i++] = p; }
-    while (form && strcmp(form->tag, "form") != 0) form = form->parent >= 0 ? nv[form->parent] : NULL;
+    DOMNode* form = control;
+    while (form && strcmp(form->tag, "form") != 0) form = form->parent >= 0 && form->parent < n ? nv[form->parent] : NULL;
     if (!form) { free(nv); return 0; }
-    char method[16] = "get", action[600] = ""; webpage_attr_get(form, "method", method, sizeof method); webpage_attr_get(form, "action", action, sizeof action);
-    if (!strcasecmp(method, "post")) { free(nv); return 0; }
-    char abs[900]; webpage_resolve_url(g_url, action[0] ? action : g_url, abs, sizeof abs);
-    char* q = strchr(abs, '?'); if (q) *q = 0; char* h = strchr(abs, '#'); if (h) *h = 0;
-    size_t o = 0; char* body = malloc((size_t)cap); if (!body) { free(nv); return 0; } body[0] = 0; int first = 1;
-    for (int i = form->idx + 1; i <= form->subtree_end; i++) {
-        DOMNode* e = nv[i]; if (e->type == TAG_TEXT || e->disabled || !e->name[0]) continue;
-        const char* val = NULL; char lb[256];
+
+    char method[16] = "get", action[600] = "", enctype[96] = "application/x-www-form-urlencoded";
+    webpage_attr_get(form, "method", method, sizeof method); webpage_attr_get(form, "action", action, sizeof action); webpage_attr_get(form, "enctype", enctype, sizeof enctype);
+    if (submitter) {
+        char override[600];
+        if (webpage_attr_get(submitter, "formmethod", override, sizeof override) && override[0]) snprintf(method, sizeof method, "%s", override);
+        if (webpage_attr_get(submitter, "formaction", override, sizeof override) && override[0]) snprintf(action, sizeof action, "%s", override);
+        if (webpage_attr_get(submitter, "formenctype", override, sizeof override) && override[0]) snprintf(enctype, sizeof enctype, "%s", override);
+    }
+    int is_post = !strcasecmp(method, "post");
+    snprintf(out->method, sizeof out->method, "%s", is_post ? "POST" : "GET");
+    char resolved[1200]; webpage_resolve_url(g_url, action[0] ? action : g_url, resolved, sizeof resolved);
+    char* hash = strchr(resolved, '#'); if (hash) *hash = 0;
+    if (!resolved[0] || strlen(resolved) >= sizeof out->url) { free(nv); return 0; }
+
+    int multipart = is_post && !strcasecmp(enctype, "multipart/form-data");
+    int plain = is_post && !strcasecmp(enctype, "text/plain");
+    FormBuf data = {0}; int first = 1, failed = 0;
+    char boundary[80] = "";
+    if (multipart) { static unsigned int seq; snprintf(boundary, sizeof boundary, "----MLBrowserBoundary%08lx%08x", (unsigned long)time(NULL), ++seq); }
+
+    for (int i = form->idx + 1; i <= form->subtree_end && i < n; i++) {
+        DOMNode* e = nv[i]; if (!e || e->type == TAG_TEXT || e->disabled || !e->name[0]) continue;
+        const char* value = NULL; char label[256]; int is_file = 0, include = 0;
         if (e->type == TAG_INPUT) {
             const char* t = e->input_type;
-            if (!strcmp(t, "submit") || !strcmp(t, "button") || !strcmp(t, "image") || !strcmp(t, "reset") || !strcmp(t, "file")) { if (e != submitter || !strcmp(t, "button") || !strcmp(t, "reset")) continue; val = e->value; }
-            else if (!strcmp(t, "checkbox") || !strcmp(t, "radio")) { if (!e->checked) continue; val = e->value[0] ? e->value : "on"; }
-            else val = e->value;
-        } else if (e->type == TAG_TEXTAREA) val = e->value;
+            if (!strcmp(t, "submit") || !strcmp(t, "image")) { if (e != submitter) continue; value = e->value; include = 1; }
+            else if (!strcmp(t, "button") || !strcmp(t, "reset")) continue;
+            else if (!strcmp(t, "file")) { is_file = 1; include = 1; value = e->file_selected ? form_basename(e->value) : ""; }
+            else if (!strcmp(t, "checkbox") || !strcmp(t, "radio")) { if (!e->checked) continue; value = e->value[0] ? e->value : "on"; include = 1; }
+            else { value = e->value; include = 1; }
+        } else if (e->type == TAG_TEXTAREA) { value = e->value; include = 1; }
         else if (e->type == TAG_SELECT) {
-            DOMNode* pick = NULL; DOMNode* firstopt = NULL;
-            for (int k = e->idx + 1; k <= e->subtree_end; k++) if (nv[k]->type == TAG_OPTION) { if (!firstopt) firstopt = nv[k]; if (nv[k]->selected && !pick) pick = nv[k]; }
-            if (!pick) pick = firstopt; if (!pick) continue;
-            val = pick->value; if (!val[0]) { option_label(e, lb, sizeof lb); val = lb; }
-        } else if (e->type == TAG_BUTTON) { if (e != submitter) continue; val = e->value; }
-        else continue;
-        if (!first && o + 1 < (size_t)cap) body[o++] = '&'; first = 0;
-        url_enc(e->name, body, (size_t)cap, &o); if (o + 1 < (size_t)cap) body[o++] = '='; body[o] = 0; url_enc(val ? val : "", body, (size_t)cap, &o);
+            DOMNode* firstopt = NULL; int emitted = 0;
+            for (int k = e->idx + 1; k <= e->subtree_end && k < n; k++) if (nv[k]->type == TAG_OPTION && !nv[k]->disabled) {
+                if (!firstopt) firstopt = nv[k];
+                if (nv[k]->selected) { value = nv[k]->value; if (!value[0]) { option_label(e, label, sizeof label); value = label; }
+                    if (multipart) failed = !form_add_text_part(&data, boundary, e->name, value);
+                    else if (plain) failed = !form_add_text_plain(&data, &first, e->name, value);
+                    else if (is_post || !strcasecmp(method, "get")) failed = !form_add_url_field(&data, &first, e->name, value);
+                    if (failed) break; emitted = 1; if (!e->multiple) break;
+                }
+            }
+            if (!failed && !emitted && firstopt && !e->multiple) {
+                value = firstopt->value; if (!value[0]) { option_label(e, label, sizeof label); value = label; }
+                if (multipart) failed = !form_add_text_part(&data, boundary, e->name, value);
+                else if (plain) failed = !form_add_text_plain(&data, &first, e->name, value);
+                else failed = !form_add_url_field(&data, &first, e->name, value);
+            }
+            if (failed) break; continue;
+        } else if (e->type == TAG_BUTTON) { if (e != submitter) continue; value = e->value; include = 1; }
+        if (!include) continue;
+        if (multipart) failed = is_file ? !form_add_file_part(&data, boundary, e) : !form_add_text_part(&data, boundary, e->name, value);
+        else if (plain) failed = is_file ? !form_add_text_plain(&data, &first, e->name, value) : !form_add_text_plain(&data, &first, e->name, value);
+        else failed = !form_add_url_field(&data, &first, e->name, value);
+        if (failed) break;
     }
-    snprintf(out, (size_t)cap, "%s%s%s", abs, body[0] ? "?" : "", body);
-    free(body); free(nv); return 1;
+    free(nv);
+    if (failed || data.n > FORM_MAX_BODY) { free(data.p); return 0; }
+
+    if (multipart) snprintf(out->headers, sizeof out->headers, "Content-Type: multipart/form-data; boundary=%s\n", boundary);
+    else if (plain) snprintf(out->headers, sizeof out->headers, "Content-Type: text/plain; charset=UTF-8\n");
+    else if (is_post) snprintf(out->headers, sizeof out->headers, "Content-Type: application/x-www-form-urlencoded\n");
+
+    if (!is_post && data.n) {
+        size_t ulen = strlen(resolved); int has_query = strchr(resolved, '?') != NULL;
+        int sep = has_query ? ((ulen && (resolved[ulen-1] == '?' || resolved[ulen-1] == '&')) ? 0 : 1) : 0;
+        if (ulen + (size_t)sep + data.n + 1 > sizeof out->url) { free(data.p); return 0; }
+        memcpy(out->url, resolved, ulen); size_t pos = ulen;
+        if (!has_query) out->url[pos++] = '?'; else if (sep) out->url[pos++] = '&';
+        memcpy(out->url + pos, data.p, data.n); out->url[pos + data.n] = 0;
+    } else snprintf(out->url, sizeof out->url, "%s", resolved);
+    if (is_post) { out->body = data.p; out->body_len = data.n; }
+    else free(data.p);
+    return 1;
+}
+
+int webpage_form_url(DOMNode* control, DOMNode* submitter, char* out, int cap) {
+    WebFormSubmission request; if (!webpage_form_request(control, submitter, &request)) return 0;
+    if (out && cap > 0) snprintf(out, (size_t)cap, "%s", request.url);
+    webpage_form_submission_free(&request); return out && cap > 0;
 }
 
 /* Клик по элементу страницы. Возвращает: 0 — ничего, 1 — сфокусировать поле ввода,
    2 — перейти по url (отправка формы), 3 — обработано (переключение/кнопка). */
-int webpage_click(DOMNode* head, DOMNode* n, char* url, int cap) {
+int webpage_click(DOMNode* head, DOMNode* n, char* url, int cap, WebFormSubmission* submission) {
     if (!n) return 0;
     const char* t = n->input_type;
     if (n->type == TAG_INPUT) {
@@ -952,13 +2209,19 @@ int webpage_click(DOMNode* head, DOMNode* n, char* url, int cap) {
             for (DOMNode* p = head; p; p = p->next) if (p->type == TAG_INPUT && !strcmp(p->input_type, "radio") && p->name[0] && !strcmp(p->name, n->name)) p->checked = 0;
             n->checked = 1; return 3;
         }
-        if (!strcmp(t, "submit") || !strcmp(t, "image")) return webpage_form_url(n, n, url, cap) ? 2 : 3;
+        if (!strcmp(t, "submit") || !strcmp(t, "image")) {
+            if (submission && webpage_form_request(n, n, submission)) { snprintf(url, (size_t)cap, "%s", submission->url); return 2; }
+            return 3;
+        }
         if (!strcmp(t, "button") || !strcmp(t, "reset") || !strcmp(t, "file") || !strcmp(t, "color") || !strcmp(t, "range")) return 3;
         return 1;
     }
     if (n->type == TAG_TEXTAREA) return 1;
     if (n->type == TAG_BUTTON) {
-        if (!t[0] || !strcmp(t, "submit")) return webpage_form_url(n, n, url, cap) ? 2 : 3;
+        if (!t[0] || !strcmp(t, "submit")) {
+            if (submission && webpage_form_request(n, n, submission)) { snprintf(url, (size_t)cap, "%s", submission->url); return 2; }
+            return 3;
+        }
         return 3;
     }
     return 0;
@@ -980,6 +2243,7 @@ void webpage_force_layout_for(DOMNode* head) {
     layout_content_width = (int)l2_doc_w - 10; layout_content_height = (int)l2_doc_h - 20;
 }
 void webpage_get_scroll(int* x, int* y, int* vw, int* vh) { *x = g_sx; *y = g_sy; *vw = SCREEN_WIDTH - 10; *vh = SCREEN_HEIGHT - g_top; }
+int webpage_viewport_top(void) { return g_top; }
 
 /* border-box элемента в координатах документа; для inline-элементов — объединение текстовых фрагментов */
 static int node_rect_raw(DOMNode* n, float* out) {
@@ -988,7 +2252,10 @@ static int node_rect_raw(DOMNode* n, float* out) {
     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; int any = 0;
     for (int i = 0; i < l2_dn; i++) {
         const Cmd* c = &l2_dl[i]; if (c->t != C_TEXT || c->fixed || !c->node) continue;
-        if (c->node->idx <= n->idx || c->node->idx > n->subtree_end) continue;
+        /* Text nodes have no C_MARK entry of their own. Match their own glyph runs;
+           for elements, aggregate text descendants as before. */
+        int match = n->type == TAG_TEXT ? c->node == n : (c->node->idx > n->idx && c->node->idx <= n->subtree_end);
+        if (!match) continue;
         if (c->x < x0) x0 = c->x; if (c->y < y0) y0 = c->y; if (c->x + c->w > x1) x1 = c->x + c->w; if (c->y + c->h > y1) y1 = c->y + c->h; any = 1;
     }
     if (!any) return 0;
@@ -1009,8 +2276,9 @@ DOMNode* webpage_hit_element(DOMNode* head, int mx, int my) {
     for (int i = 0; i < l2_dn; i++) {
         const Cmd* c = &l2_dl[i]; int k = c->fixed ? 1 : 0; Frame* f = &fr[k];
         if (fr_is_ctl(c)) { fr_ctl(f, c); continue; }
-        if (c->t != C_MARK && c->t != C_TEXT && c->t != C_IMG && c->t != C_CTRL) continue;
+        if (c->t != C_MARK && c->t != C_TEXT && c->t != C_IMG && c->t != C_CTRL && c->t != C_HIT) continue;
         if (!c->node || (c->t == C_TEXT && c->node->parent < 0)) continue;
+        if (c->node->st.pointer_events == 1) continue;
         if (!fr_in_clip(f, mx, my)) continue;
         float x0 = c->x + f->dx, y0 = c->y + f->dy, hx, hy; fr_map(f, mx, my, &hx, &hy);
         if (hx >= x0 && hx < x0 + c->w && hy >= y0 && hy < y0 + c->h) best[k] = c;
@@ -1046,3 +2314,4 @@ int  webpage_elem_scroll_get(DOMNode* n, float* x, float* y, float* sw, float* s
     if (!l2_scroll_get(n, x, y)) return 0; l2_scroll_size(n, sw, sh, cw, ch); return 1;
 }
 void webpage_elem_scroll_set(DOMNode* n, float x, float y) { l2_scroll_set(n, x, y); }
+void webpage_elem_scroll_set_smooth(DOMNode* n, float x, float y) { l2_scroll_set_raw(n, x, y); }

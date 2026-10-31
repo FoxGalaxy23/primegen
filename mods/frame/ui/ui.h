@@ -28,6 +28,7 @@ typedef struct {
     HistoryEntry history[MAX_HISTORY];
     int history_count;
     int history_index;
+    float zoom; /* per-tab page zoom (1.0 = 100%) */
 } BrowserTab;
 
 // Global state externs

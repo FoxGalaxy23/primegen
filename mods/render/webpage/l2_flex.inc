@@ -17,6 +17,8 @@ static float layout_flex(Box* b, float cx, float cy, float cw, float ch, LS* ls)
         if (c->kind == K_BR || c->kind == K_TEXT) continue;
         it[k++].b = c;
     }
+    /* CSS order is a stable sort; reverse directions reverse the sorted visual sequence afterwards. */
+    for (int i = 1; i < k; i++) { FItem t = it[i]; int j = i - 1; while (j >= 0 && it[j].b->st->order > t.b->st->order) { it[j + 1] = it[j]; j--; } it[j + 1] = t; }
     if (rev) for (int i = 0; i < k / 2; i++) { FItem t = it[i]; it[i] = it[k - 1 - i]; it[k - 1 - i] = t; }
     float gap_main = col ? st->gap_r : st->gap_c, gap_cross = col ? st->gap_c : st->gap_r;
     if (k == 0) return 0;

@@ -366,6 +366,41 @@ typedef struct JSMallocFunctions {
 
 typedef struct JSGCObjectHeader JSGCObjectHeader;
 
+typedef struct JSJITStats {
+    uint64_t compiled_functions;
+    uint64_t executed_functions;
+    uint64_t deoptimizations;
+    /* Object-valued property reads that were explicitly rooted in native frames. */
+    uint64_t object_roots_created;
+    uint64_t object_roots_released;
+    /* Heap-backed BigInt references retained by native JIT frames. */
+    uint64_t bigint_roots_created;
+    uint64_t bigint_roots_released;
+    /* Straight-line BigInt expression plans reduce repeated JIT/helper dispatch. */
+    uint64_t bigint_plans_compiled;
+    /* Plan dispatches includes attempts that propagate a JavaScript exception. */
+    uint64_t bigint_plan_executions;
+    uint64_t bigint_plan_dispatches;
+} JSJITStats;
+
+typedef struct JSPropertyICStats {
+    uint64_t get_hits;
+    uint64_t get_misses;
+    uint64_t put_hits;
+    uint64_t put_misses;
+} JSPropertyICStats;
+
+/* Read/reset statistics for the ordinary-property interpreter inline cache. */
+void JS_GetPropertyICStats(JSRuntime *rt, JSPropertyICStats *stats);
+void JS_ResetPropertyICStats(JSRuntime *rt);
+
+/* Read/reset statistics for the optional baseline JIT. Unsupported platforms
+   report zero counters and continue using the interpreter. */
+void JS_GetJITStats(JSRuntime *rt, JSJITStats *stats);
+void JS_ResetJITStats(JSRuntime *rt);
+/* Enable/disable native JIT dispatch for testing and embedding diagnostics. */
+void JS_SetJITEnabled(JSRuntime *rt, int enabled);
+
 JSRuntime *JS_NewRuntime(void);
 /* info lifetime must exceed that of rt */
 void JS_SetRuntimeInfo(JSRuntime *rt, const char *info);
@@ -924,6 +959,41 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTrac
 /* return != 0 if the JS code needs to be interrupted */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+/* Optional source-line tracing hook for embedders / DevTools. The hook is
+   called only when execution enters a new source line. Enabling it disables
+   baseline JIT execution so line events remain observable. Do not call back
+   into the same JSContext from the hook. */
+typedef void JSExecutionTraceHook(JSContext *ctx, const char *filename,
+                                  const char *function_name, int line,
+                                  int column, void *opaque);
+void JS_SetExecutionTraceHook(JSRuntime *rt, JSExecutionTraceHook *cb,
+                              void *opaque);
+/* Introspection for embedders implementing a pausing source debugger.
+   Stack strings are bounded and contain only active JavaScript bytecode frames. */
+int JS_GetCurrentStackDepth(JSContext *ctx);
+size_t JS_GetCurrentStackTrace(JSContext *ctx, char *buf, size_t buf_size,
+                               int max_frames);
+/* Primitive-only view of the active bytecode frame. Object values are reported
+   as placeholders; these APIs never invoke user getters or toString methods. */
+enum {
+    JS_DEBUG_VALUE_NOT_FOUND = 0,
+    JS_DEBUG_VALUE_UNDEFINED,
+    JS_DEBUG_VALUE_NULL,
+    JS_DEBUG_VALUE_BOOLEAN,
+    JS_DEBUG_VALUE_NUMBER,
+    JS_DEBUG_VALUE_STRING,
+    JS_DEBUG_VALUE_BIGINT,
+    JS_DEBUG_VALUE_OBJECT,
+    JS_DEBUG_VALUE_FUNCTION,
+    JS_DEBUG_VALUE_UNINITIALIZED,
+    JS_DEBUG_VALUE_SYMBOL,
+    JS_DEBUG_VALUE_OTHER
+};
+int JS_GetCurrentLocalValue(JSContext *ctx, const char *name,
+                            char *value_buf, size_t value_buf_size,
+                            int *value_type);
+size_t JS_GetCurrentLocals(JSContext *ctx, char *buf, size_t buf_size,
+                           int max_variables);
 /* if can_block is TRUE, Atomics.wait() can be used */
 void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
 /* select which debug info is stripped from the compiled code */

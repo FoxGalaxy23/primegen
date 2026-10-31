@@ -34,8 +34,12 @@ static void js_safe_copy(char* dst, size_t dst_size, const char* src) {
         dst[0] = '\0';
         return;
     }
-    strncpy(dst, src, dst_size - 1);
-    dst[dst_size - 1] = '\0';
+    /* Copy only the bytes that fit, without strncpy's ambiguous truncation
+       semantics or compiler diagnostics. memmove also permits overlapping input. */
+    size_t n = 0;
+    while (n < dst_size - 1 && src[n] != '\0') n++;
+    memmove(dst, src, n);
+    dst[n] = '\0';
 }
 
 static void js_value_make_null(JSValue* v) {
@@ -443,13 +447,26 @@ static JSValue parse_arithmetic_expr(Parser* p) {
         p->pos++;
         JSValue right = parse_term(p);
         if (op == '+' && (left.type == JS_VALUE_STRING || right.type == JS_VALUE_STRING)) {
-            char a[256], b[256], out[256];
-            js_value_to_string(&left, a, sizeof(a));
-            js_value_to_string(&right, b, sizeof(b));
-            out[0] = '\0';
-            strncat(out, a, sizeof(out) - 1);
-            strncat(out, b, sizeof(out) - strlen(out) - 1);
-            js_value_make_string(&left, out);
+            /* JSValue strings are capped at 2047 bytes. The old 256-byte
+               temporary silently truncated both operands before concatenation. */
+            char lhs_num[64];
+            char rhs_text[sizeof(right.string)];
+            const char* lhs_text = left.string;
+            if (left.type != JS_VALUE_STRING) {
+                js_value_to_string(&left, lhs_num, sizeof(lhs_num));
+                lhs_text = lhs_num;
+            }
+            js_value_to_string(&right, rhs_text, sizeof(rhs_text));
+            size_t lhs_len = strlen(lhs_text);
+            size_t lhs_copy = lhs_len < sizeof(left.string) - 1 ? lhs_len : sizeof(left.string) - 1;
+            if (lhs_text != left.string) memmove(left.string, lhs_text, lhs_copy);
+            size_t room = sizeof(left.string) - 1 - lhs_copy;
+            size_t rhs_len = strlen(rhs_text);
+            size_t rhs_copy = rhs_len < room ? rhs_len : room;
+            memcpy(left.string + lhs_copy, rhs_text, rhs_copy);
+            left.string[lhs_copy + rhs_copy] = '\0';
+            left.type = JS_VALUE_STRING;
+            left.number = 0.0;
         } else {
             double a = js_value_to_number(&left);
             double b = js_value_to_number(&right);

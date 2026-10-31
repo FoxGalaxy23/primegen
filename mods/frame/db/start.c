@@ -12,6 +12,14 @@ int active_profile_id = 1;
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <limits.h>
+#ifdef HAVE_OPENSSL_VAULT
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#endif
 
 static sqlite3* db = NULL;
 
@@ -121,12 +129,17 @@ int db_init(void) {
         "  total_size INTEGER,"
         "  downloaded_size INTEGER,"
         "  status TEXT,"
-        "  start_time INTEGER"
+        "  start_time INTEGER,"
+        "  etag TEXT NOT NULL DEFAULT '',"
+        "  last_modified TEXT NOT NULL DEFAULT '',"
+        "  accept_ranges INTEGER NOT NULL DEFAULT 0"
         ");";
 
     sqlite3_exec(db, sql_profiles, NULL, NULL, NULL);
     sqlite3_exec(db, sql_history, NULL, NULL, NULL);
     sqlite3_exec(db, sql_cookies, NULL, NULL, NULL);
+    /* Migrate databases created before SameSite was persisted. Duplicate-column errors are expected on newer DBs. */
+    sqlite3_exec(db, "ALTER TABLE cookies ADD COLUMN same_site INTEGER NOT NULL DEFAULT 2;", NULL, NULL, NULL);
     sqlite3_exec(db, sql_personal, NULL, NULL, NULL);
     sqlite3_exec(db, sql_local_storage, NULL, NULL, NULL);
     sqlite3_exec(db, sql_indexed_db_meta, NULL, NULL, NULL);
@@ -135,6 +148,13 @@ int db_init(void) {
     sqlite3_exec(db, sql_service_worker_caches, NULL, NULL, NULL);
     sqlite3_exec(db, sql_service_worker_cache_entries, NULL, NULL, NULL);
     sqlite3_exec(db, sql_downloads, NULL, NULL, NULL);
+    /* Additive migrations for databases created by older builds. Duplicate-column errors are expected. */
+    sqlite3_exec(db, "ALTER TABLE downloads ADD COLUMN etag TEXT NOT NULL DEFAULT '';", NULL, NULL, NULL);
+    sqlite3_exec(db, "ALTER TABLE downloads ADD COLUMN last_modified TEXT NOT NULL DEFAULT '';", NULL, NULL, NULL);
+    sqlite3_exec(db, "ALTER TABLE downloads ADD COLUMN accept_ranges INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS bookmarks (id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER NOT NULL, url TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at INTEGER DEFAULT 0, UNIQUE(profile_id,url), FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE);", NULL, NULL, NULL);
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS browser_session (profile_id INTEGER NOT NULL, slot INTEGER NOT NULL, url TEXT NOT NULL, is_active INTEGER DEFAULT 0, UNIQUE(profile_id,slot), FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE);", NULL, NULL, NULL);
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS saved_passwords (id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER NOT NULL, origin TEXT NOT NULL, username TEXT NOT NULL, password_enc TEXT NOT NULL, created_at INTEGER DEFAULT 0, UNIQUE(profile_id,origin,username), FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE);", NULL, NULL, NULL);
 
     // Insert Default profile if empty
     sqlite3_exec(db, "INSERT OR IGNORE INTO profiles (id, name, is_active) VALUES (1, 'Default', 1);", NULL, NULL, NULL);
@@ -159,6 +179,103 @@ void db_close(void) {
         sqlite3_close(db);
         db = NULL;
     }
+}
+
+static int db_backup_all(sqlite3* destination, sqlite3* source) {
+    if (!destination || !source) return 0;
+    sqlite3_backup* backup = sqlite3_backup_init(destination, "main", source, "main");
+    if (!backup) return 0;
+    int rc = SQLITE_OK, attempts = 0;
+    do {
+        rc = sqlite3_backup_step(backup, 256);
+        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) { sqlite3_sleep(20); attempts++; }
+    } while ((rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) && attempts < 250);
+    int finish_rc = sqlite3_backup_finish(backup);
+    return rc == SQLITE_DONE && finish_rc == SQLITE_OK;
+}
+
+static int db_path_is_live(const char* path) {
+    if (!db || !path) return 0;
+    const char* live = sqlite3_db_filename(db, "main");
+    if (!live || !*live) return 0;
+    if (!strcmp(live, path)) return 1;
+#ifndef _WIN32
+    char a[PATH_MAX], b[PATH_MAX];
+    if (realpath(live, a) && realpath(path, b) && !strcmp(a, b)) return 1;
+#endif
+    return 0;
+}
+
+int db_export_profile_backup(const char* path) {
+    if (!db || !path || !*path || db_path_is_live(path)) return 0;
+    char tmp[4096];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp-%ld", path, (long)getpid()) >= (int)sizeof tmp) return 0;
+    remove(tmp);
+    sqlite3* dst = NULL;
+    if (sqlite3_open_v2(tmp, &dst, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
+        if (dst) sqlite3_close(dst);
+        remove(tmp); return 0;
+    }
+    int ok = db_backup_all(dst, db);
+    if (sqlite3_close(dst) != SQLITE_OK) ok = 0;
+    if (ok) {
+#ifdef _WIN32
+        (void)remove(path);
+#endif
+        if (rename(tmp, path) != 0) ok = 0;
+    }
+    if (!ok) remove(tmp);
+    return ok;
+}
+
+static int db_backup_has_core_schema(sqlite3* source) {
+    const char* tables[] = {"profiles", "history", "bookmarks"};
+    for (size_t i = 0; i < sizeof tables / sizeof tables[0]; ++i) {
+        sqlite3_stmt* stmt = NULL;
+        if (sqlite3_prepare_v2(source, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", -1, &stmt, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_text(stmt, 1, tables[i], -1, SQLITE_STATIC);
+        int found = sqlite3_step(stmt) == SQLITE_ROW;
+        sqlite3_finalize(stmt);
+        if (!found) return 0;
+    }
+    sqlite3_stmt* check = NULL;
+    if (sqlite3_prepare_v2(source, "PRAGMA quick_check", -1, &check, NULL) != SQLITE_OK) return 0;
+    int rc = sqlite3_step(check);
+    const unsigned char* value = rc == SQLITE_ROW ? sqlite3_column_text(check, 0) : NULL;
+    int ok = value && !strcmp((const char*)value, "ok");
+    sqlite3_finalize(check);
+    return ok;
+}
+
+int db_import_profile_backup(const char* path) {
+    if (!db || !path || !*path || db_path_is_live(path)) return 0;
+    sqlite3* source = NULL;
+    if (sqlite3_open_v2(path, &source, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
+        if (source) sqlite3_close(source);
+        return 0;
+    }
+    if (!db_backup_has_core_schema(source)) { sqlite3_close(source); return 0; }
+    (void)mkdir("cache", 0700);
+    char safety[256]; snprintf(safety, sizeof safety, "cache/profile-restore-safety-%ld.db", (long)getpid());
+    remove(safety);
+    if (!db_export_profile_backup(safety)) { sqlite3_close(source); return 0; }
+    int ok = db_backup_all(db, source);
+    sqlite3_close(source);
+    if (ok) {
+        db_close();
+        ok = db_init(); /* re-run additive schema migrations and refresh active_profile_id */
+    }
+    if (!ok) {
+        sqlite3* rollback = NULL;
+        if (sqlite3_open_v2(safety, &rollback, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
+            if (!db) (void)db_init();
+            if (db) (void)db_backup_all(db, rollback);
+            sqlite3_close(rollback);
+        }
+        if (db) { db_close(); (void)db_init(); }
+    }
+    remove(safety);
+    return ok;
 }
 
 int db_get_active_profile(char* name_out, int max_len) {
@@ -357,9 +474,9 @@ char* db_generate_history_html(void) {
     return html;
 }
 
-int db_save_cookie(int profile_id, const char* domain, const char* name, const char* value, const char* path, long long expiry, int is_secure) {
+int db_save_cookie(int profile_id, const char* domain, const char* name, const char* value, const char* path, long long expiry, int is_secure, int same_site) {
     sqlite3_stmt* stmt;
-    const char* sql = "INSERT OR REPLACE INTO cookies (profile_id, domain, name, value, path, expiry, is_secure) VALUES (?, ?, ?, ?, ?, ?, ?);";
+    const char* sql = "INSERT OR REPLACE INTO cookies (profile_id, domain, name, value, path, expiry, is_secure, same_site) VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
     
     sqlite3_bind_int(stmt, 1, profile_id);
@@ -369,6 +486,7 @@ int db_save_cookie(int profile_id, const char* domain, const char* name, const c
     sqlite3_bind_text(stmt, 5, path ? path : "/", -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 6, expiry);
     sqlite3_bind_int(stmt, 7, is_secure);
+    sqlite3_bind_int(stmt, 8, (same_site >= 1 && same_site <= 3) ? same_site : 2);
     
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -401,7 +519,7 @@ void db_export_cookies_to_file(int profile_id, const char* filepath) {
     fprintf(f, "# Generated by MeetlookersBrowser\n");
     
     sqlite3_stmt* stmt;
-    const char* sql = "SELECT domain, path, expiry, name, value, is_secure FROM cookies WHERE profile_id = ?;";
+    const char* sql = "SELECT domain, path, expiry, name, value, is_secure, same_site FROM cookies WHERE profile_id = ?;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_int(stmt, 1, profile_id);
         while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -411,15 +529,16 @@ void db_export_cookies_to_file(int profile_id, const char* filepath) {
             const char* name = (const char*)sqlite3_column_text(stmt, 3);
             const char* value = (const char*)sqlite3_column_text(stmt, 4);
             int is_secure = sqlite3_column_int(stmt, 5);
+            int same_site = sqlite3_column_int(stmt, 6); if (same_site < 1 || same_site > 3) same_site = 2;
             
-            fprintf(f, "%s\t%s\t%s\t%s\t%lld\t%s\t%s\n",
+            fprintf(f, "%s\t%s\t%s\t%s\t%lld\t%s\t%s\t%d\n",
                     domain ? domain : "",
                     "TRUE",
                     path ? path : "/",
                     is_secure ? "TRUE" : "FALSE",
                     expiry,
                     name ? name : "",
-                    value ? value : "");
+                    value ? value : "", same_site);
         }
         sqlite3_finalize(stmt);
     }
@@ -447,6 +566,7 @@ void db_import_cookies_from_file(int profile_id, const char* filepath) {
         long long expiry = 0;
         char name[256] = {0};
         char value[1024] = {0};
+        int same_site = 2;
         
         char* d = strtok(line, "\t");
         char* f1 = strtok(NULL, "\t");
@@ -455,6 +575,7 @@ void db_import_cookies_from_file(int profile_id, const char* filepath) {
         char* exp_str = strtok(NULL, "\t");
         char* n = strtok(NULL, "\t");
         char* v = strtok(NULL, "\t");
+        char* ss = strtok(NULL, "\t"); if (ss) { int x = atoi(ss); if (x >= 1 && x <= 3) same_site = x; }
         
         if (d && f1 && p && f2 && exp_str && n) {
             strncpy(domain, d, 255);
@@ -468,7 +589,7 @@ void db_import_cookies_from_file(int profile_id, const char* filepath) {
             }
             int is_secure = (strcmp(f2, "TRUE") == 0) ? 1 : 0;
             
-            db_save_cookie(profile_id, domain, name, value, path, expiry, is_secure);
+            db_save_cookie(profile_id, domain, name, value, path, expiry, is_secure, same_site);
         }
     }
     fclose(f);
@@ -737,12 +858,178 @@ void db_update_download_progress(int id, long long downloaded, const char* statu
     }
 }
 
-char* db_generate_downloads_html(void) {
-    char* html = malloc(16384);
-    strcpy(html, "<h>Downloads</h><p>List of downloaded files.</p><a href=\"localhost/home\">Back to Start Page</a><p></p>");
+int db_download_set_validators(int id, const char* etag, const char* last_modified, int accept_ranges) {
+    if (id <= 0) return 0;
+    sqlite3_stmt* st = NULL;
+    const char* q = "UPDATE downloads SET etag=?, last_modified=?, accept_ranges=? WHERE id=?;";
+    if (sqlite3_prepare_v2(db, q, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, etag ? etag : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, last_modified ? last_modified : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, accept_ranges ? 1 : 0);
+    sqlite3_bind_int(st, 4, id);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
 
-    sqlite3_stmt* stmt;
-    const char* sql = "SELECT id, filename, url, total_size, downloaded_size, status FROM downloads ORDER BY start_time DESC;";
+int db_download_update_response(int id, long long total_size, const char* etag,
+                                const char* last_modified, int accept_ranges) {
+    if (id <= 0) return 0;
+    sqlite3_stmt* st = NULL;
+    const char* q = "UPDATE downloads SET total_size=CASE WHEN ? >= 0 THEN ? ELSE total_size END, etag=?, last_modified=?, accept_ranges=? WHERE id=?;";
+    if (sqlite3_prepare_v2(db, q, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, total_size);
+    sqlite3_bind_int64(st, 2, total_size);
+    sqlite3_bind_text(st, 3, etag ? etag : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, last_modified ? last_modified : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 5, accept_ranges ? 1 : 0);
+    sqlite3_bind_int(st, 6, id);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* At startup no in-memory worker can still own these rows. Reconcile byte counts from
+   disk before marking stale jobs interrupted, so a later resume never trusts stale DB sizes. */
+void db_download_recover_stale(void) {
+    sqlite3_stmt* read = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id,path,total_size,status FROM downloads WHERE status IN ('starting','downloading','paused');", -1, &read, NULL) != SQLITE_OK) return;
+    typedef struct { int id; char path[4096]; long long total; } Stale;
+    Stale *rows = NULL; size_t count = 0, cap = 0;
+    while (sqlite3_step(read) == SQLITE_ROW) {
+        const char* path = (const char*)sqlite3_column_text(read, 1);
+        if (!path || strlen(path) >= sizeof(((Stale*)0)->path)) continue;
+        if (count == cap) { size_t nc = cap ? cap * 2 : 16; Stale* q = realloc(rows, nc * sizeof(*q)); if (!q) break; rows = q; cap = nc; }
+        rows[count].id = sqlite3_column_int(read, 0);
+        snprintf(rows[count].path, sizeof(rows[count].path), "%s", path);
+        rows[count].total = sqlite3_column_int64(read, 2);
+        count++;
+    }
+    sqlite3_finalize(read);
+    for (size_t i = 0; i < count; ++i) {
+        /* Import an atomically published response sidecar before status recovery. This covers
+           a crash between receiving headers and the main process polling the worker. */
+        char meta_path[128];
+        snprintf(meta_path, sizeof(meta_path), "cache/download_%d.meta", rows[i].id);
+        FILE* mf = fopen(meta_path, "rb");
+        if (mf) {
+            char total_line[64], range_line[16], etag[1024], modified[256];
+            int parsed = fgets(total_line, sizeof(total_line), mf) && fgets(range_line, sizeof(range_line), mf) &&
+                         fgets(etag, sizeof(etag), mf) && fgets(modified, sizeof(modified), mf);
+            fclose(mf);
+            if (parsed) {
+                total_line[strcspn(total_line, "\r\n")] = 0; range_line[strcspn(range_line, "\r\n")] = 0;
+                etag[strcspn(etag, "\r\n")] = 0; modified[strcspn(modified, "\r\n")] = 0;
+                char* ep = NULL; errno = 0; long long total = strtoll(total_line, &ep, 10);
+                if (!errno && ep && !*ep && total >= -1 && (!strcmp(range_line, "0") || !strcmp(range_line, "1")) &&
+                    !strchr(etag, '\t') && !strchr(modified, '\t')) {
+                    sqlite3_stmt* ms = NULL;
+                    if (sqlite3_prepare_v2(db, "UPDATE downloads SET total_size=CASE WHEN ? >= 0 THEN ? ELSE total_size END,etag=?,last_modified=?,accept_ranges=? WHERE id=?;", -1, &ms, NULL) == SQLITE_OK) {
+                        sqlite3_bind_int64(ms, 1, total); sqlite3_bind_int64(ms, 2, total);
+                        sqlite3_bind_text(ms, 3, etag, -1, SQLITE_TRANSIENT); sqlite3_bind_text(ms, 4, modified, -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_int(ms, 5, atoi(range_line) == 1); sqlite3_bind_int(ms, 6, rows[i].id);
+                        (void)sqlite3_step(ms); sqlite3_finalize(ms);
+                        rows[i].total = total;
+                        unlink(meta_path);
+                    }
+                }
+            }
+        }
+        struct stat sb; long long bytes = 0; int have_file = stat(rows[i].path, &sb) == 0 && S_ISREG(sb.st_mode) && sb.st_size >= 0;
+        if (have_file) bytes = (long long)sb.st_size;
+        const char* state = (have_file && rows[i].total > 0 && bytes == rows[i].total) ? "complete" :
+                            (have_file && bytes > 0 ? "interrupted" : "failed");
+        sqlite3_stmt* upd = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE downloads SET downloaded_size=?,status=? WHERE id=?;", -1, &upd, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(upd, 1, bytes); sqlite3_bind_text(upd, 2, state, -1, SQLITE_STATIC); sqlite3_bind_int(upd, 3, rows[i].id);
+            (void)sqlite3_step(upd); sqlite3_finalize(upd);
+        }
+    }
+    free(rows);
+}
+
+int db_download_get_resume_info(int id, DBDownloadResumeInfo* out) {
+    if (id <= 0 || !out) return 0;
+    memset(out, 0, sizeof(*out));
+    sqlite3_stmt* st = NULL;
+    const char* q = "SELECT url,path,downloaded_size,total_size,status,etag,last_modified,accept_ranges FROM downloads WHERE id=? LIMIT 1;";
+    if (sqlite3_prepare_v2(db, q, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, id);
+    int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char* url = (const char*)sqlite3_column_text(st, 0);
+        const char* path = (const char*)sqlite3_column_text(st, 1);
+        const char* status = (const char*)sqlite3_column_text(st, 4);
+        const char* etag = (const char*)sqlite3_column_text(st, 5);
+        const char* modified = (const char*)sqlite3_column_text(st, 6);
+        long long downloaded = sqlite3_column_int64(st, 2);
+        long long total = sqlite3_column_int64(st, 3);
+        int ranges = sqlite3_column_int(st, 7);
+        int interrupted = status && (!strcmp(status, "paused") || !strcmp(status, "interrupted") || !strcmp(status, "failed"));
+        int validator = (etag && *etag && strncmp(etag, "W/", 2) != 0) || (modified && *modified);
+        if (url && path && strlen(url) < sizeof(out->url) && strlen(path) < sizeof(out->path) &&
+            downloaded > 0 && total >= 0 && downloaded <= total && interrupted && validator && ranges) {
+            struct stat sb;
+            if (stat(path, &sb) == 0 && S_ISREG(sb.st_mode) && (long long)sb.st_size == downloaded) {
+                out->id = id;
+                snprintf(out->url, sizeof(out->url), "%s", url);
+                snprintf(out->path, sizeof(out->path), "%s", path);
+                snprintf(out->etag, sizeof(out->etag), "%s", etag ? etag : "");
+                snprintf(out->last_modified, sizeof(out->last_modified), "%s", modified ? modified : "");
+                out->downloaded_size = downloaded; out->total_size = total; out->accept_ranges = ranges;
+                ok = 1;
+            }
+        }
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static int downloads_html_append(char** out, size_t* len, size_t* cap, const char* s) {
+    size_t n = strlen(s);
+    if (n > (1024u * 1024u) - *len - 1) return 0;
+    if (*len + n + 1 > *cap) {
+        size_t nc = *cap ? *cap : 1024;
+        while (nc < *len + n + 1) {
+            if (nc > (1024u * 1024u) / 2) { nc = 1024u * 1024u; break; }
+            nc *= 2;
+        }
+        char* tmp = realloc(*out, nc);
+        if (!tmp) return 0;
+        *out = tmp; *cap = nc;
+    }
+    memcpy(*out + *len, s, n); *len += n; (*out)[*len] = 0;
+    return 1;
+}
+
+static int downloads_html_escape(char** out, size_t* len, size_t* cap, const char* s) {
+    if (!s) s = "";
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        const char* rep = NULL;
+        switch (*p) {
+            case '&': rep = "&amp;"; break;
+            case '<': rep = "&lt;"; break;
+            case '>': rep = "&gt;"; break;
+            case '"': rep = "&quot;"; break;
+            case '\'': rep = "&#39;"; break;
+            default: break;
+        }
+        char one[2] = {(char)*p, 0};
+        if (!downloads_html_append(out, len, cap, rep ? rep : one)) return 0;
+    }
+    return 1;
+}
+
+char* db_generate_downloads_html(void) {
+    char* html = NULL; size_t len = 0, cap = 0;
+    if (!downloads_html_append(&html, &len, &cap,
+        "<!doctype html><meta charset=\"utf-8\"><title>Downloads</title>"
+        "<h1>Downloads</h1><p>Downloaded files and current transfer state.</p>"
+        "<style>.download{padding:8px 0}.download progress{width:min(480px,95%);height:1em}.download small{overflow-wrap:anywhere}</style>"
+        "<a href=\"localhost/home\">Back to Start Page</a><hr>")) return html;
+
+    sqlite3_stmt* stmt = NULL;
+    const char* sql = "SELECT id, filename, url, total_size, downloaded_size, status, etag, last_modified, accept_ranges FROM downloads ORDER BY start_time DESC LIMIT 500;";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             const char* filename = (const char*)sqlite3_column_text(stmt, 1);
@@ -750,17 +1037,51 @@ char* db_generate_downloads_html(void) {
             long long total = sqlite3_column_int64(stmt, 3);
             long long down = sqlite3_column_int64(stmt, 4);
             const char* status = (const char*)sqlite3_column_text(stmt, 5);
-
-            char buf[1024];
-            snprintf(buf, sizeof(buf),
-                     "<p><b>%s</b> (%s) - %lld/%lld bytes [%s] <br><small>%s</small></p><hr>",
-                     filename, status, down, total, (total > 0 ? "..." : "???"), url);
-            strcat(html, buf);
+            int download_id = sqlite3_column_int(stmt, 0);
+            char nums[192];
+            if (!downloads_html_append(&html, &len, &cap, "<section class=\"download\"><p><strong>") ||
+                !downloads_html_escape(&html, &len, &cap, filename) ||
+                !downloads_html_append(&html, &len, &cap, "</strong> — ") ||
+                !downloads_html_escape(&html, &len, &cap, status) ||
+                !downloads_html_append(&html, &len, &cap, "</p><p>")) break;
+            if (total < 0) snprintf(nums, sizeof nums, "%lld bytes downloaded", down < 0 ? 0 : down);
+            else snprintf(nums, sizeof nums, "%lld / %lld bytes", down < 0 ? 0 : down, total);
+            if (!downloads_html_append(&html, &len, &cap, nums)) break;
+            if (total > 0) {
+                char progress[160];
+                long long safe_down = down < 0 ? 0 : (down > total ? total : down);
+                snprintf(progress, sizeof progress, "</p><progress max=\"%lld\" value=\"%lld\"></progress><p>", total, safe_down);
+                if (!downloads_html_append(&html, &len, &cap, progress)) break;
+            }
+            if (!downloads_html_append(&html, &len, &cap, "</p><small>") ||
+                !downloads_html_escape(&html, &len, &cap, url) ||
+                !downloads_html_append(&html, &len, &cap, "</small><p class=\"actions\">")) break;
+            char action[256];
+            if (status && (!strcmp(status, "downloading") || !strcmp(status, "starting"))) {
+                snprintf(action, sizeof action, "<a href=\"browser://downloads?action=pause&amp;id=%d\">Pause</a> | <a href=\"browser://downloads?action=cancel&amp;id=%d\">Cancel</a>", download_id, download_id);
+                if (!downloads_html_append(&html, &len, &cap, action)) break;
+            } else if (status && !strcmp(status, "paused")) {
+                snprintf(action, sizeof action, "<a href=\"browser://downloads?action=continue&amp;id=%d\">Continue</a> | <a href=\"browser://downloads?action=cancel&amp;id=%d\">Cancel</a>", download_id, download_id);
+                if (!downloads_html_append(&html, &len, &cap, action)) break;
+            } else if (status && (!strcmp(status, "interrupted") || !strcmp(status, "failed"))) {
+                const char* etag = (const char*)sqlite3_column_text(stmt, 6);
+                const char* modified = (const char*)sqlite3_column_text(stmt, 7);
+                int ranges = sqlite3_column_int(stmt, 8);
+                int strong_etag = etag && *etag && strncmp(etag, "W/", 2) != 0;
+                if (ranges && (strong_etag || (modified && *modified))) {
+                    snprintf(action, sizeof action, "<a href=\"browser://downloads?action=resume&amp;id=%d\">Resume</a>", download_id);
+                    if (!downloads_html_append(&html, &len, &cap, action)) break;
+                } else if (!downloads_html_append(&html, &len, &cap, "Resume unavailable (server validator not saved)")) break;
+            }
+            if (!downloads_html_append(&html, &len, &cap, "</p></section><hr>")) break;
         }
         sqlite3_finalize(stmt);
     }
+    if (!html) return NULL;
     return html;
 }
+#include "browser_features.inc"
+
 #else
 #include <stdio.h>
 #include <stdlib.h>
@@ -777,6 +1098,8 @@ DOMNode* find_dom_node_by_id_in_tree(DOMNode* head, const char* id) {
 
 int db_init(void) { return 1; }
 void db_close(void) {}
+int db_export_profile_backup(const char* p) { (void)p; return 0; }
+int db_import_profile_backup(const char* p) { (void)p; return 0; }
 int db_get_active_profile(char* name_out, int max_len) { if(name_out && max_len > 7) strcpy(name_out, "Default"); return 1; }
 int db_set_active_profile(int profile_id) { (void)profile_id; return 1; }
 int db_create_profile(const char* name) { (void)name; return 1; }
@@ -786,7 +1109,7 @@ int db_add_history_entry(const char* url, const char* title) { (void)url; (void)
 int db_delete_history_entry(int id) { (void)id; return 1; }
 int db_clear_history(void) { return 1; }
 char* db_generate_history_html(void) { return strdup("<p>History support not compiled.</p>"); }
-int db_save_cookie(int p, const char* d, const char* n, const char* v, const char* pa, long long e, int s) { (void)p;(void)d;(void)n;(void)v;(void)pa;(void)e;(void)s; return 1; }
+int db_save_cookie(int p, const char* d, const char* n, const char* v, const char* pa, long long e, int s, int ss) { (void)p;(void)d;(void)n;(void)v;(void)pa;(void)e;(void)s;(void)ss; return 1; }
 int db_delete_cookie(int id) { (void)id; return 1; }
 int db_clear_cookies(void) { return 1; }
 void db_export_cookies_to_file(int p, const char* f) { (void)p;(void)f; }
@@ -798,4 +1121,18 @@ int db_ls_clear(const char* o) { (void)o; return 0; }
 char* db_ls_list_json(const char* o) { (void)o; return strdup("{}"); }
 int db_save_personal_info(const char* k, const char* v) { (void)k;(void)v; return 1; }
 char* db_get_personal_info(const char* k) { (void)k; return NULL; }
+int db_bookmark_add(const char* u,const char* t){(void)u;(void)t;return 0;}
+int db_bookmark_delete(int i){(void)i;return 0;}
+int db_bookmark_delete_url(const char*u){(void)u;return 0;}
+int db_bookmark_exists(const char*u){(void)u;return 0;}
+char* db_generate_bookmarks_html(void){return strdup("<p>Database support not compiled.</p>");}
+int db_save_session_tab(int s,const char*u,int a){(void)s;(void)u;(void)a;return 0;}
+int db_session_count(void){return 0;}
+int db_session_get_url(int s,char*o,size_t c,int*a){(void)s;if(o&&c)o[0]=0;if(a)*a=0;return 0;}
+int db_session_clear_from(int s){(void)s;return 0;}
+int db_password_save(const char*o,const char*u,const char*p){(void)o;(void)u;(void)p;return 0;}
+int db_password_get_for_origin(const char*o,char*u,size_t uc,char*p,size_t pc){(void)o;if(u&&uc)u[0]=0;if(p&&pc)p[0]=0;return 0;}
+int db_password_delete(int i){(void)i;return 0;}
+char* db_generate_passwords_html(void){return strdup("<p>Password manager disabled.</p>");}
+
 #endif

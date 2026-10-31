@@ -203,6 +203,15 @@ static void ap_lerp(int p, NodeStyle* d, const NodeStyle* a, const NodeStyle* b,
     }
 }
 
+/* Public narrow adapter used by renderer-owned View Transition pseudo-elements.
+   It deliberately shares the DOM animation interpolation primitives so opacity,
+   colors, lengths, filters, clipping and transforms use the same typed rules. */
+void anim_style_apply_mask(NodeStyle* dst, const NodeStyle* a, const NodeStyle* b, uint64_t mask, float t) {
+    if (!dst || !a || !b) return;
+    if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+    for (int p = 0; p < AP_COUNT; p++) if (mask & APM(p)) ap_lerp(p, dst, a, b, t);
+}
+
 /* ══════════════ записи ══════════════ */
 typedef struct { float off[24]; NodeStyle* st[24]; uint64_t pm[24]; int n; uint64_t all; } KfSet;
 typedef struct {
@@ -286,7 +295,7 @@ void anim_cascade_end(DOMNode** nv, int n, Keyframes* kfs, float root_fs, KfBuil
             const NodeStyle* eff = (g_capture && g_have && i < g_oldn && g_have[i]) ? &g_old[i] : prev;      /* видимое значение до каскада */
             int was_shown = eff->display != DSP_NONE;
             for (int p = 0; p < AP_COUNT; p++) {
-                FxTrans t; int has = tr_for(st, p, &t);
+                FxTrans t = {0}; int has = tr_for(st, p, &t);
                 if (r->tmask & APM(p)) { if (!has || (t.dur <= 0 && t.delay == 0)) r->tmask &= ~APM(p); }
                 if (!has || (t.dur <= 0 && t.delay == 0) || !was_shown || g_first) continue;
                 if (ap_eq(p, prev, st)) continue;                                   /* целевое значение не менялось */
@@ -365,7 +374,29 @@ int anim_step(DOMNode* head) {
             AnimInst* a = &r->an[k]; if (!a->name[0] || !a->kf.n) continue; const FxAnim* sp = &a->spec;
             double el = (a->paused ? a->paused_at : now) - a->start - sp->delay; double dur = sp->dur;
             int fill_b = sp->fill & 2, fill_f = sp->fill & 1; float prog = 0; int apply = 0;
-            if (dur <= 0) { if (el >= 0) { if (!a->ended) { a->ended = 1; ev_push(nd, AEV_ANIM_END, a->name, 0); } if (fill_f) { prog = (sp->dir == 1 || sp->dir == 3) ? 0.0f : 1.0f; apply = 1; } } else if (fill_b) { prog = (sp->dir == 1 || sp->dir == 3) ? 1.0f : 0.0f; apply = 1; } }
+            if (st->animation_timeline == 3) { /* animation-timeline:none disables this animation */
+                continue;
+            } else if (st->animation_timeline == 1 || st->animation_timeline == 2) {
+                float tp = l2_timeline_progress(nd, st->animation_timeline, st->animation_timeline_axis);
+                float rs=st->animation_range_start, re=st->animation_range_end;
+                if (re <= rs) tp = tp >= re ? 1.0f : 0.0f;
+                else tp=(tp-rs)/(re-rs);
+                if(tp<0)tp=0;if(tp>1)tp=1;
+                if (!a->started) { a->started=1; ev_push(nd, AEV_ANIM_START, a->name, 0); }
+                double iters=sp->iter<0?1.0:sp->iter; if(iters<0.0001)iters=1.0;
+                int it=0; float frac=0;
+                if(tp>=1.0f) {
+                    if(!a->ended){a->ended=1;ev_push(nd,AEV_ANIM_END,a->name,(float)(dur*iters/1000.0));}
+                    if(fill_f) { it=(int)ceil(iters)-1;if(it<0)it=0;frac=(float)(iters-floor(iters));if(frac==0)frac=1;apply=1; }
+                } else {
+                    a->ended=0;
+                    double scaled=(double)tp*iters;it=(int)floor(scaled);frac=(float)(scaled-it);apply=1;
+                    if(it!=a->last_iter){if(a->last_iter>=0)ev_push(nd,AEV_ANIM_ITER,a->name,(float)(it*dur/1000.0));a->last_iter=it;}
+                }
+                if(apply){int rev=sp->dir==1||(sp->dir==2&&(it&1))||(sp->dir==3&&!(it&1));prog=rev?1.0f-frac:frac;}
+                /* Unlike document-time animations, timeline animations advance on scroll/layout
+                   invalidation and therefore do not keep a timer running while the page is idle. */
+            } else if (dur <= 0) { if (el >= 0) { if (!a->ended) { a->ended = 1; ev_push(nd, AEV_ANIM_END, a->name, 0); } if (fill_f) { prog = (sp->dir == 1 || sp->dir == 3) ? 0.0f : 1.0f; apply = 1; } } else if (fill_b) { prog = (sp->dir == 1 || sp->dir == 3) ? 1.0f : 0.0f; apply = 1; } }
             else if (el < 0) { if (fill_b) { prog = (sp->dir == 1 || sp->dir == 3) ? 1.0f : 0.0f; apply = 1; } g_running = 1; }
             else {
                 double total_d = sp->iter < 0 ? 1e30 : dur * sp->iter; int it; float frac;

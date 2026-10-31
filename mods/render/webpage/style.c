@@ -32,6 +32,7 @@ static const char* UA_CSS =
 "h5{font-size:.83em;margin:1.67em 0;font-weight:bold}h6{font-size:.67em;margin:2.33em 0;font-weight:bold}"
 "b,strong,th{font-weight:bold}th{text-align:center}i,em,cite,var,dfn,address{font-style:italic}"
 "u,ins{text-decoration:underline}s,strike,del{text-decoration:line-through}"
+"bdo{unicode-bidi:bidi-override}bdi{unicode-bidi:isolate}"
 "small{font-size:.83em}big{font-size:1.17em}sub{vertical-align:sub;font-size:.83em}sup{vertical-align:super;font-size:.83em}"
 "code,kbd,samp,tt,pre{font-family:monospace}pre{white-space:pre;margin:1em 0}"
 "a:link{color:#0000ee;text-decoration:underline;cursor:pointer}"
@@ -44,14 +45,17 @@ static const char* UA_CSS =
 "input[type=hidden]{display:none}input[type=checkbox],input[type=radio]{padding:0;border:0;background-color:transparent}"
 "fieldset{margin:0 2px;padding:.35em .75em .625em;border:2px groove #c0c0c0}legend{padding:0 2px}"
 "img{}iframe{border:2px inset #767676}"
-"noscript,[hidden]{display:none}";
+"noscript,[hidden]{display:none}"
+"details:not([open]) > :not(summary){display:none}";
 
 
 /* ══════════════ :hover / :active / :focus ══════════════ */
 static DOMNode* g_hover; static DOMNode* g_active; static int g_dyn_pending, g_uses_dyn;
+static int g_keyboard_modality = 1;
 int webpage_uses_dyn(void) { return g_uses_dyn; }
 void webpage_set_hover(DOMNode* n) { if (n == g_hover) return; g_hover = n; if (g_uses_dyn) g_dyn_pending = 1; }
 void webpage_set_active(DOMNode* n) { if (n == g_active) return; g_active = n; if (g_uses_dyn) g_dyn_pending = 1; }
+void webpage_set_input_modality(int keyboard) { keyboard = keyboard != 0; if (keyboard == g_keyboard_modality) return; g_keyboard_modality = keyboard; if (g_uses_dyn) g_dyn_pending = 1; }
 DOMNode* webpage_hover_node(void) { return g_hover; }
 DOMNode* webpage_active_node(void) { return g_active; }
 int  webpage_dyn_pending(void) { return g_dyn_pending; }
@@ -60,13 +64,20 @@ int webpage_dyn_match(int kind, const DOMNode* n) {
     const DOMNode* t = kind == PC_HOVER ? g_hover : kind == PC_ACTIVE ? g_active : focused_node;
     if (!t || t->idx < 0) return 0;
     if (kind == PC_FOCUS) return t == n;
+    if (kind == PC_FOCUS_VISIBLE) {
+        if (t != n) return 0;
+        if (g_keyboard_modality) return 1;
+        if (!strcmp(n->tag,"input") || !strcmp(n->tag,"textarea") || !strcmp(n->tag,"select")) return 1;
+        char ce[16]; if (webpage_attr_get(n,"contenteditable",ce,sizeof ce) && strcasecmp(ce,"false")) return 1;
+        return 0;
+    }
     return n->idx <= t->idx && t->idx <= n->subtree_end;
 }
 
 /* ══════════════ индекс правил ══════════════ */
 typedef struct HB { char* key; Rule** v; int n, cap; struct HB* next; } HB;
 #define HSZ 4096
-typedef struct { HB* t[HSZ]; Rule** uni; int nuni, capuni; int has_pseudo; } RIndex;
+typedef struct { HB* t[HSZ]; Rule** uni; int nuni, capuni; int has_pseudo, has_marker; } RIndex;
 
 static unsigned hstr(const char* s) { unsigned h = 5381; while (*s) h = h * 33 + (unsigned char)*s++; return h; }
 static HB* hb_get(RIndex* ix, const char* key, int create) {
@@ -81,6 +92,7 @@ static void index_rules(RIndex* ix, RuleSet* rs) {
     for (int i = 0; i < rs->n; i++) {
         Rule* r = rs->v[i]; Simple* last = &r->sel[r->nsel - 1]; char key[80];
         if (r->pseudo) ix->has_pseudo = 1;
+        if (r->pseudo == 3) ix->has_marker = 1;
         if (last->id[0]) { snprintf(key, sizeof key, "#%s", last->id); hb_push(hb_get(ix, key, 1), r); }
         else if (last->ncls) { snprintf(key, sizeof key, ".%s", last->cls[0]); hb_push(hb_get(ix, key, 1), r); }
         else if (last->tag[0]) { snprintf(key, sizeof key, "T%s", last->tag); hb_push(hb_get(ix, key, 1), r); }
@@ -95,8 +107,280 @@ static void index_free(RIndex* ix) {
 /* ══════════════ документ ══════════════ */
 typedef struct CP { const char* name; const char* val; struct CP* next; } CP;
 typedef struct {
-    DOMNode** nv; int n; int* prev; int* eidx; int* ecnt; CP** cps;
+    DOMNode** nv; int n; int* prev; int* eidx; int* ecnt; CP** cps; RuleSet* rs;
 } Doc;
+
+/* Computed style snapshots for the View Transition pseudo-element tree. They
+   are copied out of the transient stylesheet arena before style_apply returns,
+   so the paint compositor never retains pointers into CSS parser storage. */
+#define VT_STYLE_MAX_NAMES 24
+#define VT_STYLE_ANIM_MAX 3
+#define VT_STYLE_KF_MAX 24
+#define VT_STYLE_KF_BUDGET (8u * 1024u * 1024u)
+typedef struct { float off; uint64_t mask; NodeStyle* st; } VTStyleKeyframe;
+typedef struct {
+    FxAnim spec;
+    VTStyleKeyframe frames[VT_STYLE_KF_MAX];
+    int n;
+    uint64_t all;
+} VTStyleAnimation;
+typedef struct {
+    VTStyleAnimation animation[VT_STYLE_ANIM_MAX];
+    NodeStyle evaluated;
+} VTStyleAnimList;
+typedef struct {
+    char name[48];
+    NodeStyle group, image_pair, old_image, new_image;
+    VTStyleAnimList group_anim, image_pair_anim, old_anim, new_anim;
+} VTStyleRecord;
+static NodeStyle g_vt_root_style;
+static VTStyleAnimList g_vt_root_anim;
+static VTStyleRecord g_vt_style_records[VT_STYLE_MAX_NAMES];
+static int g_vt_style_count;
+static size_t g_vt_style_kf_bytes;
+static uint64_t kf_build(void* ctx, DOMNode* n, const Decl* decls, int nd, NodeStyle* out, float root_fs);
+
+static void vt_free_anim_list(VTStyleAnimList* list) {
+    if (!list) return;
+    for (int a=0;a<VT_STYLE_ANIM_MAX;a++) {
+        VTStyleAnimation* an=&list->animation[a];
+        for (int i=0;i<an->n;i++) {
+            if (an->frames[i].st) {
+                free(an->frames[i].st);
+                if (g_vt_style_kf_bytes >= sizeof(NodeStyle)) g_vt_style_kf_bytes -= sizeof(NodeStyle);
+                else g_vt_style_kf_bytes = 0;
+            }
+        }
+        memset(an,0,sizeof *an);
+    }
+    memset(&list->evaluated,0,sizeof list->evaluated);
+}
+
+static void vt_free_all_anim_lists(void) {
+    vt_free_anim_list(&g_vt_root_anim);
+    for (int i=0;i<VT_STYLE_MAX_NAMES;i++) {
+        vt_free_anim_list(&g_vt_style_records[i].group_anim);
+        vt_free_anim_list(&g_vt_style_records[i].image_pair_anim);
+        vt_free_anim_list(&g_vt_style_records[i].old_anim);
+        vt_free_anim_list(&g_vt_style_records[i].new_anim);
+    }
+    g_vt_style_kf_bytes=0;
+}
+
+/* Renderer snapshot layers only paint opacity, background color and affine
+   transform, so keyframe declarations outside this subset are intentionally
+   not copied into the pseudo-element compositor. DOM animations remain full. */
+#define VT_STYLE_ANIM_MASK (APM(AP_OPACITY) | APM(AP_BG) | APM(AP_XFORM) | APM(AP_ORIGIN) | APM(AP_FILTER) | APM(AP_CLIP))
+
+static void vt_prepare_anim_list(Doc* d, RuleSet* rs, DOMNode* root, float root_fs,
+                                 const NodeStyle* base, VTStyleAnimList* list) {
+    if (!d || !rs || !root || !base || !list) return;
+    for (int a=0;a<VT_STYLE_ANIM_MAX && a<base->an_n;a++) {
+        const FxAnim* spec=&base->an[a];
+        if (!spec->name[0] || !strcasecmp(spec->name,"none")) continue;
+        const Keyframes* kf=NULL;
+        for (const Keyframes* it=rs->kf;it;it=it->next) if (!strcmp(it->name,spec->name)) { kf=it; break; }
+        if (!kf) continue;
+        VTStyleAnimation* target=&list->animation[a];
+        target->spec=*spec;
+        for (int i=0;i<kf->n && target->n<VT_STYLE_KF_MAX;i++) {
+            if (g_vt_style_kf_bytes + sizeof(NodeStyle) > VT_STYLE_KF_BUDGET) break;
+            NodeStyle* frame=malloc(sizeof *frame);
+            if (!frame) break;
+            *frame=*base;
+            uint64_t mask=kf_build(d,root,kf->fr[i].decls,kf->fr[i].nd,frame,root_fs) & VT_STYLE_ANIM_MASK;
+            if (!mask) { free(frame); continue; }
+            VTStyleKeyframe* dst=&target->frames[target->n++];
+            dst->off=kf->fr[i].off; dst->mask=mask; dst->st=frame;
+            target->all |= mask; g_vt_style_kf_bytes += sizeof(NodeStyle);
+        }
+        if (!target->n) memset(target,0,sizeof *target);
+    }
+}
+
+static float vt_animation_progress(const FxAnim* spec, double elapsed_ms, int* applies) {
+    *applies=0;
+    if (!spec) return 0;
+    double el=elapsed_ms-(double)spec->delay;
+    double dur=(double)spec->dur;
+    double iterations=(double)spec->iter;
+    if (iterations < 0.0) iterations=1.0; /* infinite pseudo animation is bounded by the transition lifecycle */
+    if (!isfinite(iterations) || iterations < 0.0) iterations=1.0;
+    if (iterations > 1000000.0) iterations=1000000.0;
+    if (el < 0.0) {
+        if (!(spec->fill & 2u)) return 0.0f;
+        *applies=1;
+        return (spec->dir==1 || spec->dir==3) ? 1.0f : 0.0f;
+    }
+    if (iterations <= 0.0) return 0.0f;
+    int after=0, iteration=0; float frac=0.0f;
+    if (dur <= 0.0) {
+        after=1;
+        if (!(spec->fill & 1u)) return 0.0f;
+        iteration=(int)ceil(iterations)-1; if (iteration<0) iteration=0;
+        frac=(float)(iterations-floor(iterations)); if (frac==0.0f) frac=1.0f;
+    } else {
+        double total=dur*iterations;
+        if (!isfinite(total) || total < 0.0) total=0.0;
+        if (el >= total) {
+            after=1;
+            if (!(spec->fill & 1u)) return 0.0f;
+            iteration=(int)ceil(iterations)-1; if (iteration<0) iteration=0;
+            frac=(float)(iterations-floor(iterations)); if (frac==0.0f) frac=1.0f;
+        } else {
+            double scaled=el/dur;
+            if (scaled<0) scaled=0;
+            if (scaled>1000000.0) scaled=1000000.0;
+            iteration=(int)floor(scaled); frac=(float)(scaled-(double)iteration);
+        }
+    }
+    (void)after;
+    if (spec->dir==1 || (spec->dir==2 && (iteration&1)) || (spec->dir==3 && !(iteration&1))) frac=1.0f-frac;
+    *applies=1;
+    return fx_ease(&spec->ease,frac);
+}
+
+static void vt_compose_animation_property(NodeStyle* out, const NodeStyle* effect,
+                                         int prop, uint8_t composition) {
+    uint64_t bit=APM(prop);
+    if (composition==0) { anim_style_apply_mask(out,effect,effect,bit,1.0f); return; }
+    if (prop==AP_OPACITY) {
+        /* Additive opacity is a numeric sum; the renderable CSS value is clamped. */
+        float v=out->op_own+effect->op_own;
+        if (!isfinite(v) || v<0.0f) v=0.0f; if (v>1.0f) v=1.0f;
+        out->op_own=v; out->opacity=v;
+        return;
+    }
+    if (prop==AP_XFORM) {
+        /* Transform-list addition concatenates operations. Accumulate is
+           approximated with the same matrix/list order until DOMMatrix-backed
+           transform accumulation is available. */
+        int n=out->xf.n, en=effect->xf.n;
+        if (n+en<=6) {
+            memcpy(&out->xf.op[n],effect->xf.op,(size_t)en*sizeof(FxXfOp));
+            out->xf.n=(uint8_t)(n+en);
+        } else {
+            /* Keep bounded and deterministic when an author supplies huge lists. */
+            int take=6-n; if(take<0)take=0;
+            if(take)memcpy(&out->xf.op[n],effect->xf.op,(size_t)take*sizeof(FxXfOp));
+            out->xf.n=6;
+        }
+        return;
+    }
+    /* Color/filter/clip additive composition is not yet defined by this compact
+       raster compositor; use replace rather than inventing numeric semantics. */
+    anim_style_apply_mask(out,effect,effect,bit,1.0f);
+}
+
+static void vt_evaluate_animation(const VTStyleAnimation* animation, const NodeStyle* base,
+                                  double elapsed_ms, NodeStyle* out) {
+    if (!animation || !base || !out || !animation->n || !animation->all) return;
+    int applies=0; float progress=vt_animation_progress(&animation->spec,elapsed_ms,&applies);
+    if (!applies) return;
+    NodeStyle effect=*base;
+    for (int prop=0;prop<AP_COUNT;prop++) {
+        uint64_t bit=APM(prop);
+        if (!(animation->all & bit)) continue;
+        int lo=-1,hi=-1;
+        for (int i=0;i<animation->n;i++) if (animation->frames[i].mask & bit) {
+            if (animation->frames[i].off <= progress) lo=i;
+            if (animation->frames[i].off >= progress && hi<0) hi=i;
+        }
+        const NodeStyle* a=lo>=0?animation->frames[lo].st:base;
+        const NodeStyle* b=hi>=0?animation->frames[hi].st:base;
+        float oa=lo>=0?animation->frames[lo].off:0.0f;
+        float ob=hi>=0?animation->frames[hi].off:1.0f;
+        float t=ob>oa?(progress-oa)/(ob-oa):1.0f;
+        if (t<0)t=0;if(t>1)t=1;
+        anim_style_apply_mask(&effect,a,b,bit,t);
+    }
+    for (int prop=0;prop<AP_COUNT;prop++) if (animation->all & APM(prop))
+        vt_compose_animation_property(out,&effect,prop,animation->spec.composition);
+}
+
+static const NodeStyle* vt_eval_style(const NodeStyle* base, VTStyleAnimList* anim, double elapsed_ms) {
+    if (!base) return NULL;
+    if (!anim) return base;
+    anim->evaluated=*base;
+    for (int i=0;i<VT_STYLE_ANIM_MAX;i++)
+        vt_evaluate_animation(&anim->animation[i],base,elapsed_ms,&anim->evaluated);
+    return &anim->evaluated;
+}
+
+const NodeStyle* webpage_view_transition_style(const char* name, int pseudo) {
+    if (pseudo == WEBPAGE_VT_PSEUDO_ROOT) return &g_vt_root_style;
+    if (!name || !*name) return NULL;
+    for (int i=0; i<g_vt_style_count; i++) if (!strcmp(g_vt_style_records[i].name,name)) {
+        switch (pseudo) {
+            case WEBPAGE_VT_PSEUDO_GROUP: return &g_vt_style_records[i].group;
+            case WEBPAGE_VT_PSEUDO_IMAGE_PAIR: return &g_vt_style_records[i].image_pair;
+            case WEBPAGE_VT_PSEUDO_OLD: return &g_vt_style_records[i].old_image;
+            case WEBPAGE_VT_PSEUDO_NEW: return &g_vt_style_records[i].new_image;
+            default: return NULL;
+        }
+    }
+    return NULL;
+}
+
+const NodeStyle* webpage_view_transition_style_at(const char* name, int pseudo, double elapsed_ms) {
+    if (pseudo==WEBPAGE_VT_PSEUDO_ROOT)
+        return vt_eval_style(&g_vt_root_style,&g_vt_root_anim,elapsed_ms);
+    if (!name || !*name) return NULL;
+    for (int i=0;i<g_vt_style_count;i++) if (!strcmp(g_vt_style_records[i].name,name)) {
+        VTStyleRecord* rec=&g_vt_style_records[i];
+        switch (pseudo) {
+            case WEBPAGE_VT_PSEUDO_GROUP: return vt_eval_style(&rec->group,&rec->group_anim,elapsed_ms);
+            case WEBPAGE_VT_PSEUDO_IMAGE_PAIR: return vt_eval_style(&rec->image_pair,&rec->image_pair_anim,elapsed_ms);
+            case WEBPAGE_VT_PSEUDO_OLD: return vt_eval_style(&rec->old_image,&rec->old_anim,elapsed_ms);
+            case WEBPAGE_VT_PSEUDO_NEW: return vt_eval_style(&rec->new_image,&rec->new_anim,elapsed_ms);
+            default: return NULL;
+        }
+    }
+    return NULL;
+}
+
+double webpage_view_transition_duration_ms(void) {
+    double longest=240.0;
+    VTStyleAnimList* lists[1+VT_STYLE_MAX_NAMES*4]; int count=0;
+    lists[count++]=&g_vt_root_anim;
+    for (int i=0;i<g_vt_style_count;i++) {
+        lists[count++]=&g_vt_style_records[i].group_anim;
+        lists[count++]=&g_vt_style_records[i].image_pair_anim;
+        lists[count++]=&g_vt_style_records[i].old_anim;
+        lists[count++]=&g_vt_style_records[i].new_anim;
+    }
+    for (int i=0;i<count;i++) for (int a=0;a<VT_STYLE_ANIM_MAX;a++) {
+        VTStyleAnimation* an=&lists[i]->animation[a];
+        if (!an->n || !an->spec.name[0]) continue;
+        if (an->spec.iter<0.0f) continue; /* infinite animation cannot keep VT alive forever */
+        double total=(double)an->spec.delay+(double)an->spec.dur*(double)an->spec.iter;
+        if (!isfinite(total)) continue;
+        if (total>30000.0) total=30000.0;
+        if (total>longest) longest=total;
+    }
+    if (longest<1.0) longest=1.0;
+    return longest;
+}
+
+int webpage_view_transition_animates_opacity(const char* name, int pseudo) {
+    VTStyleAnimList* list=NULL;
+    if (pseudo==WEBPAGE_VT_PSEUDO_ROOT) list=&g_vt_root_anim;
+    else if (name && *name) for (int i=0;i<g_vt_style_count;i++) if (!strcmp(g_vt_style_records[i].name,name)) {
+        VTStyleRecord* rec=&g_vt_style_records[i];
+        switch (pseudo) {
+            case WEBPAGE_VT_PSEUDO_GROUP: list=&rec->group_anim; break;
+            case WEBPAGE_VT_PSEUDO_IMAGE_PAIR: list=&rec->image_pair_anim; break;
+            case WEBPAGE_VT_PSEUDO_OLD: list=&rec->old_anim; break;
+            case WEBPAGE_VT_PSEUDO_NEW: list=&rec->new_anim; break;
+            default: break;
+        }
+        break;
+    }
+    if (!list) return 0;
+    for (int a=0;a<VT_STYLE_ANIM_MAX;a++)
+        if (list->animation[a].n && (list->animation[a].all & APM(AP_OPACITY))) return 1;
+    return 0;
+}
 
 static DOMNode* par(Doc* d, DOMNode* n) { return n->parent >= 0 ? d->nv[n->parent] : NULL; }
 static DOMNode* prev_el(Doc* d, DOMNode* n) { int p = d->prev[n->idx]; return p >= 0 ? d->nv[p] : NULL; }
@@ -155,6 +439,17 @@ static int match_simple(Doc* d, DOMNode* n, Simple* s) {
             default: break;
         }
     }
+    if (s->sub_has) {
+        int found = 0;
+        for (int q = n->idx + 1; q <= n->subtree_end && q < d->n; q++) {
+            DOMNode* child = d->nv[q];
+            if (s->sub_direct && child->parent != n->idx) continue;
+            if (child->type == TAG_TEXT) continue;
+            if (match_sub(d, child, s->sub)) { found = 1; break; }
+            if (s->sub_direct && child->parent == n->idx) { /* continue through immediate siblings only */ }
+        }
+        if (!found) return 0;
+    }
     for (int i = 0; i < s->npc; i++) {
         int total = 0, ok = 1;
         switch (s->pc[i]) {
@@ -173,12 +468,12 @@ static int match_simple(Doc* d, DOMNode* n, Simple* s) {
             case PC_CHECKED: ok = n->checked || n->selected; break;
             case PC_DISABLED: ok = n->disabled; break;
             case PC_ENABLED: ok = !n->disabled && (n->type == TAG_INPUT || n->type == TAG_BUTTON || n->type == TAG_SELECT || n->type == TAG_TEXTAREA); break;
-            case PC_HOVER: case PC_ACTIVE: case PC_FOCUS: case PC_FOCUS_WITHIN: ok = webpage_dyn_match(s->pc[i], n); break;
+            case PC_HOVER: case PC_ACTIVE: case PC_FOCUS: case PC_FOCUS_VISIBLE: case PC_FOCUS_WITHIN: ok = webpage_dyn_match(s->pc[i], n); break;
             default: ok = 0; break;
         }
         if (!ok) return 0;
     }
-    if (s->sub) { int m = match_sub(d, n, s->sub); if (s->sub_neg ? m : !m) return 0; }
+    if (s->sub && !s->sub_has) { int m = match_sub(d, n, s->sub); if (s->sub_neg ? m : !m) return 0; }
     return 1;
 }
 
@@ -219,8 +514,20 @@ static int resolve_vars(CP* chain, const char* in, char* out, size_t cap, int de
     out[o] = 0; return 1;
 }
 
+/* Registered custom properties have a computed initial value and may disable
+   inheritance. Inject their defaults before authored declarations so local
+   declarations still win through the normal reverse-order CP chain. */
+static void cp_seed_registered(const RuleSet* rs, CP** chain) {
+    if (!rs || !chain) return;
+    for (const RegisteredProperty* r=rs->properties; r; r=r->next) {
+        if (r->inherits && cp_find(*chain,r->name,strlen(r->name))) continue;
+        CP* cp=malloc(sizeof *cp); if(!cp) return;
+        cp->name=r->name; cp->val=r->initial_value; cp->next=*chain; *chain=cp;
+    }
+}
+
 /* ══════════════ применение значений ══════════════ */
-typedef struct { float em, rem, pfs; uint32_t cur; DOMNode* parent; char* content; int has_content; DOMNode* owner; } Cx;
+typedef struct { float em, rem, pfs, lh, parent_lh; uint32_t cur; DOMNode* parent; char* content; int has_content; DOMNode* owner; Doc* doc; } Cx;
 
 static int tok_next(const char** pp, char* buf, size_t cap) {
     const char* p = *pp; while (isspace((unsigned char)*p)) p++;
@@ -234,13 +541,39 @@ static int tok_next(const char** pp, char* buf, size_t cap) {
     buf[k] = 0; *pp = p; return 1;
 }
 
-static int len_of(Cx* c, const char* v, Len* out) { return css_parse_len(v, out, c->em, c->rem); }
+/* Like tok_next(), but refuse tokens that do not fit rather than silently
+   treating a truncated identifier as a different, valid name. The token is
+   still consumed so callers can continue safely after an oversized token. */
+static int tok_next_exact(const char** pp, char* buf, size_t cap) {
+    const char* start = *pp;
+    while (isspace((unsigned char)*start)) start++;
+    if (!*start) { if (cap) buf[0] = 0; return 0; }
+    if (!tok_next(pp, buf, cap)) return 0;
+    if (!cap || (size_t)(*pp - start) >= cap) {
+        if (cap) buf[0] = 0;
+        return -1;
+    }
+    return 1;
+}
+
+static int css_tokens_fit(const char* value, size_t max_token) {
+    const char* p = value;
+    while (*p) {
+        while (isspace((unsigned char)*p)) p++;
+        const char* start = p;
+        while (*p && !isspace((unsigned char)*p)) p++;
+        if ((size_t)(p - start) > max_token) return 0;
+    }
+    return 1;
+}
+
+static int len_of(Cx* c, const char* v, Len* out) { return css_parse_len_lh(v, out, c->em, c->rem, c->lh); }
 static int col_of(Cx* c, const char* v, uint32_t* out) {
     if (!strcasecmp(v, "currentcolor")) { *out = CUR_COLOR; return 1; }
     return css_parse_color(v, out, c->cur);
 }
 static const char* g_base = NULL;
-static float px_of(const Len* l, float pct_base) { return l->px + l->pct * pct_base / 100.0f + l->vw * SCREEN_WIDTH + l->vh * SCREEN_HEIGHT; }
+static float px_of(const Len* l, float pct_base) { return l->px + l->pct * pct_base / 100.0f + (l->vw + l->svw + l->dvw) * SCREEN_WIDTH + (l->vh + l->svh + l->dvh) * SCREEN_HEIGHT + l->lh; }
 
 /* 1..4 значения -> t r b l */
 static void box4(Cx* c, const char* v, Len out[4]) {
@@ -291,6 +624,7 @@ static void parse_shadow(Cx* c, NodeStyle* st, const char* v) {
 /* парсинг всех цветовых остановок linear-/radial-gradient() вместо использования только первой */
 static void parse_gradient_stops(Cx* c, NodeStyle* st, const char* tk) {
     int radial = !strncasecmp(tk, "radial-gradient(", 16);
+    int conic = !strncasecmp(tk, "conic-gradient(", 15);
     const char* q = strchr(tk, '('); if (!q) return; q++;
     char a[160]; size_t k = 0; int d = 0; int n = 0; float angle = 180.0f; int first = 1;
     for (;; q++) {
@@ -303,7 +637,8 @@ static void parse_gradient_stops(Cx* c, NodeStyle* st, const char* tk) {
             if (first) {
                 first = 0;
                 if (!radial && (strcasestr(sp, "deg") || !strncasecmp(sp, "to ", 3))) {
-                    if (strcasestr(sp, "deg")) angle = strtof(sp, NULL);
+                    if (conic && !strncasecmp(sp, "from ", 5)) angle = strtof(sp + 5, NULL);
+                    else if (strcasestr(sp, "deg")) angle = strtof(sp, NULL);
                     else {
                         int rt = strcasestr(sp, "right") != NULL, lf = strcasestr(sp, "left") != NULL;
                         int tp = strcasestr(sp, "top") != NULL, bt = strcasestr(sp, "bottom") != NULL;
@@ -312,7 +647,7 @@ static void parse_gradient_stops(Cx* c, NodeStyle* st, const char* tk) {
                     }
                     k = 0; if (!*q || end) break; continue;
                 }
-                if (radial && (strcasestr(sp, "circle") || strcasestr(sp, "ellipse") || strcasestr(sp, "at "))) { k = 0; if (!*q || end) break; continue; }
+                if ((radial && (strcasestr(sp, "circle") || strcasestr(sp, "ellipse") || strcasestr(sp, "at "))) || (conic && !strncasecmp(sp, "at ", 3))) { k = 0; if (!*q || end) break; continue; }
             }
             char cs[96] = {0}; float pos = -1; char* ce = sp; int dd = 0;
             while (*ce && !(dd == 0 && isspace((unsigned char)*ce))) { if (*ce == '(') dd++; if (*ce == ')') dd--; ce++; }
@@ -326,7 +661,7 @@ static void parse_gradient_stops(Cx* c, NodeStyle* st, const char* tk) {
     }
     if (n >= 2) {
         for (int i = 0; i < n; i++) if (st->bg_grad_p[i] < 0) st->bg_grad_p[i] = 100.0f * i / (n - 1);
-        st->bg_grad_type = radial ? 2 : 1; st->bg_grad_n = (uint8_t)n; st->bg_grad_angle = angle; st->bg = st->bg_grad_c[0];
+        st->bg_grad_type = conic ? 3 : radial ? 2 : 1; st->bg_grad_n = (uint8_t)n; st->bg_grad_angle = angle; st->bg = st->bg_grad_c[0];
     } else if (n == 1) { st->bg = st->bg_grad_c[0]; st->bg_grad_type = 0; }
 }
 
@@ -336,11 +671,23 @@ static void parse_bg(Cx* c, NodeStyle* st, const char* v, int full) {
     int posn = 0; int in_size = 0;
     while (tok_next(&p, tk, sizeof tk)) {
         if (!strncasecmp(tk, "url(", 4)) {
-            const char* q = tk + 4; while (isspace((unsigned char)*q)) q++; char qc = (*q == '"' || *q == '\'') ? *q++ : 0; size_t k = 0;
+            const char* q = tk + 4; while (isspace((unsigned char)*q)) q++; char qc = (*q == '"' || *q == '\'') ? *q++ : 0;
             const char* qe = q; while (*qe && (qc ? *qe != qc : *qe != ')')) qe++;
-            if (qe - q > 5 && !strncasecmp(q, "data:", 5)) { char dp[200]; if (!webpage_data_uri_to_file(q, (size_t)(qe - q), dp, sizeof dp)) dp[0] = 0; snprintf(st->bg_url, sizeof st->bg_url, "%s", dp); }   /* data: → файл кэша */
-            else { while (*q && (qc ? *q != qc : *q != ')') && k < 190) st->bg_url[k++] = *q++; st->bg_url[k] = 0; }
-        } else if (!strncasecmp(tk, "linear-gradient(", 16) || !strncasecmp(tk, "-webkit-linear-gradient(", 24) || !strncasecmp(tk, "radial-gradient(", 16)) {
+            if (qe - q > 5 && !strncasecmp(q, "data:", 5)) {
+                char dp[200];
+                if (!webpage_data_uri_to_file(q, (size_t)(qe - q), dp, sizeof dp) || strlen(dp) >= sizeof st->bg_url) dp[0] = 0;
+                memcpy(st->bg_url, dp, strlen(dp) + 1); /* data: → файл кэша */
+            } else {
+                size_t url_len = (size_t)(qe - q);
+                if (url_len >= sizeof st->bg_url) {
+                    /* Do not load a different URL formed from a truncated prefix. */
+                    st->bg_url[0] = 0;
+                } else {
+                    memcpy(st->bg_url, q, url_len);
+                    st->bg_url[url_len] = 0;
+                }
+            }
+        } else if (!strncasecmp(tk, "linear-gradient(", 16) || !strncasecmp(tk, "-webkit-linear-gradient(", 24) || !strncasecmp(tk, "radial-gradient(", 16) || !strncasecmp(tk, "conic-gradient(", 15)) {
             parse_gradient_stops(c, st, tk);
         } else if (!strcasecmp(tk, "no-repeat")) st->bg_repeat = 3; else if (!strcasecmp(tk, "repeat-x")) st->bg_repeat = 1;
         else if (!strcasecmp(tk, "repeat-y")) st->bg_repeat = 2; else if (!strcasecmp(tk, "repeat")) st->bg_repeat = 0;
@@ -377,8 +724,8 @@ static float font_kw(const char* v, float pfs, int* ok) {
 static void set_font_size(Cx* c, NodeStyle* st, const char* v) {
     int ok; float kw = font_kw(v, c->pfs, &ok);
     if (ok) { st->font_size = kw; return; }
-    Len l; if (!css_parse_len(v, &l, c->pfs, c->rem) || !l.set) return;
-    float px = l.px + l.pct * c->pfs / 100.0f + l.vw * SCREEN_WIDTH + l.vh * SCREEN_HEIGHT;
+    Len l; if (!css_parse_len_lh(v, &l, c->pfs, c->rem, c->parent_lh) || !l.set) return;
+    float px = px_of(&l, c->pfs);
     if (px >= 0) st->font_size = px;
 }
 
@@ -386,7 +733,7 @@ static void set_line_height(Cx* c, NodeStyle* st, const char* v) {
     if (!strcasecmp(v, "normal")) { st->lh_mult = 0; st->lh_px = 0; return; }
     char* e; float n = strtof(v, &e);
     if (e != v && !*e) { st->lh_mult = n; st->lh_px = 0; return; }
-    Len l; if (css_parse_len(v, &l, c->em, c->rem) && l.set) { st->lh_px = l.px + l.pct * st->font_size / 100.0f; st->lh_mult = 0; }
+    Len l; if (css_parse_len_lh(v, &l, c->em, c->rem, c->parent_lh) && l.set) { st->lh_px = px_of(&l, st->font_size); st->lh_mult = 0; }
 }
 
 /* font-weight → 100..900 (0 — не распознано). bolder/lighter без учёта родителя: 700 / 300 */
@@ -410,7 +757,11 @@ static void apply_font_shorthand(Cx* c, DOMNode* n, NodeStyle* st, const char* v
         else if (!strcasecmp(tk, "lighter")) wt = 300;
         else {                                                             /* размер[/высота] */
             char sz[64] = "", lh[64] = ""; const char* sl = strchr(tk, '/');
-            if (sl) { snprintf(sz, sizeof sz, "%.*s", (int)(sl - tk), tk); snprintf(lh, sizeof lh, "%s", sl + 1); } else snprintf(sz, sizeof sz, "%s", tk);
+            size_t size_len = sl ? (size_t)(sl - tk) : strlen(tk);
+            size_t lh_len = sl ? strlen(sl + 1) : 0;
+            if (size_len >= sizeof sz || lh_len >= sizeof lh) return;
+            memcpy(sz, tk, size_len); sz[size_len] = 0;
+            if (sl) { memcpy(lh, sl + 1, lh_len); lh[lh_len] = 0; }
             if (size_pass) { set_font_size(c, st, sz); }
             else {
                 st->bold = (uint8_t)bold; st->italic = (uint8_t)ital; st->weight = (uint16_t)wt;
@@ -435,11 +786,71 @@ static void put_utf8(char* out, size_t cap, size_t* o, unsigned cp) {
 }
 /* сырой байт исходного текста: он уже в UTF-8, поэтому многобайтовые символы копируем как есть (put_utf8 по байтам их портил) */
 static void put_raw(char* out, size_t cap, size_t* o, unsigned char ch) { if (*o + 2 >= cap) return; out[(*o)++] = (char)ch; out[*o] = 0; }
+typedef struct { char name[40]; int value, end; } CounterEntry;
+static int collect_counter_values(Doc* d, DOMNode* owner, const char* wanted, int* values, int cap) {
+    if (!d || !owner || owner->idx<0 || owner->idx>=d->n) return 0;
+    CounterEntry stack[256]; int n=0;
+    for (int ix=0; ix<=owner->idx && ix<d->n; ix++) {
+        while (n>0 && stack[n-1].end < ix) n--;
+        DOMNode* el=d->nv[ix]; if (!el || el->type==TAG_TEXT) continue;
+        const char* p=el->st.counter_reset; char name[40], num[48];
+        while (tok_next(&p,name,sizeof name)) {
+            if (!strcasecmp(name,"none")) continue;
+            int value=0; const char* save=p;
+            if (tok_next(&p,num,sizeof num)) { char* e; long q=strtol(num,&e,10); if(e!=num && !*e) value=(int)q; else p=save; }
+            if(n<256) { snprintf(stack[n].name,sizeof stack[n].name,"%s",name); stack[n].value=value; stack[n].end=el->subtree_end; n++; }
+        }
+        p=el->st.counter_increment;
+        while (tok_next(&p,name,sizeof name)) {
+            if (!strcasecmp(name,"none")) continue;
+            int inc=1; const char* save=p;
+            if (tok_next(&p,num,sizeof num)) { char* e; long q=strtol(num,&e,10); if(e!=num && !*e) inc=(int)q; else p=save; }
+            int j; for(j=n-1;j>=0;j--) if(!strcmp(stack[j].name,name)) break;
+            if(j<0 && n<256) { j=n++; snprintf(stack[j].name,sizeof stack[j].name,"%s",name); stack[j].value=0; stack[j].end=el->subtree_end; }
+            if(j>=0) stack[j].value+=inc;
+        }
+        p=el->st.counter_set;
+        while (tok_next(&p,name,sizeof name)) {
+            if (!strcasecmp(name,"none")) continue;
+            int value=0; const char* save=p;
+            if (tok_next(&p,num,sizeof num)) { char* e; long q=strtol(num,&e,10); if(e!=num && !*e) value=(int)q; else p=save; }
+            int j; for(j=n-1;j>=0;j--) if(!strcmp(stack[j].name,name)) break;
+            if(j<0 && n<256) { j=n++; snprintf(stack[j].name,sizeof stack[j].name,"%s",name); stack[j].end=el->subtree_end; }
+            if(j>=0) stack[j].value=value;
+        }
+    }
+    int count=0; for(int i=0;i<n;i++) if(!strcmp(stack[i].name,wanted)) { if(count<cap && values) values[count]=stack[i].value; count++; }
+    return count;
+}
+static void counter_format(char* out, size_t cap, int value, const char* style) {
+    if (!strcasecmp(style,"upper-roman") || !strcasecmp(style,"lower-roman")) {
+        static const int nums[]={1000,900,500,400,100,90,50,40,10,9,5,4,1};
+        static const char* sym[]={"M","CM","D","CD","C","XC","L","XL","X","IX","V","IV","I"};
+        if(value>0&&value<=3999) { size_t o=0; for(int i=0;i<13;i++) while(value>=nums[i]) { size_t l=strlen(sym[i]); if(o+l+1>=cap) break; memcpy(out+o,sym[i],l);o+=l;value-=nums[i]; } out[o]=0; if(!strcasecmp(style,"lower-roman")) for(char*p=out;*p;p++)*p=(char)tolower((unsigned char)*p); return; }
+    }
+    if (!strcasecmp(style,"lower-alpha") || !strcasecmp(style,"upper-alpha") || !strcasecmp(style,"lower-latin") || !strcasecmp(style,"upper-latin")) {
+        if(value>0&&value<=18278) { char tmp[16]; int k=0; while(value>0&&k<15){value--;tmp[k++]=(char)((!strncasecmp(style,"upper",5)?'A':'a')+(value%26));value/=26;} size_t o=0;while(k&&o+1<cap)out[o++]=tmp[--k];out[o]=0;return; }
+    }
+    snprintf(out,cap,"%d",value);
+}
+static void content_counter(Cx* c, const char* expr, int is_many, char* out, size_t cap) {
+    char name[40]="", style[32]="decimal", sep[40]="."; const char* p=expr;
+    while(isspace((unsigned char)*p))p++; size_t n=0; while(*p && *p!=',' && !isspace((unsigned char)*p) && n<sizeof name-1)name[n++]=*p++;name[n]=0;
+    while(isspace((unsigned char)*p))p++;
+    if(*p==',') { p++; while(isspace((unsigned char)*p))p++; if(*p=='"'||*p=='\'') { char q=*p++;size_t k=0;while(*p&&*p!=q&&k<sizeof sep-1)sep[k++]=*p++;sep[k]=0;if(*p)p++; while(isspace((unsigned char)*p))p++; if(*p==',')p++; } if (p<expr+strlen(expr)) { while(isspace((unsigned char)*p))p++; if (*p=='"'||*p=='\'') {p++;size_t k=0;while(*p&&*p!='"'&&*p!='\''&&k<sizeof style-1)style[k++]=*p++;style[k]=0;} else {size_t k=0;while(*p && !isspace((unsigned char)*p)&&k<sizeof style-1)style[k++]=*p++;style[k]=0;} } }
+    if (!c->doc || !c->owner || !name[0]) { snprintf(out,cap,"0"); return; }
+    int vals[32]; int count=collect_counter_values(c->doc,c->owner,name,vals,32); if(count<=0){snprintf(out,cap,"0");return;}
+    if (expr[0]=='#') (void)expr;
+    if (is_many) { size_t o=0; int use=count<32?count:32; for(int i=0;i<use;i++){char b[32];counter_format(b,sizeof b,vals[i],style);if(i){size_t z=strlen(sep);if(o+z>=cap)break;memcpy(out+o,sep,z);o+=z;}size_t z=strlen(b);if(o+z>=cap)z=cap-o-1;memcpy(out+o,b,z);o+=z;if(o>=cap-1)break;}out[o]=0;}
+    else counter_format(out,cap,vals[count-1],style);
+}
+
 static void parse_content(Cx* c, const char* v) {
     char* out = c->content; size_t cap = 248, o = 0; out[0] = 0; c->has_content = 0;
     const char* p = v;
     while (isspace((unsigned char)*p)) p++;
-    if (!*p || !strncasecmp(p, "none", 4) || !strncasecmp(p, "normal", 6)) return;
+    if (!*p || !strncasecmp(p, "normal", 6)) return;
+    if (!strncasecmp(p, "none", 4)) { c->has_content = -1; return; }
     c->has_content = 1;
     while (*p) {
         while (isspace((unsigned char)*p)) p++;
@@ -469,10 +880,69 @@ static void parse_content(Cx* c, const char* v) {
         } else if (!strncasecmp(p, "open-quote", 10)) { put_utf8(out, cap, &o, 0x201C); p += 10; }
         else if (!strncasecmp(p, "close-quote", 11)) { put_utf8(out, cap, &o, 0x201D); p += 11; }
         else if (*p == '/') break;                                              /* «content: X / "alt"» — альтернативный текст */
-        else {                                                                   /* counter(...), url(...), no-open-quote и пр. */
-            int d = 0; while (*p && (d > 0 || !isspace((unsigned char)*p))) { if (*p == '(') d++; else if (*p == ')') d--; p++; }
+        else if (!strncasecmp(p,"counter(",8) || !strncasecmp(p,"counters(",9)) {
+            int is_many=!strncasecmp(p,"counters(",9); const char* arg=p+(is_many?9:8); const char* e=arg; int dep=1;
+            while(*e&&dep){if(*e=='(')dep++;else if(*e==')')dep--;if(dep)e++;}
+            if(dep) break; char expr[160];size_t l=(size_t)(e-arg);if(l>159)l=159;memcpy(expr,arg,l);expr[l]=0;
+            char tmp[160];content_counter(c,expr,is_many,tmp,sizeof tmp);for(char*q=tmp;*q;q++)put_raw(out,cap,&o,(unsigned char)*q);p=e+1;
+        } else {                                                                   /* url(...), no-open-quote и прочие пока не отрисовываем */
+            int d = 0; while (*p && (d > 0 || !isspace((unsigned char)*p))) { if (*p == '(') d++; if (*p == ')') d--; p++; }
         }
     }
+}
+
+static int logical_side(const NodeStyle* st, int inline_axis, int start) {
+    int wm = st->writing_mode, rtl = st->direction != 0;
+    if (wm == 0) {
+        if (inline_axis) return (start != rtl) ? 3 : 1; /* LTR start=left; RTL start=right */
+        return start ? 0 : 2;
+    }
+    if (inline_axis) return (start != rtl) ? 0 : 2; /* vertical inline direction: top/bottom */
+    if (wm == 1) return start ? 1 : 3;              /* vertical-rl */
+    return start ? 3 : 1;                            /* vertical-lr */
+}
+static void logical_pair(Cx* c, const char* v, Len out[4], const NodeStyle* st, int inline_axis, int base_side) {
+    const char* p = v; char a[128], b[128]; Len la, lb;
+    if (!tok_next(&p, a, sizeof a)) return;
+    if (!tok_next(&p, b, sizeof b)) snprintf(b, sizeof b, "%s", a);
+    if (!len_of(c, a, &la) || !len_of(c, b, &lb)) return;
+    out[logical_side(st, inline_axis, 1)] = la;
+    out[logical_side(st, inline_axis, 0)] = lb;
+    (void)base_side;
+}
+static void parse_text_shadow(Cx* c, NodeStyle* st, const char* v) {
+    st->ts_color = 0; st->ts_x = st->ts_y = st->ts_blur = 0;
+    if (!strcasecmp(v, "none")) return;
+    char first[256]; const char* e = v; int d = 0; size_t k = 0;
+    while (*e && !(d == 0 && *e == ',') && k < sizeof(first)-1) { if (*e == '(') d++; if (*e == ')') d--; first[k++] = *e++; } first[k] = 0;
+    float nums[3] = {0,0,0}; int nn = 0; uint32_t color = 0x80000000u; char tk[96]; const char* p = first; Len l;
+    while (tok_next(&p, tk, sizeof tk)) { uint32_t cc;
+        if ((isdigit((unsigned char)tk[0]) || tk[0]=='-' || tk[0]=='.') && len_of(c, tk, &l)) { if (nn < 3) nums[nn++] = px_of(&l, 0); }
+        else if (col_of(c, tk, &cc)) color = cc;
+    }
+    if (nn >= 2) { st->ts_x = nums[0]; st->ts_y = nums[1]; st->ts_blur = nums[2]; st->ts_color = color; }
+}
+static void parse_outline(Cx* c, NodeStyle* st, const char* v) {
+    if (!strcasecmp(v, "none") || !strncasecmp(v, "0", 1)) { st->outline_w = 0; st->outline_style = BS_NONE; st->outline_set = 1; st->no_ring = 1; return; }
+    char tk[128]; const char* p = v; Len l; uint32_t col;
+    float w = 3; int style = BS_SOLID; uint32_t color = st->color;
+    while (tok_next(&p, tk, sizeof tk)) {
+        int bs = bstyle(tk);
+        if (bs >= 0) style = bs;
+        else if (!strcasecmp(tk, "thin")) w = 1; else if (!strcasecmp(tk, "medium")) w = 3; else if (!strcasecmp(tk, "thick")) w = 5;
+        else if ((isdigit((unsigned char)tk[0]) || tk[0]=='-' || tk[0]=='.') && len_of(c, tk, &l)) w = px_of(&l, 0);
+        else if (col_of(c, tk, &col)) color = col;
+    }
+    st->outline_w = w; st->outline_style = (uint8_t)style; st->outline_c = color; st->outline_set = 1; st->no_ring = style == BS_NONE;
+}
+static void append_individual_transform(Cx* c, NodeStyle* st, int prop, const char* val) {
+    FxXform tmp; memset(&tmp, 0, sizeof tmp); tmp.ox = st->xf.ox; tmp.oy = st->xf.oy; tmp.has_origin = st->xf.has_origin;
+    char expr[256];
+    if (!strcasecmp(val, "none")) return;
+    if (prop == P_TRANSLATE) snprintf(expr, sizeof expr, "translate(%s)", val);
+    else snprintf(expr, sizeof expr, "rotate(%s)", val);
+    parse_xform(c, &tmp, expr);
+    for (int i = 0; i < tmp.n && st->xf.n < 6; i++) st->xf.op[st->xf.n++] = tmp.op[i];
 }
 
 static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, int size_pass) {
@@ -493,6 +963,9 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
             case P_WIDTH: st->width = ps->width; break; case P_HEIGHT: st->height = ps->height; break;
             case P_LINE_HEIGHT: st->lh_px = ps->lh_px; st->lh_mult = ps->lh_mult; break;
             case P_TEXT_DECO: case P_TEXT_DECO_LINE: st->deco = ps->deco; break;
+            case P_POINTER_EVENTS: st->pointer_events = ps->pointer_events; break; case P_USER_SELECT: st->user_select = ps->user_select; break;
+            case P_WRITING_MODE: st->writing_mode = ps->writing_mode; break; case P_DIRECTION: st->direction = ps->direction; break;
+            case P_TEXT_INDENT: st->text_indent_len = ps->text_indent_len; st->text_indent = ps->text_indent; break; case P_WORD_SPACING: st->word_spacing_len = ps->word_spacing_len; st->word_spacing = ps->word_spacing; break; case P_TEXT_SHADOW: st->ts_x=ps->ts_x; st->ts_y=ps->ts_y; st->ts_blur=ps->ts_blur; st->ts_color=ps->ts_color; break;
             case P_POSITION: st->position = ps->position; break; case P_BORDER_RADIUS: memcpy(st->radius, ps->radius, sizeof st->radius); break;
             default: break;
         }
@@ -500,6 +973,104 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
     }
     if (!strcasecmp(val, "initial") || !strcasecmp(val, "unset") || !strcasecmp(val, "revert")) return;
     switch (prop) {
+    case P_ASPECT_RATIO: {
+        if (!strcasecmp(val, "auto")) { st->aspect_ratio = 0; return; }
+        const char* p = val; while (isspace((unsigned char)*p)) p++; if (!strncasecmp(p, "auto", 4)) { p += 4; while (isspace((unsigned char)*p)) p++; }
+        char* e = NULL; float a = strtof(p, &e); if (e == p || a <= 0) return; while (isspace((unsigned char)*e)) e++;
+        float b = 1; if (*e == '/') { b = strtof(e + 1, &e); if (b <= 0) return; }
+        st->aspect_ratio = a / b; return; }
+    case P_ORDER: { long v = strtol(val, NULL, 10); if (v < -32768) v = -32768; if (v > 32767) v = 32767; st->order = (int16_t)v; return; }
+    case P_TEXT_INDENT: if (len_of(c, val, &l)) { st->text_indent_len = l; st->text_indent = px_of(&l, SCREEN_WIDTH); } return;
+    case P_WORD_SPACING: if (strcasecmp(val, "normal") == 0) { memset(&st->word_spacing_len, 0, sizeof st->word_spacing_len); st->word_spacing = 0; } else if (len_of(c, val, &l)) { st->word_spacing_len = l; st->word_spacing = px_of(&l, 0); } return;
+    case P_INLINE_SIZE: case P_BLOCK_SIZE: case P_MIN_INLINE_SIZE: case P_MAX_INLINE_SIZE: case P_MIN_BLOCK_SIZE: case P_MAX_BLOCK_SIZE:
+        if (len_of(c, val, &l)) {
+            int inl = (prop == P_INLINE_SIZE || prop == P_MIN_INLINE_SIZE || prop == P_MAX_INLINE_SIZE);
+            int ismin = (prop == P_MIN_INLINE_SIZE || prop == P_MIN_BLOCK_SIZE), ismax = (prop == P_MAX_INLINE_SIZE || prop == P_MAX_BLOCK_SIZE);
+            int horizontal = st->writing_mode == 0;
+            Len* dst;
+            if (inl) dst = horizontal ? (ismin ? &st->min_w : ismax ? &st->max_w : &st->width) : (ismin ? &st->min_h : ismax ? &st->max_h : &st->height);
+            else dst = horizontal ? (ismin ? &st->min_h : ismax ? &st->max_h : &st->height) : (ismin ? &st->min_w : ismax ? &st->max_w : &st->width);
+            *dst = l;
+        } return;
+    case P_MARGIN_INLINE: logical_pair(c, val, st->margin, st, 1, 0); return;
+    case P_MARGIN_BLOCK: logical_pair(c, val, st->margin, st, 0, 0); return;
+    case P_PADDING_INLINE: logical_pair(c, val, st->padding, st, 1, 0); return;
+    case P_PADDING_BLOCK: logical_pair(c, val, st->padding, st, 0, 0); return;
+    case P_INSET_INLINE: logical_pair(c, val, st->inset, st, 1, 0); return;
+    case P_INSET_BLOCK: logical_pair(c, val, st->inset, st, 0, 0); return;
+    case P_MARGIN_INLINE_START: case P_MARGIN_INLINE_END: case P_MARGIN_BLOCK_START: case P_MARGIN_BLOCK_END:
+    case P_PADDING_INLINE_START: case P_PADDING_INLINE_END: case P_PADDING_BLOCK_START: case P_PADDING_BLOCK_END:
+    case P_INSET_INLINE_START: case P_INSET_INLINE_END: case P_INSET_BLOCK_START: case P_INSET_BLOCK_END: {
+        if (!len_of(c, val, &l)) return;
+        int inl = prop == P_MARGIN_INLINE_START || prop == P_MARGIN_INLINE_END || prop == P_PADDING_INLINE_START || prop == P_PADDING_INLINE_END || prop == P_INSET_INLINE_START || prop == P_INSET_INLINE_END;
+        int start = prop == P_MARGIN_INLINE_START || prop == P_MARGIN_BLOCK_START || prop == P_PADDING_INLINE_START || prop == P_PADDING_BLOCK_START || prop == P_INSET_INLINE_START || prop == P_INSET_BLOCK_START;
+        int side = logical_side(st, inl, start);
+        if (prop == P_MARGIN_INLINE_START || prop == P_MARGIN_INLINE_END || prop == P_MARGIN_BLOCK_START || prop == P_MARGIN_BLOCK_END) st->margin[side] = l;
+        else if (prop == P_PADDING_INLINE_START || prop == P_PADDING_INLINE_END || prop == P_PADDING_BLOCK_START || prop == P_PADDING_BLOCK_END) st->padding[side] = l;
+        else st->inset[side] = l;
+        return; }
+    case P_OBJECT_FIT: st->object_fit = !strcasecmp(val,"contain") ? 1 : !strcasecmp(val,"cover") ? 2 : !strcasecmp(val,"none") ? 3 : !strcasecmp(val,"scale-down") ? 4 : 0; return;
+    case P_OBJECT_POSITION: {
+        char a[96], b[96]; const char* p = val; if (!tok_next(&p, a, sizeof a)) return; if (!tok_next(&p, b, sizeof b)) strcpy(b, "center");
+        #define OBJ_POS(tok, dst) do { if (!strcasecmp((tok),"left") || !strcasecmp((tok),"top")) (dst)=0; else if (!strcasecmp((tok),"right") || !strcasecmp((tok),"bottom")) (dst)=100; else if (!strcasecmp((tok),"center")) (dst)=50; else (dst)=strtof((tok),NULL); } while(0)
+        OBJ_POS(a, st->object_pos_x); OBJ_POS(b, st->object_pos_y);
+        if (!strcasecmp(a,"top") || !strcasecmp(a,"bottom")) { st->object_pos_y = !strcasecmp(a,"top") ? 0 : 100; st->object_pos_x = !strcasecmp(b,"left") ? 0 : !strcasecmp(b,"right") ? 100 : 50; }
+        #undef OBJ_POS
+        return; }
+    case P_POINTER_EVENTS: st->pointer_events = !strcasecmp(val,"none") ? 1 : 0; return;
+    case P_USER_SELECT: st->user_select = !strcasecmp(val,"none") ? 1 : !strcasecmp(val,"all") ? 3 : !strcasecmp(val,"text") ? 2 : 0; return;
+    case P_TEXT_SHADOW: parse_text_shadow(c, st, val); return;
+    case P_TEXT_OVERFLOW: st->text_overflow = !strcasecmp(val,"ellipsis") ? 1 : 0; return;
+    case P_WEBKIT_LINE_CLAMP: { int v = atoi(val); if (v < 0) v = 0; if (v > 255) v = 255; st->line_clamp = (uint8_t)v; if (v) st->overflow_hidden = 1; return; }
+    case P_OUTLINE: parse_outline(c, st, val); return;
+    case P_OUTLINE_OFFSET: if (len_of(c,val,&l)) st->outline_offset = px_of(&l,0); return;
+    case P_MIX_BLEND_MODE: st->blend_mode = !strcasecmp(val,"multiply") ? 1 : !strcasecmp(val,"screen") ? 2 : !strcasecmp(val,"overlay") ? 3 : !strcasecmp(val,"darken") ? 4 : !strcasecmp(val,"lighten") ? 5 : !strcasecmp(val,"difference") ? 6 : !strcasecmp(val,"exclusion") ? 7 : 0; return;
+    case P_SCROLL_BEHAVIOR: st->scroll_behavior = !strcasecmp(val,"smooth") ? 1 : 0; return;
+    case P_SCROLL_SNAP_TYPE: { char t[40]; const char* p=val; if (!tok_next(&p,t,sizeof t) || !strcasecmp(t,"none")) st->scroll_snap_type=0; else if (!strcasecmp(t,"both")) st->scroll_snap_type=3; else if (!strcasecmp(t,"y")) st->scroll_snap_type=2; else st->scroll_snap_type=1; return; }
+    case P_SCROLL_SNAP_ALIGN: { char t[40]; const char* p=val; if (!tok_next(&p,t,sizeof t)) st->scroll_snap_align=0; else st->scroll_snap_align=!strcasecmp(t,"start")?1:!strcasecmp(t,"center")?2:!strcasecmp(t,"end")?3:0; return; }
+    case P_COUNTER_RESET:
+        if (strlen(val) < sizeof st->counter_reset && css_tokens_fit(val, 39)) memcpy(st->counter_reset, val, strlen(val) + 1);
+        else st->counter_reset[0] = 0;
+        return;
+    case P_COUNTER_INCREMENT:
+        if (strlen(val) < sizeof st->counter_increment && css_tokens_fit(val, 39)) memcpy(st->counter_increment, val, strlen(val) + 1);
+        else st->counter_increment[0] = 0;
+        return;
+    case P_COUNTER_SET:
+        if (strlen(val) < sizeof st->counter_set && css_tokens_fit(val, 39)) memcpy(st->counter_set, val, strlen(val) + 1);
+        else st->counter_set[0] = 0;
+        return;
+    case P_WRITING_MODE: st->writing_mode = !strcasecmp(val,"vertical-rl") ? 1 : !strcasecmp(val,"vertical-lr") ? 2 : 0; return;
+    case P_DIRECTION: if (!strcasecmp(val,"rtl")) st->direction = 1; else if (!strcasecmp(val,"ltr")) st->direction = 0; return;
+    case P_UNICODE_BIDI:
+        st->unicode_bidi = !strcasecmp(val,"embed") ? 1 : !strcasecmp(val,"isolate") ? 2 :
+                           !strcasecmp(val,"bidi-override") ? 3 : !strcasecmp(val,"isolate-override") ? 4 :
+                           !strcasecmp(val,"plaintext") ? 5 : 0;
+        return;
+    case P_ZOOM: { float z = !strcasecmp(val,"normal") ? 1.0f : strtof(val,NULL); if (strchr(val,'%')) z /= 100.0f; if (z < 0.1f) z = 0.1f; if (z > 8.0f) z = 8.0f; st->zoom = z; return; }
+    case P_TRANSLATE: case P_ROTATE: append_individual_transform(c, st, prop, val); return;
+    case P_CONTAINER_TYPE: st->container_type = !strcasecmp(val,"size") ? 2 : !strcasecmp(val,"inline-size") ? 1 : 0; return;
+    case P_CONTAINER_NAME: {
+        char t[sizeof st->container_name]; const char* p=val;
+        int status = tok_next_exact(&p, t, sizeof t);
+        if (status > 0 && strcasecmp(t,"none")) { memcpy(st->container_name, t, strlen(t) + 1); st->container_name_set=1; }
+        else { st->container_name[0]=0; st->container_name_set=0; }
+        return;
+    }
+    case P_CONTAINER: {
+        char a[sizeof st->container_name], b[48]; const char* p=val;
+        a[0]=b[0]=0;
+        int first = tok_next_exact(&p,a,sizeof a);
+        if (first <= 0) { st->container_name[0]=0; st->container_name_set=0; return; }
+        int second = tok_next(&p,b,sizeof b);
+        if (!strcasecmp(a,"size")||!strcasecmp(a,"inline-size")||!strcasecmp(a,"normal")) {
+            apply(c,n,st,P_CONTAINER_TYPE,a,0); st->container_name[0]=0; st->container_name_set=0;
+        } else {
+            if (a[0] && strcmp(a,"none")) { memcpy(st->container_name,a,strlen(a)+1); st->container_name_set=1; }
+            if (second && b[0]) apply(c,n,st,P_CONTAINER_TYPE,b,0); else if (a[0]) apply(c,n,st,P_CONTAINER_TYPE,a,0);
+        }
+        return;
+    }
     case P_DISPLAY: {
         static const struct { const char* k; int d; } M[] = { {"none",DSP_NONE},{"block",DSP_BLOCK},{"inline",DSP_INLINE},{"inline-block",DSP_INLINE_BLOCK},
             {"flex",DSP_FLEX},{"-webkit-box",DSP_FLEX},{"inline-flex",DSP_INLINE_FLEX},{"-webkit-inline-box",DSP_INLINE_FLEX},{"grid",DSP_BLOCK},
@@ -529,8 +1100,15 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
         if (!k && !st->sc_x && !st->sc_y) { /* visible по обеим осям: сохраняем прежнее поведение — отсечение не отключаем, если задано другой осью */ }
         #undef OV_KIND
         return; }
-    case P_TEXT_ALIGN: st->center_blocks = (!strcasecmp(val, "-webkit-center") || !strcasecmp(val, "-moz-center")); st->text_align = (!strcasecmp(val, "right") || !strcasecmp(val, "end")) ? ALIGN_RIGHT : (!strcasecmp(val, "center") || !strcasecmp(val, "-webkit-center")) ? ALIGN_CENTER : !strcasecmp(val, "justify") ? ALIGN_JUSTIFY : ALIGN_LEFT; return;
+    case P_TEXT_ALIGN:
+        st->center_blocks = (!strcasecmp(val, "-webkit-center") || !strcasecmp(val, "-moz-center"));
+        st->text_align = !strcasecmp(val,"start") ? ALIGN_START : !strcasecmp(val,"end") ? ALIGN_END :
+                         !strcasecmp(val,"right") ? ALIGN_RIGHT : (!strcasecmp(val,"center") || !strcasecmp(val,"-webkit-center")) ? ALIGN_CENTER :
+                         !strcasecmp(val,"justify") ? ALIGN_JUSTIFY : ALIGN_LEFT;
+        return;
     case P_WHITE_SPACE: st->white_space = !strcasecmp(val, "nowrap") ? WS_NOWRAP : !strcasecmp(val, "pre") ? WS_PRE : (!strcasecmp(val, "pre-wrap") || !strcasecmp(val, "break-spaces")) ? WS_PRE_WRAP : !strcasecmp(val, "pre-line") ? WS_PRE_LINE : WS_NORMAL; return;
+    case P_TEXT_WRAP: if (!strcasecmp(val,"nowrap")) st->text_wrap=1; else if (!strcasecmp(val,"balance")) st->text_wrap=2; else if (!strcasecmp(val,"pretty")) st->text_wrap=3; else if (!strcasecmp(val,"stable")) st->text_wrap=4; else if (!strcasecmp(val,"wrap")) st->text_wrap=0; return;
+    case P_CONTENT_VISIBILITY: st->content_visibility = !strcasecmp(val,"hidden") ? 2 : !strcasecmp(val,"auto") ? 1 : 0; return;
     case P_TEXT_DECO: case P_TEXT_DECO_LINE: {
         uint8_t d = 0; if (strcasestr(val, "underline")) d |= DECO_UNDERLINE; if (strcasestr(val, "line-through")) d |= DECO_LINE_THROUGH; if (strcasestr(val, "overline")) d |= DECO_OVERLINE;
         st->deco = d; return; }
@@ -543,7 +1121,6 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
     case P_VERTICAL_ALIGN: st->vertical_align = !strcasecmp(val, "top") || !strcasecmp(val, "text-top") ? VA_TOP : !strcasecmp(val, "middle") ? VA_MIDDLE : !strcasecmp(val, "bottom") || !strcasecmp(val, "text-bottom") ? VA_BOTTOM : !strcasecmp(val, "sub") ? VA_SUB : !strcasecmp(val, "super") ? VA_SUPER : VA_BASELINE; return;
     case P_WORD_BREAK: st->break_word = !strcasecmp(val, "break-all") ? 2 : (st->break_word == 1 ? 1 : 0); return;
     case P_OVERFLOW_WRAP: case P_WORD_WRAP: st->break_word = (!strcasecmp(val, "break-word") || !strcasecmp(val, "anywhere")) ? 1 : 0; return;
-    case P_OUTLINE: st->no_ring = (!strncasecmp(val, "none", 4) || !strncmp(val, "0", 1)); return;
     case P_CURSOR: st->pointer = !strcasecmp(val, "pointer"); return;
     case P_BOX_SIZING: st->box_sizing = !strcasecmp(val, "border-box"); return;
     case P_OPACITY: { float o = strtof(val, NULL); if (strchr(val, '%')) o /= 100.0f; st->opacity = o < 0 ? 0 : o > 1 ? 1 : o; return; }
@@ -574,7 +1151,12 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
     case P_BORDER_T: border_side(c, st, 1, val); return; case P_BORDER_R: border_side(c, st, 2, val); return;
     case P_BORDER_B: border_side(c, st, 4, val); return; case P_BORDER_L: border_side(c, st, 8, val); return;
     case P_BORDER_COLOR: case P_BORDER_STYLE: case P_BORDER_WIDTH: {
-        const char* p = val; char t[4][64]; int k = 0; while (k < 4 && tok_next(&p, tk, sizeof tk)) snprintf(t[k++], 64, "%s", tk);
+        const char* p = val; char t[4][256]; int k = 0;
+        while (k < 4 && tok_next(&p, tk, sizeof tk)) {
+            size_t tl = strlen(tk);
+            if (tl >= sizeof t[k]) return;
+            memcpy(t[k], tk, tl + 1); k++;
+        }
         if (!k) return; int map[4] = {0, k > 1 ? 1 : 0, k > 2 ? 2 : 0, k > 3 ? 3 : (k > 1 ? 1 : 0)};
         for (int i = 0; i < 4; i++) { const char* s = t[map[i]];
             if (prop == P_BORDER_COLOR) { if (col_of(c, s, &col)) st->border_c[i] = col; }
@@ -613,8 +1195,93 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
     case P_TRANSITION_TIMING: parse_transition_list(c, st, 3, val); return;
     case P_ANIMATION: parse_animation_short(c, st, val); return;
     case P_ANIMATION_NAME: case P_ANIMATION_DURATION: case P_ANIMATION_DELAY: case P_ANIMATION_TIMING: case P_ANIMATION_ITER:
-    case P_ANIMATION_DIR: case P_ANIMATION_FILL: case P_ANIMATION_PLAY: parse_animation_list(c, st, prop, val); return;
-    case P_GRID_ROWS: if (!strncasecmp(val, "none", 4)) st->grid_rows[0] = 0; else copy_trim(st->grid_rows, sizeof st->grid_rows, val); return;
+    case P_ANIMATION_DIR: case P_ANIMATION_FILL: case P_ANIMATION_PLAY: case P_ANIMATION_COMPOSITION:
+        parse_animation_list(c, st, prop, val); return;
+    case P_ANIMATION_TIMELINE: {
+        if (!strcasecmp(val, "auto")) { st->animation_timeline = 0; return; }
+        if (!strcasecmp(val, "none")) { st->animation_timeline = 3; return; }
+        if (strcasestr(val, "view(")) st->animation_timeline = 2;
+        else if (strcasestr(val, "scroll(")) st->animation_timeline = 1;
+        else return;
+        st->animation_timeline_axis = 0;
+        if (strcasestr(val, "inline") || strcasestr(val, "x")) st->animation_timeline_axis = 1;
+        if (strcasestr(val, " y") || strcasestr(val, "block")) st->animation_timeline_axis = 3;
+        return;
+    }
+    case P_ANIMATION_RANGE: {
+        if (!strcasecmp(val, "normal")) { st->animation_range_start = 0; st->animation_range_end = 1; return; }
+        char a[48] = "", b[48] = ""; const char* p = val; while (isspace((unsigned char)*p)) p++;
+        size_t k = 0; while (*p && !isspace((unsigned char)*p) && k + 1 < sizeof a) a[k++] = *p++; a[k] = 0;
+        while (isspace((unsigned char)*p)) p++; k = 0; while (*p && !isspace((unsigned char)*p) && k + 1 < sizeof b) b[k++] = *p++; b[k] = 0;
+        char* e = NULL; float x = strtof(a, &e); if (e == a) return; if (strchr(a, '%')) x /= 100.0f;
+        float y = 1.0f; if (b[0]) { e = NULL; y = strtof(b, &e); if (e == b) return; if (strchr(b, '%')) y /= 100.0f; }
+        if (x < 0) x = 0; if (x > 1) x = 1; if (y < x) y = x; if (y > 1) y = 1;
+        st->animation_range_start = x; st->animation_range_end = y; return;
+    }
+    case P_COLUMN_COUNT: {
+        if (!strcasecmp(val, "auto")) { st->column_count = 0; return; }
+        char* e = NULL; long v = strtol(val, &e, 10); while (e && isspace((unsigned char)*e)) e++;
+        if (e && e != val && !*e) { if (v < 1) v = 1; if (v > 32) v = 32; st->column_count = (uint8_t)v; } return;
+    }
+    case P_COLUMN_WIDTH:
+        if (!strcasecmp(val, "auto")) { memset(&st->column_width, 0, sizeof st->column_width); return; }
+        if (len_of(c, val, &l) && l.set && l.px + l.pct + l.vw + l.vh > 0) st->column_width = l; return;
+    case P_COLUMNS: {
+        st->column_count = 0; memset(&st->column_width, 0, sizeof st->column_width);
+        const char* p = val;
+        while (tok_next(&p, tk, sizeof tk)) {
+            if (!strcasecmp(tk, "auto")) continue;
+            char* e = NULL; long v = strtol(tk, &e, 10);
+            if (e != tk && !*e) { if (v < 1) v = 1; if (v > 32) v = 32; st->column_count = (uint8_t)v; }
+            else if (len_of(c, tk, &l) && l.set) st->column_width = l;
+        } return;
+    }
+    case P_COLUMN_FILL: st->column_fill = !strcasecmp(val, "auto") ? 1 : 0; return;
+    case P_COLUMN_SPAN: st->column_span = !strcasecmp(val, "all") ? 1 : 0; return;
+    case P_COLUMN_RULE_WIDTH: {
+        if (!strcasecmp(val, "thin")) st->column_rule_width = 1;
+        else if (!strcasecmp(val, "medium")) st->column_rule_width = 3;
+        else if (!strcasecmp(val, "thick")) st->column_rule_width = 5;
+        else if (len_of(c, val, &l)) st->column_rule_width = px_of(&l, 0);
+        if (st->column_rule_width < 0) st->column_rule_width = 0; return;
+    }
+    case P_COLUMN_RULE_STYLE: { int q = bstyle(val); if (q >= 0) st->column_rule_style = (uint8_t)q; return; }
+    case P_COLUMN_RULE_COLOR: if (col_of(c, val, &col)) st->column_rule_color = col; return;
+    case P_COLUMN_RULE: {
+        st->column_rule_width = 3; st->column_rule_style = BS_SOLID; st->column_rule_color = st->color;
+        const char* p = val;
+        while (tok_next(&p, tk, sizeof tk)) {
+            int bs = bstyle(tk); uint32_t cc;
+            if (bs >= 0) st->column_rule_style = (uint8_t)bs;
+            else if (!strcasecmp(tk, "thin")) st->column_rule_width = 1;
+            else if (!strcasecmp(tk, "medium")) st->column_rule_width = 3;
+            else if (!strcasecmp(tk, "thick")) st->column_rule_width = 5;
+            else if (len_of(c, tk, &l)) st->column_rule_width = px_of(&l, 0);
+            else if (col_of(c, tk, &cc)) st->column_rule_color = cc;
+        } return;
+    }
+    case P_TEXT_ORIENTATION: st->text_orientation = !strcasecmp(val,"upright") ? 1 : !strcasecmp(val,"sideways") ? 2 : 0; return;
+    case P_TEXT_COMBINE_UPRIGHT: st->text_combine_upright = (!strcasecmp(val,"all") || !strcasecmp(val,"digits")) ? 1 : 0; return;
+    case P_CONTAIN_INTRINSIC_SIZE: {
+        memset(&st->contain_intrinsic_w, 0, sizeof st->contain_intrinsic_w); memset(&st->contain_intrinsic_h, 0, sizeof st->contain_intrinsic_h);
+        if (!strcasecmp(val, "none")) return;
+        const char* p = val; char a[128], b[128]; int k = 0;
+        if (tok_next(&p, a, sizeof a)) { if (!strcasecmp(a,"auto")) { if (tok_next(&p,b,sizeof b) && len_of(c,b,&l)) st->contain_intrinsic_w = st->contain_intrinsic_h = l; return; } if (len_of(c,a,&l)) { st->contain_intrinsic_h = l; k = 1; } else return; }
+        if (tok_next(&p,b,sizeof b) && len_of(c,b,&l)) { if (k) st->contain_intrinsic_w = st->contain_intrinsic_h; st->contain_intrinsic_h = l; }
+        else if(k) st->contain_intrinsic_w = st->contain_intrinsic_h;
+        return;
+    }
+    case P_ANCHOR_NAME: {
+        st->anchor_name[0] = 0; const char* p = val; char t[48];
+        while (tok_next(&p, t, sizeof t)) if (!strcasecmp(t,"none")) { st->anchor_name[0]=0; return; } else if (t[0]=='-' && t[1]=='-') { snprintf(st->anchor_name,sizeof st->anchor_name,"%s",t); return; }
+        return;
+    }
+    case P_POSITION_ANCHOR: {
+        st->position_anchor[0]=0; const char* p=val; char t[48]; if (tok_next(&p,t,sizeof t) && t[0]=='-' && t[1]=='-') snprintf(st->position_anchor,sizeof st->position_anchor,"%s",t); return;
+    }
+    case P_POSITION_AREA: copy_trim(st->position_area,sizeof st->position_area,val); return;
+    case P_VIEW_TRANSITION_NAME: copy_trim(st->view_transition_name,sizeof st->view_transition_name,val); return;
+    case P_GRID_ROWS: if (!strncasecmp(val, "subgrid", 7) && (!val[7] || isspace((unsigned char)val[7]))) { st->grid_subgrid_rows=1; copy_trim(st->grid_rows, sizeof st->grid_rows, val); } else { st->grid_subgrid_rows=0; if (!strncasecmp(val, "none", 4)) st->grid_rows[0] = 0; else copy_trim(st->grid_rows, sizeof st->grid_rows, val); } return;
     case P_GRID_AUTO_ROWS: copy_trim(st->grid_auto_r, sizeof st->grid_auto_r, val); return;
     case P_GRID_AUTO_COLS: copy_trim(st->grid_auto_c, sizeof st->grid_auto_c, val); return;
     case P_GRID_AUTO_FLOW: st->grid_flow = (uint8_t)((strcasestr(val, "column") ? 1 : 0) | (strcasestr(val, "dense") ? 2 : 0)); return;
@@ -658,7 +1325,7 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
         int a = (!strcasecmp(val, "flex-start") || !strcasecmp(val, "start") || !strcasecmp(val, "self-start")) ? AI_START : (!strcasecmp(val, "flex-end") || !strcasecmp(val, "end") || !strcasecmp(val, "self-end")) ? AI_END : !strcasecmp(val, "center") ? AI_CENTER : !strncasecmp(val, "baseline", 8) ? AI_BASELINE : !strcasecmp(val, "auto") ? AI_AUTO : AI_STRETCH;
         if (prop == P_ALIGN_ITEMS) st->align_items = (uint8_t)a; else st->align_self = (uint8_t)a; return; }
     case P_GAP: { const char* p = val; Len a, b; int k = 0; while (k < 2 && tok_next(&p, tk, sizeof tk)) { if (!len_of(c, tk, k ? &b : &a)) return; k++; } if (!k) return; st->gap_r = px_of(&a, 0); st->gap_c = k > 1 ? px_of(&b, 0) : st->gap_r; return; }
-    case P_GRID_COLS: if (!strncasecmp(val, "none", 4)) st->grid_cols[0] = 0; else snprintf(st->grid_cols, sizeof st->grid_cols, "%s", val); return;
+    case P_GRID_COLS: if (!strncasecmp(val, "subgrid", 7) && (!val[7] || isspace((unsigned char)val[7]))) { st->grid_subgrid_cols=1; snprintf(st->grid_cols,sizeof st->grid_cols,"subgrid"); } else { st->grid_subgrid_cols=0; if (!strncasecmp(val,"none",4)) st->grid_cols[0]=0; else snprintf(st->grid_cols,sizeof st->grid_cols,"%s",val); } return;
     case P_GRID_TEMPLATE: {                                          /* шорткат «строки / колонки»; строки с именами областей в кавычках идут и в grid-template-areas */
         const char* sl = strrchr(val, '/');
         if (sl) { const char* p2 = sl + 1; while (isspace((unsigned char)*p2)) p2++; snprintf(st->grid_cols, sizeof st->grid_cols, "%s", p2); }
@@ -673,7 +1340,7 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
                 size_t tl = (size_t)(e - q); if (tl && ro + tl + 2 < sizeof rows) { memcpy(rows + ro, q, tl); ro += tl; rows[ro++] = ' '; } expect = 0; q = e ? e : q + 1; if (e == q && !*q) break;
             }
             if (expect && ro + 5 < sizeof rows) { memcpy(rows + ro, "auto ", 5); ro += 5; } rows[ro] = 0; copy_trim(st->grid_rows, sizeof st->grid_rows, rows);
-        } else if (sl && !strncasecmp(head, "none", 4) == 0) copy_trim(st->grid_rows, sizeof st->grid_rows, head);
+        } else if (sl && strncasecmp(head, "none", 4) != 0) copy_trim(st->grid_rows, sizeof st->grid_rows, head);
         return;
     }
     case P_GRID_AREAS: {                                             /* 'a a' 'b c' -> "a a\nb c" (без кавычек, по одной строке на ряд) */
@@ -692,7 +1359,7 @@ static void apply(Cx* c, DOMNode* n, NodeStyle* st, int prop, const char* val, i
     }
     case P_GRID_AREA: {
         if (strchr(val, '/')) {                                       /* row-start / col-start / row-end / col-end */
-            char part[4][256]; int k = split_slash4(val, part);
+            char part[4][256] = {{0}}; int k = split_slash4(val, part);
             copy_trim(st->grid_row_s, sizeof st->grid_row_s, part[0]); copy_trim(st->grid_col_s, sizeof st->grid_col_s, k > 1 ? part[1] : part[0]);
             copy_trim(st->grid_row_e, sizeof st->grid_row_e, k > 2 ? part[2] : (k > 1 ? "" : part[0])); copy_trim(st->grid_col_e, sizeof st->grid_col_e, k > 3 ? part[3] : (k > 2 ? "" : (k > 1 ? "" : part[0])));
             return;
@@ -737,7 +1404,7 @@ static uint64_t decl_ap_mask(int prop) {
 /* Стиль ключевого кадра: стиль узла + декларации кадра (для анимации) */
 static uint64_t kf_build(void* ctx, DOMNode* n, const Decl* decls, int nd, NodeStyle* out, float root_fs) {
     Doc* d = ctx; DOMNode* pa = par(d, n); Cx cx; memset(&cx, 0, sizeof cx);
-    cx.parent = pa; cx.pfs = pa ? pa->st.font_size : 16; cx.rem = root_fs; cx.owner = n; CP* cps = d->cps ? d->cps[n->idx] : NULL; char resolved[1024];
+    cx.parent = pa; cx.pfs = pa ? pa->st.font_size : 16; cx.rem = root_fs; cx.owner = n; cx.doc = d; cx.parent_lh = pa ? (pa->st.lh_px > 0 ? pa->st.lh_px : pa->st.lh_mult > 0 ? pa->st.lh_mult * pa->st.font_size : pa->st.font_size * 1.2f) : cx.pfs * 1.2f; cx.lh = cx.parent_lh; CP* cps = d->cps ? d->cps[n->idx] : NULL; char resolved[1024];
     uint64_t mask = 0;
     for (int pass = 0; pass < 2; pass++) for (int i = 0; i < nd; i++) {
         const Decl* dc = &decls[i]; if (pass == 1) mask |= decl_ap_mask(dc->prop); if (dc->prop == P_CUSTOM || dc->prop == P_FONT_FAMILY || dc->prop == P_FONT || dc->prop == P_CONTENT) continue;
@@ -745,6 +1412,9 @@ static uint64_t kf_build(void* ctx, DOMNode* n, const Decl* decls, int nd, NodeS
         cx.em = pass == 0 ? cx.pfs : out->font_size; cx.cur = out->color;
         apply(&cx, n, out, dc->prop, v, pass == 0);
     }
+    /* Keyframe builds do not run finish_style(); keep the animation-facing
+       opacity field coherent with the declaration just applied. */
+    if (mask & APM(AP_OPACITY)) out->op_own = out->opacity;
     return mask;
 }
 
@@ -761,8 +1431,8 @@ static uint64_t mkkey(int origin, uint32_t spec, int order) { return ((uint64_t)
 
 static void init_style(DOMNode* n, DOMNode* pa) {
     NodeStyle* st = &n->st; memset(st, 0, sizeof *st);
-    st->display = DSP_INLINE; st->font_size = 16; st->color = 0xFF000000u; st->opacity = 1; st->flex_shrink = 1;
-    st->spacing = 2; st->border_style[0] = st->border_style[1] = st->border_style[2] = st->border_style[3] = BS_NONE;
+    st->display = DSP_INLINE; st->font_size = 16; st->color = 0xFF000000u; st->opacity = 1; st->flex_shrink = 1; st->zoom = 1.0f; st->object_pos_x = st->object_pos_y = 50.0f; st->outline_c = st->color; st->outline_w = 3; st->outline_style = BS_SOLID;
+    st->spacing = 2; st->text_align = ALIGN_START; st->animation_range_start = 0.0f; st->animation_range_end = 1.0f; st->column_rule_color = 0xFF000000u; st->border_style[0] = st->border_style[1] = st->border_style[2] = st->border_style[3] = BS_NONE;
     for (int i = 0; i < 4; i++) { st->border_w[i] = 3; st->border_c[i] = CUR_COLOR; }
     st->sh_color = 0; st->list_style = LS_DISC; st->align_self = AI_AUTO;
     for (int i = 0; i < 4; i++) { st->margin[i].set = 1; st->padding[i].set = 1; }
@@ -770,9 +1440,9 @@ static void init_style(DOMNode* n, DOMNode* pa) {
     if (pa) {
         const NodeStyle* ps = &pa->st;
         st->color = ps->color; st->font_size = ps->font_size; st->lh_px = ps->lh_px; st->lh_mult = ps->lh_mult; st->bold = ps->bold; st->weight = ps->weight; st->italic = ps->italic;
-        st->text_align = ps->text_align; st->white_space = ps->white_space; st->text_transform = ps->text_transform; st->visibility = ps->visibility;
+        st->text_align = ps->text_align; st->white_space = ps->white_space; st->text_wrap = ps->text_wrap; st->bidi_context = ps->bidi_context; st->text_transform = ps->text_transform; st->visibility = ps->visibility;
         st->center_blocks = ps->center_blocks; st->list_style = ps->list_style; st->pointer = ps->pointer; st->break_word = ps->break_word; st->spacing = ps->spacing;
-        st->deco = ps->deco; snprintf(n->font_family, sizeof n->font_family, "%s", pa->font_family);
+        st->deco = ps->deco; st->pointer_events = ps->pointer_events; st->user_select = ps->user_select; st->writing_mode = ps->writing_mode; st->direction = ps->direction; st->text_indent_len = ps->text_indent_len; st->text_indent = ps->text_indent; st->word_spacing_len = ps->word_spacing_len; st->word_spacing = ps->word_spacing; st->ts_x = ps->ts_x; st->ts_y = ps->ts_y; st->ts_blur = ps->ts_blur; st->ts_color = ps->ts_color; snprintf(n->font_family, sizeof n->font_family, "%s", pa->font_family);
         /* фон-градиент и background-clip:text передаём вниз на анонимные текстовые узлы,
            иначе они не видят фон, объявленный на родительском элементе (h1, span и т.п.) */
         st->bg_clip_text = ps->bg_clip_text;
@@ -782,9 +1452,41 @@ static void init_style(DOMNode* n, DOMNode* pa) {
 }
 
 /* Правила, подходящие узлу. pseudo: 0 — для самого элемента, 1/2 — для его ::before/::after */
+static int container_query_matches(Doc* d, DOMNode* n, const Rule* r) {
+    if (!r->has_container_query) return 1;
+    for (DOMNode* a=par(d,n); a; a=par(d,a)) {
+        const NodeStyle* st=&a->st;
+        if (!st->container_type) continue;
+        if (r->cq_name[0] && (!st->container_name_set || strcmp(st->container_name,r->cq_name))) continue;
+        float w=0,h=0;
+        if (st->width.set) w=px_of(&st->width, SCREEN_WIDTH);
+        else if (a->idx==0) w=(float)SCREEN_WIDTH;
+        if (st->height.set) h=px_of(&st->height, SCREEN_HEIGHT);
+        else if (a->idx==0) h=(float)SCREEN_HEIGHT;
+        if (r->cq_flags & 3) {
+            if (st->container_type<1 || (!st->width.set && a->idx!=0)) continue;
+            if (((r->cq_flags & 1) && w+0.01f<r->cq_min_w) || ((r->cq_flags & 2) && w-0.01f>r->cq_max_w)) return 0;
+        }
+        if (r->cq_flags & 12) {
+            if (st->container_type<2 || (!st->height.set && a->idx!=0)) continue;
+            if (((r->cq_flags & 4) && h+0.01f<r->cq_min_h) || ((r->cq_flags & 8) && h-0.01f>r->cq_max_h)) return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static void gather_rules(Doc* d, RIndex* ix, DOMNode* n, GV* g, int pseudo) {
     Rule** cand[64]; int ncand[64]; int nc = 0; char key[80];
-    if (n->id[0]) { snprintf(key, sizeof key, "#%s", n->id); HB* b = hb_get(ix, key, 0); if (b) { cand[nc] = b->v; ncand[nc++] = b->n; } }
+    if (n->id[0]) {
+        size_t id_len = strlen(n->id);
+        /* Selectors store ids exactly up to 47 bytes. Skip lookup for longer
+           element ids instead of hashing a truncated key. */
+        if (id_len < sizeof(((Simple*)0)->id) && id_len + 1 < sizeof key) {
+            key[0] = '#'; memcpy(key + 1, n->id, id_len + 1);
+            HB* b = hb_get(ix, key, 0); if (b) { cand[nc] = b->v; ncand[nc++] = b->n; }
+        }
+    }
     { const char* p = n->class_name; while (*p && nc < 60) {
         while (isspace((unsigned char)*p)) p++; const char* e = p; while (*e && !isspace((unsigned char)*e)) e++;
         if (e > p && e - p < 70) { key[0] = '.'; memcpy(key + 1, p, (size_t)(e - p)); key[1 + (e - p)] = 0; HB* b = hb_get(ix, key, 0); if (b) { cand[nc] = b->v; ncand[nc++] = b->n; } }
@@ -794,40 +1496,62 @@ static void gather_rules(Doc* d, RIndex* ix, DOMNode* n, GV* g, int pseudo) {
     for (int c = 0; c < nc; c++) for (int i = 0; i < ncand[c]; i++) {
         Rule* r = cand[c][i];
         if (r->pseudo != pseudo) continue;
+        if (!container_query_matches(d,n,r)) continue;
         if (match_at(d, n, r->sel, r->nsel - 1)) gv_push(g, r->decls, r->ndecls, mkkey(r->origin, r->spec, r->order));
     }
 }
 
 /* Применяет отсортированные группы деклараций к узлу n (custom-свойства, font-size, затем остальное; обычные, затем !important) */
 static void apply_groups(Doc* d, DOMNode* n, DOMNode* pa, GV* g, float root_fs, CP** cps, char* content_out, DOMNode* owner) {
-    Cx cx; cx.parent = pa; cx.pfs = pa ? pa->st.font_size : 16; cx.rem = root_fs; cx.em = cx.pfs; cx.cur = n->st.color;
+    Cx cx; memset(&cx, 0, sizeof cx); cx.parent = pa; cx.pfs = pa ? pa->st.font_size : 16; cx.rem = root_fs; cx.em = cx.pfs; cx.cur = n->st.color; cx.doc = d; cx.parent_lh = pa ? (pa->st.lh_px > 0 ? pa->st.lh_px : pa->st.lh_mult > 0 ? pa->st.lh_mult * pa->st.font_size : pa->st.font_size * 1.2f) : cx.pfs * 1.2f; cx.lh = cx.parent_lh;
     cx.content = content_out; cx.has_content = 0; cx.owner = owner;
     (void)d;
-    /* 1) пользовательские свойства --x (у ::before/::after свои --x не поддерживаются: берём цепочку владельца) */
-    if (!content_out) for (int imp = 0; imp < 2; imp++) for (int i = 0; i < g->n; i++) for (int k = 0; k < g->v[i].nd; k++) {
-        Decl* dc = &g->v[i].d[k]; if (dc->prop != P_CUSTOM || dc->imp != imp) continue;
-        CP* cp = malloc(sizeof(CP)); cp->name = dc->name; cp->val = dc->val; cp->next = *cps; *cps = cp;   /* name/val живут в арене — освободим после каскада */
+    /* 1) registered-property defaults (element cascade only), then authored --x values. */
+    if (!content_out) {
+        cp_seed_registered(d->rs,cps);
+        for (int imp = 0; imp < 2; imp++) for (int i = 0; i < g->n; i++) for (int k = 0; k < g->v[i].nd; k++) {
+            Decl* dc = &g->v[i].d[k]; if (dc->prop != P_CUSTOM || dc->imp != imp) continue;
+            const RegisteredProperty* rp=css_registered_property(d->rs,dc->name);
+            if (rp && !css_registered_value_valid(rp,dc->val)) continue;
+            CP* cp = malloc(sizeof(CP)); if(!cp) continue;
+            cp->name = dc->name; cp->val = dc->val; cp->next = *cps; *cps = cp;   /* name/val live in arena */
+        }
     }
-    /* 2) font-size, затем всё остальное; обычные, затем !important */
+    /* 2) font-size, then precompute line-height before resolving the lh unit in lengths. */
     char resolved[1024];
-    for (int pass = 0; pass < 2; pass++) for (int imp = 0; imp < 2; imp++) {
-        if (pass == 1 && imp == 0) { cx.em = n->st.font_size; }
-        for (int i = 0; i < g->n; i++) for (int k = 0; k < g->v[i].nd; k++) {
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            cx.em = n->st.font_size;
+            /* `lh` on font/line-height itself is relative to the parent's line box. */
+            cx.lh = cx.parent_lh;
+            for (int imp = 0; imp < 2; imp++) for (int i = 0; i < g->n; i++) for (int k = 0; k < g->v[i].nd; k++) {
+                Decl* dc = &g->v[i].d[k]; if (dc->imp != imp || (dc->prop != P_LINE_HEIGHT && dc->prop != P_FONT)) continue;
+                const char* v = dc->val;
+                if (strstr(v, "var(")) { if (!resolve_vars(*cps, v, resolved, sizeof resolved, 0)) continue; v = resolved; }
+                apply(&cx, n, &n->st, dc->prop, v, 0);
+            }
+            cx.lh = n->st.lh_px > 0 ? n->st.lh_px : n->st.lh_mult > 0 ? n->st.lh_mult * n->st.font_size : n->st.font_size * 1.2f;
+        }
+        for (int imp = 0; imp < 2; imp++) for (int i = 0; i < g->n; i++) for (int k = 0; k < g->v[i].nd; k++) {
             Decl* dc = &g->v[i].d[k]; if (dc->imp != imp || dc->prop == P_CUSTOM) continue;
             const char* v = dc->val;
             if (strstr(v, "var(")) { if (!resolve_vars(*cps, v, resolved, sizeof resolved, 0)) continue; v = resolved; }
-            if (pass == 0) cx.em = cx.pfs; else { cx.em = n->st.font_size; cx.cur = n->st.color; }
+            cx.em = pass == 0 ? cx.pfs : n->st.font_size;
+            if (pass == 0) cx.lh = cx.parent_lh; else cx.cur = n->st.color;
             apply(&cx, n, &n->st, dc->prop, v, pass == 0);
         }
     }
     if (content_out) { if (!cx.has_content) content_out[0] = 0; owner->aux = owner->aux; }
     /* пометка «content задан» передаётся через content_out[247]: 1 — есть */
-    if (content_out) content_out[247] = (char)(cx.has_content ? 1 : 0);
+    if (content_out) content_out[247] = (char)cx.has_content;
 }
 
 /* Пост-обработка вычисленного стиля (общая для элементов и псевдоэлементов) */
 static void finish_style(DOMNode* n, DOMNode* pa) {
     NodeStyle* st = &n->st;
+    /* -webkit-line-clamp is normally paired with display:-webkit-box; this engine's
+       legacy box value maps to flex, but clamping is performed by the inline formatter. */
+    if (st->line_clamp && st->display != DSP_NONE) { st->display = DSP_BLOCK; st->is_grid = 0; }
     if ((st->float_ != FLT_NONE || st->position >= POS_ABSOLUTE) && st->display != DSP_NONE) {
         if (st->display == DSP_INLINE || st->display == DSP_INLINE_BLOCK || st->display == DSP_CELL || st->display == DSP_ROW || st->display == DSP_ROW_GROUP) st->display = DSP_BLOCK;
         else if (st->display == DSP_INLINE_FLEX) st->display = DSP_FLEX;
@@ -838,7 +1562,12 @@ static void finish_style(DOMNode* n, DOMNode* pa) {
         if (st->border_c[i] == CUR_COLOR) st->border_c[i] = st->color;
     }
     if ((st->sh_color & 0xFF000000u) == 0x01000000u) st->sh_color = st->color;
-    if (st->bg_url[0] && strncmp(st->bg_url, "data:", 5) != 0 && strncmp(st->bg_url, "cache/data_", 11) != 0) { char ab[512]; webpage_resolve_url(g_base, st->bg_url, ab, sizeof ab); snprintf(st->bg_url, sizeof st->bg_url, "%s", ab); }
+    if (st->bg_url[0] && strncmp(st->bg_url, "data:", 5) != 0 && strncmp(st->bg_url, "cache/data_", 11) != 0) {
+        char ab[8192];
+        webpage_resolve_url(g_base, st->bg_url, ab, sizeof ab);
+        if (!ab[0] || strlen(ab) >= sizeof st->bg_url) st->bg_url[0] = 0;
+        else memcpy(st->bg_url, ab, strlen(ab) + 1);
+    }
     st->op_own = st->opacity; st->has_fx = (uint8_t)fx_style_has_fx(st);
     if (pa) { st->opacity *= pa->st.opacity; if (st->display == DSP_INLINE_BLOCK || st->float_ || st->position >= POS_ABSOLUTE) st->deco = st->deco & 0; if (pa->st.deco && st->display != DSP_INLINE_BLOCK && !st->float_ && st->position < POS_ABSOLUTE) st->deco |= pa->st.deco; }
 }
@@ -854,14 +1583,127 @@ static void cascade_pseudo(Doc* d, RIndex* ix, DOMNode* n, int which, float root
     CP* cps = d->cps[n->idx];
     apply_groups(d, tmp, n, &g, root_fs, &cps, pb->content, n);
     free(g.v);
-    int has = pb->content[247] == 1; pb->content[247] = 0;
+    int content_state = (int)(signed char)pb->content[247]; pb->content[247] = 0;
+    pb->content_state = (int8_t)content_state;
     NodeStyle* st = &tmp->st;
-    if (has && st->display != DSP_NONE) {
+    /* ::before/::after require generated content; ::marker also styles the UA marker
+       when `content` is normal or omitted. `content:none` suppresses it. */
+    if ((which == 3 ? 1 : content_state == 1) && st->display != DSP_NONE) {
         finish_style(tmp, n);
         pb->st = tmp->st; memcpy(pb->font_family, tmp->font_family, sizeof pb->font_family);
         n->pb[which - 1] = pb;
     } else free(pb);
     free(tmp);
+}
+
+static int vt_style_name_valid(const char* name) {
+    if (!name || !*name || strlen(name) >= sizeof(((VTStyleRecord*)0)->name) ||
+        !strcmp(name,"none") || !strcmp(name,"auto") || !strcmp(name,"initial") ||
+        !strcmp(name,"inherit") || !strcmp(name,"unset") || !strcmp(name,"revert") ||
+        !strcmp(name,"revert-layer")) return 0;
+    const unsigned char* p=(const unsigned char*)name;
+    if (!(isalpha(*p) || *p=='_' || *p=='-' || *p>=0x80)) return 0;
+    for (p++; *p; p++) if (!(isalnum(*p) || *p=='_' || *p=='-' || *p>=0x80)) return 0;
+    return 1;
+}
+
+static int vt_pseudo_parent_kind(int child) {
+    switch (child) {
+        case WEBPAGE_VT_PSEUDO_GROUP: return WEBPAGE_VT_PSEUDO_ROOT;
+        case WEBPAGE_VT_PSEUDO_IMAGE_PAIR: return WEBPAGE_VT_PSEUDO_GROUP;
+        case WEBPAGE_VT_PSEUDO_OLD: case WEBPAGE_VT_PSEUDO_NEW: return WEBPAGE_VT_PSEUDO_IMAGE_PAIR;
+        default: return WEBPAGE_VT_PSEUDO_NONE;
+    }
+}
+
+static int vt_simple_host_matches(Doc* d, DOMNode* root, const Simple* s) {
+    int constrained=s->tag[0] || s->id[0] || s->ncls || s->nat || s->npc || s->sub;
+    if (!constrained) return 1;
+    Simple host=*s; host.pseudo=WEBPAGE_VT_PSEUDO_NONE; host.pseudo_arg[0]=0;
+    return match_simple(d,root,&host);
+}
+
+static int vt_rule_matches(Doc* d, DOMNode* root, const Rule* r, int pseudo, const char* name) {
+    if (!r || !r->nsel || r->pseudo!=pseudo) return 0;
+    const Simple* last=&r->sel[r->nsel-1];
+    if (pseudo==WEBPAGE_VT_PSEUDO_ROOT) {
+        if (last->pseudo_arg[0]) return 0;
+    } else if (!name || strcmp(last->pseudo_arg,name)) return 0;
+    for (int i=r->nsel-1; i>0; i--) {
+        const Simple* child=&r->sel[i]; const Simple* parent=&r->sel[i-1];
+        if (child->pseudo < WEBPAGE_VT_PSEUDO_ROOT || child->pseudo > WEBPAGE_VT_PSEUDO_NEW ||
+            parent->pseudo < WEBPAGE_VT_PSEUDO_ROOT || parent->pseudo > WEBPAGE_VT_PSEUDO_NEW) return 0;
+        if (child->comb!='>' || vt_pseudo_parent_kind(child->pseudo)!=parent->pseudo) return 0;
+        if (child->pseudo!=WEBPAGE_VT_PSEUDO_GROUP && strcmp(child->pseudo_arg,parent->pseudo_arg)) return 0;
+        if (child->pseudo==WEBPAGE_VT_PSEUDO_GROUP && parent->pseudo!=WEBPAGE_VT_PSEUDO_ROOT &&
+            strcmp(child->pseudo_arg,parent->pseudo_arg)) return 0;
+        if (parent->pseudo==WEBPAGE_VT_PSEUDO_ROOT && !vt_simple_host_matches(d,root,parent)) return 0;
+    }
+    const Simple* first=&r->sel[0];
+    if (first->pseudo==WEBPAGE_VT_PSEUDO_ROOT) return vt_simple_host_matches(d,root,first);
+    /* A selector may start at any named pseudo-element; its ancestors are
+       implicit in the transition tree unless the author explicitly chains them. */
+    if (r->nsel==1) return vt_simple_host_matches(d,root,first);
+    return 1;
+}
+
+static void vt_compute_pseudo_style(Doc* d, RuleSet* rs, DOMNode* root,
+                                    const NodeStyle* inherited, int pseudo,
+                                    const char* name, float root_fs, NodeStyle* out) {
+    GV g={0};
+    for (int i=0; i<rs->n; i++) {
+        Rule* r=rs->v[i];
+        if (r->pseudo != pseudo || !r->nsel) continue;
+        /* Match against the generated View Transition pseudo tree rather than
+           treating pseudo-elements as actual DOM ancestors. */
+        if (vt_rule_matches(d,root,r,pseudo,name))
+            gv_push(&g,r->decls,r->ndecls,mkkey(r->origin,r->spec,r->order));
+    }
+    if (g.n>1) qsort(g.v,(size_t)g.n,sizeof(Grp),grp_cmp);
+    DOMNode parent_fake=*root, tmp; memset(&tmp,0,sizeof tmp);
+    parent_fake.st=*inherited; tmp.idx=root->idx;
+    init_style(&tmp,&parent_fake);
+    CP* cp=d->cps[root->idx]; CP* base_cp=cp;
+    apply_groups(d,&tmp,&parent_fake,&g,root_fs,&cp,NULL,root);
+    finish_style(&tmp,&parent_fake);
+    *out=tmp.st;
+    while (cp && cp!=base_cp) { CP* next=cp->next; free(cp); cp=next; }
+    free(g.v);
+}
+
+static void vt_add_style_name(const char* name) {
+    if (!vt_style_name_valid(name)) return;
+    for (int i=0;i<g_vt_style_count;i++) if (!strcmp(g_vt_style_records[i].name,name)) return;
+    if (g_vt_style_count>=VT_STYLE_MAX_NAMES) return;
+    snprintf(g_vt_style_records[g_vt_style_count++].name,sizeof g_vt_style_records[0].name,"%s",name);
+}
+
+static void vt_compute_styles(Doc* d, RuleSet* rs, float root_fs) {
+    vt_free_all_anim_lists();
+    memset(&g_vt_root_style,0,sizeof g_vt_root_style);
+    memset(g_vt_style_records,0,sizeof g_vt_style_records);
+    g_vt_style_count=0;
+    if (!d || d->n<=0 || !d->nv[0]) return;
+    DOMNode* root=d->nv[0];
+    vt_compute_pseudo_style(d,rs,root,&root->st,WEBPAGE_VT_PSEUDO_ROOT,"",root_fs,&g_vt_root_style);
+    vt_prepare_anim_list(d,rs,root,root_fs,&g_vt_root_style,&g_vt_root_anim);
+    for (DOMNode* n=root; n; n=n->next) vt_add_style_name(n->st.view_transition_name);
+    for (int i=0;i<rs->n;i++) {
+        Rule* r=rs->v[i];
+        if (r->pseudo>=WEBPAGE_VT_PSEUDO_GROUP && r->pseudo<=WEBPAGE_VT_PSEUDO_NEW && r->nsel)
+            vt_add_style_name(r->sel[r->nsel-1].pseudo_arg);
+    }
+    for (int i=0;i<g_vt_style_count;i++) {
+        VTStyleRecord* rec=&g_vt_style_records[i];
+        vt_compute_pseudo_style(d,rs,root,&g_vt_root_style,WEBPAGE_VT_PSEUDO_GROUP,rec->name,root_fs,&rec->group);
+        vt_prepare_anim_list(d,rs,root,root_fs,&rec->group,&rec->group_anim);
+        vt_compute_pseudo_style(d,rs,root,&rec->group,WEBPAGE_VT_PSEUDO_IMAGE_PAIR,rec->name,root_fs,&rec->image_pair);
+        vt_prepare_anim_list(d,rs,root,root_fs,&rec->image_pair,&rec->image_pair_anim);
+        vt_compute_pseudo_style(d,rs,root,&rec->image_pair,WEBPAGE_VT_PSEUDO_OLD,rec->name,root_fs,&rec->old_image);
+        vt_prepare_anim_list(d,rs,root,root_fs,&rec->old_image,&rec->old_anim);
+        vt_compute_pseudo_style(d,rs,root,&rec->image_pair,WEBPAGE_VT_PSEUDO_NEW,rec->name,root_fs,&rec->new_image);
+        vt_prepare_anim_list(d,rs,root,root_fs,&rec->new_image,&rec->new_anim);
+    }
 }
 
 static int pseudo_capable(const DOMNode* n) {
@@ -887,10 +1729,15 @@ static void cascade_node(Doc* d, RIndex* ix, RuleSet* rs, DOMNode* n, float root
     free(g.v); afree(&tmp);
 
     NodeStyle* st = &n->st;
+    if (st->unicode_bidi == 3 || st->unicode_bidi == 4)
+        st->bidi_context = st->direction ? 2 : 1; /* propagate the inline override context to descendant text nodes */
+    else if (st->unicode_bidi == 5)
+        st->bidi_context = 3; /* plaintext: first-strong paragraph direction */
     if (n->idx == 0) st->display = DSP_BLOCK;
     if (st->display == DSP_NONE) return;
     finish_style(n, pa);
     if (ix->has_pseudo && pseudo_capable(n)) { cascade_pseudo(d, ix, n, 1, root_fs); cascade_pseudo(d, ix, n, 2, root_fs); }
+    if (ix->has_marker && st->display == DSP_LIST_ITEM && pseudo_capable(n)) cascade_pseudo(d, ix, n, 3, root_fs);
 }
 
 static int g_style_offline = 0;
@@ -904,14 +1751,14 @@ void style_apply(DOMNode* head, SheetList* sheets, const char* base_url) {
         if (!css_media_matches(s->media)) continue;
         if (!s->css && s->href && nsheet < 10 && css_fetch_budget > 0 && !strncmp(s->href, "http", 4) && !webpage_mixed_blocked(s->href)) {      /* скачиваем и сохраняем текст в бандле */
             css_fetch_budget--; nsheet++;
-            s->css = nal_http_get(s->href);
+            s->css = nal_http_get_kind(s->href, NAL_RESOURCE_STYLE);
         }
         if (s->css) css_parse_sheet(&A, &rs, s->css, s->href ? s->href : base_url, 2, 0);
     }
     index_rules(&ix, &rs); g_uses_dyn = css_dyn_seen;
 
     int n = 0; for (DOMNode* p = head; p; p = p->next) n++;
-    Doc d; d.n = n; d.nv = malloc((size_t)n * sizeof(DOMNode*)); d.prev = malloc((size_t)n * sizeof(int));
+    Doc d; memset(&d,0,sizeof d); d.rs = &rs; d.n = n; d.nv = malloc((size_t)n * sizeof(DOMNode*)); d.prev = malloc((size_t)n * sizeof(int));
     d.eidx = calloc((size_t)n, sizeof(int)); d.ecnt = calloc((size_t)n, sizeof(int)); d.cps = calloc((size_t)n, sizeof(CP*));
     int* lastel = malloc((size_t)n * sizeof(int));
     { int i = 0; for (DOMNode* p = head; p; p = p->next) d.nv[i++] = p; }
@@ -936,6 +1783,7 @@ void style_apply(DOMNode* head, SheetList* sheets, const char* base_url) {
         i++;
     }
     anim_cascade_end(d.nv, n, rs.kf, root_fs, kf_build, &d);
+    vt_compute_styles(&d,&rs,root_fs);
     /* освобождаем CP-цепочки (узлы, аллоцированные malloc) */
     for (int i = 0; i < n; i++) {
         CP* c = d.cps[i]; DOMNode* pa = d.nv[i]->parent >= 0 ? d.nv[d.nv[i]->parent] : NULL; CP* stop = pa ? d.cps[pa->idx] : NULL;

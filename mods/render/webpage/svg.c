@@ -234,8 +234,15 @@ static int parse_color(const char* s, uint32_t* out, uint32_t cur, char* urlbuf,
     if (!strncasecmp(s, "inherit", 7)) return 4;
     if (!strncasecmp(s, "transparent", 11)) { *out = 0; return 1; }
     if (!strncasecmp(s, "url(", 4)) {
-        const char* p = s + 4; while (isspace((unsigned char)*p)) p++; if (*p == '\'' || *p == '"') p++;
-        if (*p == '#') p++; size_t k = 0; while (*p && *p != ')' && *p != '\'' && *p != '"' && k + 1 < ucap) urlbuf[k++] = *p++; urlbuf[k] = 0;
+        const char* p = s + 4;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == '\'' || *p == '"') p++;
+        if (*p == '#') p++;
+        const char* start = p;
+        while (*p && *p != ')' && *p != '\'' && *p != '"' && !isspace((unsigned char)*p)) p++;
+        size_t url_len = (size_t)(p - start);
+        if (!urlbuf || !ucap || url_len >= ucap) { if (urlbuf && ucap) urlbuf[0] = 0; return 4; }
+        memcpy(urlbuf, start, url_len); urlbuf[url_len] = 0;
         return 3;
     }
     if (*s == '#') {
@@ -302,14 +309,28 @@ static void rules_parse(Rules* rs, Arena* ar, const char* css) {
             if (!*part || strpbrk(part, " >+~[:")) continue;                  /* составные/псевдо-селекторы не поддерживаем */
             if (rs->n == rs->cap) { int nc = rs->cap ? rs->cap * 2 : 32; Rule* nv = realloc(rs->r, (size_t)nc * sizeof(Rule)); if (!nv) return; rs->r = nv; rs->cap = nc; }
             Rule* r = &rs->r[rs->n++]; memset(r, 0, sizeof *r); r->order = order++; r->decls = body; r->dlen = bl;
-            const char* p = part;
-            if (*p != '.' && *p != '#' && *p != '*') { size_t k = 0; while (*p && *p != '.' && *p != '#' && k < sizeof r->tag - 1) r->tag[k++] = (char)tolower((unsigned char)*p++); r->spec += 1; }
-            else if (*p == '*') p++;
-            while (*p) {
-                if (*p == '.' && r->ncls < 4) { p++; size_t k = 0; while (*p && *p != '.' && *p != '#' && k < 47) r->cls[r->ncls][k++] = *p++; r->ncls++; r->spec += 10; }
-                else if (*p == '#') { p++; size_t k = 0; while (*p && *p != '.' && *p != '#' && k < 47) r->id[k++] = *p++; r->spec += 100; }
-                else p++;
+            const char* p = part; int valid = 1;
+            if (*p != '.' && *p != '#' && *p != '*') {
+                const char* tag = p; while (*p && *p != '.' && *p != '#') p++;
+                size_t len = (size_t)(p - tag);
+                if (!len || len >= sizeof r->tag) valid = 0;
+                else { for (size_t j = 0; j < len; j++) r->tag[j] = (char)tolower((unsigned char)tag[j]); r->tag[len] = 0; r->spec += 1; }
+            } else if (*p == '*') p++;
+            while (*p && valid) {
+                if (*p == '.') {
+                    p++; const char* cls = p; while (*p && *p != '.' && *p != '#') p++;
+                    size_t len = (size_t)(p - cls);
+                    if (!len || len >= sizeof r->cls[0] || r->ncls >= 4) { valid = 0; break; }
+                    memcpy(r->cls[r->ncls], cls, len); r->cls[r->ncls][len] = 0; r->ncls++; r->spec += 10;
+                } else if (*p == '#') {
+                    if (r->id[0]) { valid = 0; break; }
+                    p++; const char* id = p; while (*p && *p != '.' && *p != '#') p++;
+                    size_t len = (size_t)(p - id);
+                    if (!len || len >= sizeof r->id) { valid = 0; break; }
+                    memcpy(r->id, id, len); r->id[len] = 0; r->spec += 100;
+                } else { valid = 0; break; }
             }
+            if (!valid) rs->n--; /* an unrepresentable selector must not degrade to a weaker one */
         }
     }
 }
@@ -355,13 +376,22 @@ static void style_decl(Style* s, const char* name, const char* val) {
     else if (!strcmp(name, "visibility")) s->hidden = !strncmp(val, "hidden", 6) || !strncmp(val, "collapse", 8);
     else if (!strcmp(name, "filter") || !strcmp(name, "clip-path") || !strcmp(name, "mask")) {
         char id[64] = {0}; const char* p = strstr(val, "url(");
-        if (p) { p += 4; while (isspace((unsigned char)*p) || *p == '\'' || *p == '\"') p++; if (*p == '#') p++; size_t z = 0; while (*p && *p != ')' && *p != '\'' && *p != '\"' && !isspace((unsigned char)*p) && z + 1 < sizeof id) id[z++] = *p++; }
-        if (!strcmp(name, "filter")) snprintf(s->filter_url, sizeof s->filter_url, "%s", id);
-        else if (!strcmp(name, "clip-path")) snprintf(s->clip_url, sizeof s->clip_url, "%s", id);
-        else snprintf(s->mask_url, sizeof s->mask_url, "%s", id);
+        if (p) {
+            p += 4;
+            while (isspace((unsigned char)*p) || *p == '\'' || *p == '\"') p++;
+            if (*p == '#') p++;
+            const char* start = p;
+            while (*p && *p != ')' && *p != '\'' && *p != '\"' && !isspace((unsigned char)*p)) p++;
+            size_t len = (size_t)(p - start);
+            if (len < sizeof id) { memcpy(id, start, len); id[len] = 0; }
+            /* Overlong fragment identifiers are ignored rather than aliased. */
+        }
+        if (!strcmp(name, "filter")) memcpy(s->filter_url, id, strlen(id) + 1);
+        else if (!strcmp(name, "clip-path")) memcpy(s->clip_url, id, strlen(id) + 1);
+        else memcpy(s->mask_url, id, strlen(id) + 1);
     }
     else if (!strcmp(name, "font-size")) { float v = parse_len(val, s->font_size, -1); if (v > 0 && v <= 4096) s->font_size = v; }
-    else if (!strcmp(name, "font-family")) { while (isspace((unsigned char)*val)) val++; size_t n = strlen(val); while (n && isspace((unsigned char)val[n-1])) n--; if (n >= 2 && ((val[0] == '\'' && val[n-1] == '\'') || (val[0] == '\"' && val[n-1] == '\"'))) { val++; n -= 2; } if (n >= sizeof s->font_family) n = sizeof s->font_family - 1; memcpy(s->font_family, val, n); s->font_family[n] = 0; }
+    else if (!strcmp(name, "font-family")) { while (isspace((unsigned char)*val)) val++; size_t n = strlen(val); while (n && isspace((unsigned char)val[n-1])) n--; if (n >= 2 && ((val[0] == '\'' && val[n-1] == '\'') || (val[0] == '\"' && val[n-1] == '\"'))) { val++; n -= 2; } if (n >= sizeof s->font_family) return; memcpy(s->font_family, val, n); s->font_family[n] = 0; }
     else if (!strcmp(name, "font-weight")) { if (!strncmp(val, "bold", 4)) s->font_weight = 700; else if (!strncmp(val, "normal", 6)) s->font_weight = 400; else { int v = atoi(val); if (v >= 100 && v <= 900) s->font_weight = v; } }
     else if (!strcmp(name, "font-style")) s->font_italic = !strncmp(val, "italic", 6) || !strncmp(val, "oblique", 7);
     else if (!strcmp(name, "text-anchor")) s->text_anchor = !strncmp(val, "middle", 6) ? 1 : !strncmp(val, "end", 3) ? 2 : 0;
@@ -387,7 +417,7 @@ static const char* PRES_ATTRS[] = {"fill", "stroke", "fill-opacity", "stroke-opa
 /* Спрайты: <use href="#id"> может ссылаться на <symbol> из ДРУГОГО встроенного svg страницы. html.c сохраняет такие svg
    в cache/sprite_<хэш origin>_<хэш>.svg, а в svg, использующие <use>, добавляет комментарий <!--mlsprite:<хэш origin>-->.
    Распарсенные спрайты держим в памяти (парсинг сотен символов на каждую иконку был бы слишком дорог). */
-typedef struct { Doc* docs[8]; int n; char key[32]; char sig[512]; } ExtSet;
+typedef struct { Doc* docs[8]; int n; char key[32]; char sig[1025]; } ExtSet;
 static ExtSet g_ext;
 typedef struct { Doc* doc; Rules rules; uint32_t cur; float vw, vh; ExtSet* ext; SNode* bypass_effect_node; int clip_mode, text_active; float text_x, text_y; } Ctx;
 static SNode* ctx_by_id(Ctx* cx, const char* id) {
@@ -1176,18 +1206,43 @@ static void ext_load(Ctx* cx, const char* src, size_t len) {
     const char* m = NULL; size_t lim = len < 256 ? len : 256;
     for (size_t i = 0; i + 13 < lim; i++) if (!memcmp(src + i, "<!--mlsprite:", 13)) { m = src + i + 13; break; }
     if (!m) return;
-    char key[32]; size_t k = 0; while (m < src + len && *m != '-' && k < 31) key[k++] = *m++; key[k] = 0; if (!k) return;
+    char key[32]; size_t k = 0;
+    while (m < src + len && *m != '-' && k < sizeof key - 1) {
+        unsigned char ch = (unsigned char)*m;
+        if (!(isalnum(ch) || ch == '_')) return;
+        key[k++] = *m++;
+    }
+    key[k] = 0;
+    if (!k || m >= src + len || *m != '-') return;
     char prefix[48]; snprintf(prefix, sizeof prefix, "sprite_%s_", key);
     DIR* d = opendir("cache"); if (!d) return;
     char names[16][64]; int nn = 0; struct dirent* de;
-    while ((de = readdir(d)) && nn < 16) if (!strncmp(de->d_name, prefix, strlen(prefix)) && strlen(de->d_name) < 63) snprintf(names[nn++], 64, "%s", de->d_name);
+    while ((de = readdir(d)) && nn < 16) {
+        size_t name_len = strlen(de->d_name);
+        if (!strncmp(de->d_name, prefix, strlen(prefix)) && name_len < sizeof names[0]) {
+            memcpy(names[nn], de->d_name, name_len + 1); nn++;
+        }
+    }
     closedir(d);
-    char sig[512]; sig[0] = 0; for (int i = 0; i < nn; i++) { strncat(sig, names[i], sizeof sig - strlen(sig) - 2); strcat(sig, ";"); }
+    /* 16 names of at most 62 bytes plus separators fit into 1025 bytes.
+       Check each append nevertheless; never subtract from a capacity unsignedly. */
+    char sig[1025]; size_t sig_used = 0; sig[0] = 0;
+    for (int i = 0; i < nn; i++) {
+        size_t name_len = strlen(names[i]);
+        if (sig_used > sizeof sig - 2 || name_len > sizeof sig - sig_used - 2) { cx->ext = NULL; return; }
+        memcpy(sig + sig_used, names[i], name_len); sig_used += name_len;
+        sig[sig_used++] = ';'; sig[sig_used] = 0;
+    }
     if (!strcmp(g_ext.key, key) && !strcmp(g_ext.sig, sig)) { cx->ext = &g_ext; return; }       /* уже загружены */
     for (int i = 0; i < g_ext.n; i++) { Doc* old = g_ext.docs[i]; doc_free(old); free(old); } g_ext.n = 0;
     snprintf(g_ext.key, sizeof g_ext.key, "%s", key); snprintf(g_ext.sig, sizeof g_ext.sig, "%s", sig);
     for (int i = 0; i < nn && g_ext.n < 8; i++) {
-        char path[160]; snprintf(path, sizeof path, "cache/%s", names[i]); FILE* f = fopen(path, "rb"); if (!f) continue;
+        char path[sizeof("cache/") - 1 + sizeof names[i]];
+        size_t name_len = strlen(names[i]);
+        if (name_len >= sizeof names[i] || name_len + sizeof("cache/") > sizeof path) continue;
+        memcpy(path, "cache/", sizeof("cache/") - 1);
+        memcpy(path + sizeof("cache/") - 1, names[i], name_len + 1);
+        FILE* f = fopen(path, "rb"); if (!f) continue;
         fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
         if (sz > 0 && sz < 4 * 1024 * 1024) {
             char* buf = malloc((size_t)sz + 1);

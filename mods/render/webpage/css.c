@@ -11,6 +11,7 @@
 #include <strings.h>
 
 int css_fetch_budget = 0;
+static int g_allow_pseudo = 0;                    /* enabled for stylesheet rules and selector() */
 
 /* ══════════════ арена ══════════════ */
 void* aalloc(Arena* a, size_t n) {
@@ -38,6 +39,7 @@ static const char* PNAMES[] = { "",
 #undef X
 };
 int css_prop_id(const char* name, size_t n) {
+    if (n == strlen("-webkit-line-clamp") && !strncasecmp(name, "-webkit-line-clamp", n)) return P_WEBKIT_LINE_CLAMP;
     if (n >= 2 && name[0] == '-' && name[1] == '-') return P_CUSTOM;
     if (n > 8 && name[0] == '-') {                         /* -webkit-/-moz-/-ms-/-o- */
         const char* d = memchr(name + 1, '-', n - 1);
@@ -48,6 +50,314 @@ int css_prop_id(const char* name, size_t n) {
     if (n == 15 && strncasecmp(name, "grid-column-gap", 15) == 0) return P_COL_GAP;
     if (n == 8 && strncasecmp(name, "grid-gap", 8) == 0) return P_GAP;
     return P_NONE;
+}
+
+const RegisteredProperty* css_registered_property(const RuleSet* rs, const char* name) {
+    if (!rs || !name) return NULL;
+    for (const RegisteredProperty* r=rs->properties; r; r=r->next)
+        if (!strcmp(r->name,name)) return r;
+    return NULL;
+}
+
+static int registered_atom_valid(const char* syntax, const char* value) {
+    char v[256]; size_t n=strlen(value);
+    while (*value && isspace((unsigned char)*value)) value++;
+    n=strlen(value); while(n && isspace((unsigned char)value[n-1])) n--;
+    if (!n || n>=sizeof v) return 0;
+    memcpy(v,value,n); v[n]=0;
+    if (!strcmp(syntax,"*")) return 1;
+    if (!strcmp(syntax,"<color>")) { uint32_t c; return css_parse_color(v,&c,0xFF000000u); }
+    if (!strcmp(syntax,"<length>") || !strcmp(syntax,"<length-percentage>") || !strcmp(syntax,"<percentage>")) {
+        Len l={0}; if (!css_parse_len(v,&l,16,16)) return 0;
+        if (!strcmp(syntax,"<percentage>")) return strchr(v,'%')!=NULL;
+        if (!strcmp(syntax,"<length>")) return l.pct==0 && !strchr(v,'%');
+        return 1;
+    }
+    if (!strcmp(syntax,"<number>")) {
+        char* e=NULL; double x=strtod(v,&e); return e!=v && *e==0 && isfinite(x);
+    }
+    if (!strcmp(syntax,"<integer>")) {
+        char* e=NULL; (void)strtol(v,&e,10); return e!=v && *e==0;
+    }
+    if (!strcmp(syntax,"<angle>")) {
+        char* e=NULL; double x=strtod(v,&e); if(e==v || !isfinite(x))return 0;
+        return !strcasecmp(e,"deg") || !strcasecmp(e,"rad") || !strcasecmp(e,"grad") || !strcasecmp(e,"turn");
+    }
+    if (!strcmp(syntax,"<time>")) {
+        char* e=NULL; double x=strtod(v,&e); if(e==v || !isfinite(x))return 0;
+        return !strcasecmp(e,"s") || !strcasecmp(e,"ms");
+    }
+    if (!strcmp(syntax,"<custom-ident>")) {
+        if (!strcasecmp(v,"initial")||!strcasecmp(v,"inherit")||!strcasecmp(v,"unset")||!strcasecmp(v,"revert")||!strcasecmp(v,"default")) return 0;
+        if (!(isalpha((unsigned char)v[0]) || v[0]=='_' || (unsigned char)v[0]>=0x80)) return 0;
+        for (const unsigned char* p=(const unsigned char*)v+1; *p; p++)
+            if (!(isalnum(*p)||*p=='_'||*p=='-'||*p>=0x80)) return 0;
+        return 1;
+    }
+    if (!strcmp(syntax,"<string>")) return (v[0]=='\'' || v[0]=='"') && n>=2 && v[n-1]==v[0];
+    return 0;
+}
+
+int css_registered_value_valid(const RegisteredProperty* registration, const char* value) {
+    if (!registration || !value) return 0;
+    /* Computed values containing var() are validated after substitution by the consuming property. */
+    if (strstr(value,"var(")) return 1;
+    const char* syntax=registration->syntax;
+    if (!strcmp(syntax,"*")) return 1;
+    /* Support syntax alternatives (for example <length> | <percentage>) and
+       the single-token repetition multipliers '+' / '#'. */
+    const char* p=syntax;
+    while (*p) {
+        const char* sep=strchr(p,'|'); const char* e=sep?sep:p+strlen(p);
+        while(p<e&&isspace((unsigned char)*p))p++;
+        while(e>p&&isspace((unsigned char)e[-1]))e--;
+        char atom[96]; size_t an=(size_t)(e-p); int list=0;
+        if(an&& (p[an-1]=='+'||p[an-1]=='#')) { list= p[an-1]=='#' ? 2 : 1; an--; }
+        if(an>0&&an<sizeof atom) {
+            memcpy(atom,p,an); atom[an]=0;
+            if (!list && registered_atom_valid(atom,value)) return 1;
+            if (list) {
+                char tmp[512]; size_t vl=strlen(value);
+                if(vl<sizeof tmp) {
+                    memcpy(tmp,value,vl+1); int ok=1, count=0; char* q=tmp;
+                    while(*q) {
+                        while(isspace((unsigned char)*q) || (list==2&&*q==',')) q++;
+                        if(!*q)break;
+                        char* start=q; while(*q && !isspace((unsigned char)*q) && (list!=2||*q!=',')) q++;
+                        char hold=*q; *q=0; if(!registered_atom_valid(atom,start))ok=0; *q=hold; count++;
+                        if(*q)q++;
+                    }
+                    if(ok&&count>0)return 1;
+                }
+            }
+        }
+        p=sep?sep+1:e;
+    }
+    return 0;
+}
+
+static int css_valid_property_name(const char* s) {
+    if (!s || s[0]!='-' || s[1]!='-' || !s[2]) return 0;
+    for (const unsigned char* p=(const unsigned char*)s+2; *p; p++)
+        if (!(isalnum(*p)||*p=='_'||*p=='-'||*p>=0x80)) return 0;
+    return 1;
+}
+
+static void css_parse_property_rule(Arena* a, RuleSet* rs, const char* prelude, const char* body, size_t len) {
+    if (!a || !rs || !prelude) return;
+    while(isspace((unsigned char)*prelude))prelude++;
+    const char* ne=prelude; while(*ne&&!isspace((unsigned char)*ne))ne++;
+    char name[64]; size_t nn=(size_t)(ne-prelude);
+    if(!nn||nn>=sizeof name)return;
+    memcpy(name,prelude,nn); name[nn]=0;
+    while(isspace((unsigned char)*ne))ne++;
+    if(*ne || !css_valid_property_name(name))return;
+    char syntax[96]="", inherits[16]="", initial[256]=""; int has_syntax=0,has_inherits=0,has_initial=0;
+    const char* p=body; const char* end=body+len;
+    while(p<end) {
+        while(p<end&&(isspace((unsigned char)*p)||*p==';'))p++;
+        if(p>=end)break;
+        const char* ns=p; while(p<end&&(isalnum((unsigned char)*p)||*p=='-'))p++;
+        size_t nl=(size_t)(p-ns); while(p<end&&isspace((unsigned char)*p))p++;
+        if(p>=end||*p!=':') { while(p<end&&*p!=';')p++; continue; }
+        p++; while(p<end&&isspace((unsigned char)*p))p++;
+        const char* vs=p; char quote=0; int depth=0;
+        while(p<end) { char c=*p; if(quote){if(c==quote && (p==vs || p[-1]!='\\'))quote=0;} else if(c=='\''||c=='"')quote=c; else if(c=='(')depth++; else if(c==')'&&depth)depth--; else if(c==';'&&depth==0)break; p++; }
+        const char* ve=p; while(ve>vs&&isspace((unsigned char)ve[-1]))ve--; if(p<end&&*p==';')p++;
+        size_t vl=(size_t)(ve-vs);
+        if(nl==6&&!strncasecmp(ns,"syntax",6)&&vl>=2&&vl<sizeof syntax&&(vs[0]=='\''||vs[0]=='"')&&ve[-1]==vs[0]) { memcpy(syntax,vs+1,vl-2);syntax[vl-2]=0;has_syntax=1; }
+        else if(nl==8&&!strncasecmp(ns,"inherits",8)&&vl<sizeof inherits) { memcpy(inherits,vs,vl);inherits[vl]=0;has_inherits=1; }
+        else if(nl==13&&!strncasecmp(ns,"initial-value",13)&&vl<sizeof initial) { memcpy(initial,vs,vl);initial[vl]=0;has_initial=1; }
+    }
+    if(!has_syntax||!has_inherits||(strcasecmp(inherits,"true")&&strcasecmp(inherits,"false")))return;
+    if(strcmp(syntax,"*")!=0) {
+        RegisteredProperty check={0}; snprintf(check.syntax,sizeof check.syntax,"%s",syntax);
+        if(!has_initial || !initial[0] || strstr(initial,"var(") || !css_registered_value_valid(&check,initial))return;
+    }
+    RegisteredProperty* r=aalloc(a,sizeof *r); if(!r)return;
+    memcpy(r->name,name,nn+1); snprintf(r->syntax,sizeof r->syntax,"%s",syntax);
+    r->initial_value=has_initial?astrdup(a,initial,strlen(initial)):NULL;
+    r->inherits=!strcasecmp(inherits,"true");
+    r->next=rs->properties; rs->properties=r;
+}
+
+/* CSS Conditional Rules: conservative @supports evaluator. Unsupported declarations
+ * are false instead of the old behavior that treated nearly every condition as true. */
+static void css_trim_span(const char **s, size_t *n) {
+    while (*n && isspace((unsigned char)**s)) { (*s)++; (*n)--; }
+    while (*n && isspace((unsigned char)(*s)[*n - 1])) (*n)--;
+}
+static int css_outer_parens(const char *s, size_t n) {
+    if (n < 2 || s[0] != '(' || s[n-1] != ')') return 0;
+    int d = 0; char quote = 0; int esc = 0;
+    for (size_t i=0; i<n; i++) {
+        char c=s[i];
+        if (quote) { if (esc) esc=0; else if (c=='\\') esc=1; else if (c==quote) quote=0; continue; }
+        if (c=='\'' || c=='"') { quote=c; continue; }
+        if (c=='(') d++;
+        else if (c==')') { if (--d < 0) return 0; if (d==0 && i != n-1) return 0; }
+    }
+    return d==0 && !quote;
+}
+static int css_supported_value(int prop, const char *v) {
+    while (isspace((unsigned char)*v)) v++;
+    size_t n=strlen(v); while(n && isspace((unsigned char)v[n-1])) n--;
+    if (!n) return 0;
+    char val[256]; if (n>=sizeof val) return 0; memcpy(val,v,n); val[n]=0;
+    if (!strcasecmp(val,"inherit") || !strcasecmp(val,"initial") || !strcasecmp(val,"unset") || !strcasecmp(val,"revert")) return 1;
+    switch (prop) {
+      case P_GRID_COLS:
+        if (strcasestr(val, "masonry")) return 0;
+        if (strcasestr(val, "subgrid")) return 1; /* direct nested column tracks are inherited */
+        return 1;
+      case P_GRID_ROWS:
+        if (strcasestr(val, "masonry")) return 0;
+        if (strcasestr(val, "subgrid")) return !strcasestr(val, "repeat(");
+        return 1;
+      case P_GRID_TEMPLATE: {
+        if (strcasestr(val, "masonry")) return 0;
+        const char* slash=strchr(val,'/');
+        if (strcasestr(val,"subgrid")) {
+            if (!slash) return 0;
+            size_t row_n=(size_t)(slash-val); while(row_n && isspace((unsigned char)val[row_n-1]))row_n--;
+            const char* row=val; while(*row && isspace((unsigned char)*row))row++;
+            int rows_subgrid = row_n >= (size_t)(row-val)+7 && !strncasecmp(row,"subgrid",7);
+            int cols_subgrid = strcasestr(slash+1,"subgrid")!=NULL;
+            return rows_subgrid || cols_subgrid;
+        }
+        return 1;
+      }
+      case P_COLUMN_COUNT: {
+        if (!strcasecmp(val,"auto")) return 1;
+        char* e=NULL; long x=strtol(val,&e,10); while(e && isspace((unsigned char)*e))e++;
+        return e && e!=val && !*e && x>0 && x<=32;
+      }
+      case P_COLUMN_WIDTH: {
+        if (!strcasecmp(val,"auto")) return 1; Len l; return css_parse_len(val,&l,16,16) && l.set && (l.px+l.pct+l.vw+l.vh)>0;
+      }
+      case P_COLUMNS:
+        return !strcasestr(val,"subgrid") && !strcasestr(val,"masonry");
+      case P_TEXT_ORIENTATION:
+        return !strcasecmp(val,"upright"); /* mixed requires sideways Latin glyph orientation */
+      case P_TEXT_COMBINE_UPRIGHT:
+        return !strcasecmp(val,"none") || !strncasecmp(val,"digits",6); /* only ASCII digit runs are combined by layout */
+      case P_ANIMATION_TIMELINE:
+        return !strcasecmp(val,"auto") || !strcasecmp(val,"none") || strcasestr(val,"scroll(") || strcasestr(val,"view(");
+      case P_ANIMATION_COMPOSITION:
+        return !strcasecmp(val,"replace") || !strcasecmp(val,"add") || !strcasecmp(val,"accumulate");
+      case P_ANIMATION_RANGE: {
+        if (!strcasecmp(val,"normal")) return 1;
+        char* e=NULL; (void)strtof(val,&e); return e && e!=val && (strchr(val,'%') || !*e || isspace((unsigned char)*e));
+      }
+      case P_ANCHOR_NAME: case P_POSITION_ANCHOR:
+        return !strcasecmp(val,"none") || (val[0]=='-' && val[1]=='-');
+      case P_POSITION_AREA:
+        return strcasestr(val,"top") || strcasestr(val,"bottom") || strcasestr(val,"left") || strcasestr(val,"right") || strcasestr(val,"center");
+      case P_VIEW_TRANSITION_NAME: {
+        if (!strcasecmp(val, "none")) return 1;
+        if (!*val || !strcasecmp(val, "auto") || !strcasecmp(val, "match-element")) return 0;
+        for (const unsigned char* p = (const unsigned char*)val; *p; p++) {
+            if (isspace(*p) || strchr(",()\'\"", *p)) return 0;
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_' || *p == '-' || *p >= 0x80 || (*p >= '0' && *p <= '9' && p != (const unsigned char*)val))) return 0;
+        }
+        return 1; /* named viewport snapshots/shared-element movement are implemented as a bounded subset */
+      }
+      case P_DISPLAY:
+        return !strcasecmp(val,"none") || !strcasecmp(val,"inline") || !strcasecmp(val,"block") ||
+          !strcasecmp(val,"inline-block") || !strcasecmp(val,"flex") || !strcasecmp(val,"inline-flex") ||
+          !strcasecmp(val,"grid") || !strcasecmp(val,"inline-grid") || !strcasecmp(val,"list-item") ||
+          !strcasecmp(val,"table") || !strcasecmp(val,"table-row") || !strcasecmp(val,"table-cell") ||
+          !strcasecmp(val,"table-row-group") || !strcasecmp(val,"table-caption") || !strcasecmp(val,"contents") ||
+          !strcasecmp(val,"flow-root");
+      case P_POSITION:
+        return !strcasecmp(val,"static") || !strcasecmp(val,"relative") || !strcasecmp(val,"absolute") ||
+          !strcasecmp(val,"fixed") || !strcasecmp(val,"sticky");
+      case P_WRITING_MODE:
+        return !strcasecmp(val,"horizontal-tb") || !strcasecmp(val,"vertical-rl") || !strcasecmp(val,"vertical-lr");
+      case P_WHITE_SPACE:
+        return !strcasecmp(val,"normal") || !strcasecmp(val,"nowrap") || !strcasecmp(val,"pre") ||
+          !strcasecmp(val,"pre-wrap") || !strcasecmp(val,"pre-line") || !strcasecmp(val,"break-spaces");
+      case P_TEXT_WRAP:
+        return !strcasecmp(val,"wrap") || !strcasecmp(val,"nowrap") || !strcasecmp(val,"balance") || !strcasecmp(val,"pretty");
+      case P_CONTENT_VISIBILITY:
+        return !strcasecmp(val,"visible") || !strcasecmp(val,"auto") || !strcasecmp(val,"hidden");
+      case P_CONTAIN_INTRINSIC_SIZE: {
+        if (!strcasecmp(val,"none")) return 1;
+        const char* p=val; char t[128]; int got=0; while (*p) { while(isspace((unsigned char)*p))p++; if(!*p)break; size_t n=0; while(*p&&!isspace((unsigned char)*p)&&n+1<sizeof t)t[n++]=*p++;t[n]=0; if(!strcasecmp(t,"auto"))continue; Len l;if(!css_parse_len(t,&l,16,16))return 0;got++; }
+        return got>0;
+      }
+      case P_CONTAINER_TYPE:
+        return !strcasecmp(val,"normal") || !strcasecmp(val,"size") || !strcasecmp(val,"inline-size");
+      case P_CONTAINER:
+        return 1; /* shorthand is parsed by the style layer */
+      case P_COLOR: case P_BG_COLOR: case P_BORDER_COLOR: {
+        uint32_t col; return css_parse_color(val,&col,0xFF000000u);
+      }
+      case P_WIDTH: case P_HEIGHT: case P_MIN_W: case P_MAX_W: case P_MIN_H: case P_MAX_H:
+      case P_INLINE_SIZE: case P_BLOCK_SIZE: case P_MIN_INLINE_SIZE: case P_MAX_INLINE_SIZE:
+      case P_MIN_BLOCK_SIZE: case P_MAX_BLOCK_SIZE: {
+        Len l; if (!strcasecmp(val,"auto") || !strcasecmp(val,"min-content") || !strcasecmp(val,"max-content") || !strcasecmp(val,"fit-content")) return 1;
+        return css_parse_len(val,&l,16,16);
+      }
+      default: return 1;
+    }
+}
+static int css_supports_decl(const char *s, size_t n) {
+    css_trim_span(&s,&n); if (!n || n>511) return 0;
+    int d=0; char quote=0; int esc=0; const char *colon=NULL;
+    for (size_t i=0;i<n;i++) {
+        char c=s[i];
+        if (quote) { if(esc)esc=0; else if(c=='\\')esc=1; else if(c==quote)quote=0; continue; }
+        if(c=='\''||c=='"'){quote=c;continue;}
+        if(c=='(')d++; else if(c==')'){if(--d<0)return 0;}
+        else if(c==':' && d==0){colon=s+i;break;}
+    }
+    if (!colon || d<0) return 0;
+    const char *ns=s,*ne=colon,*vs=colon+1; size_t nl=(size_t)(ne-ns), vl=n-(size_t)(vs-s);
+    while(nl && isspace((unsigned char)*ns)){ns++;nl--;}
+    while(nl && isspace((unsigned char)ns[nl-1]))nl--;
+    css_trim_span(&vs,&vl);
+    if (!nl || !vl) return 0;
+    if (nl>=2 && ns[0]=='-' && ns[1]=='-') return 1; /* all custom properties are syntactically valid */
+    int prop=css_prop_id(ns,nl);
+    if (prop==P_NONE || prop==P_CUSTOM) return 0;
+    char vcopy[512]; if (vl>=sizeof vcopy) return 0; memcpy(vcopy,vs,vl); vcopy[vl]=0;
+    return css_supported_value(prop,vcopy);
+}
+static int css_supports_eval(const char *s, size_t n, int depth) {
+    if (depth>16) return 0;
+    css_trim_span(&s,&n); if(!n) return 0;
+    if (css_outer_parens(s,n)) return css_supports_eval(s+1,n-2,depth+1);
+    if (n>=4 && !strncasecmp(s,"not",3) && isspace((unsigned char)s[3])) {
+        int v=css_supports_eval(s+4,n-4,depth+1); return !v;
+    }
+    /* split at top-level logical operators; `and` binds more tightly than `or`. */
+    for (int want_or=1; want_or>=0; want_or--) {
+        int d=0; char quote=0; int esc=0;
+        for(size_t i=0;i<n;i++) {
+            char c=s[i];
+            if(quote){if(esc)esc=0;else if(c=='\\')esc=1;else if(c==quote)quote=0;continue;}
+            if(c=='\''||c=='"'){quote=c;continue;}
+            if(c=='('){d++;continue;} if(c==')'){if(d==0)return 0;d--;continue;}
+            if(d)continue;
+            const char *op=want_or?"or":"and"; size_t ol=want_or?2:3;
+            if(i+ol<=n && !strncasecmp(s+i,op,ol) && (i==0||isspace((unsigned char)s[i-1])) && (i+ol==n||isspace((unsigned char)s[i+ol]))) {
+                int a=css_supports_eval(s,i,depth+1), b=css_supports_eval(s+i+ol,n-i-ol,depth+1);
+                return want_or ? (a||b) : (a&&b);
+            }
+        }
+        if(d!=0 || quote)return 0;
+    }
+    if (n>=9 && !strncasecmp(s,"selector(",9) && s[n-1]==')') {
+        const char *q=s+9; size_t qn=n-10; css_trim_span(&q,&qn); if(!qn)return 0;
+        Arena a={0}; int nsel=0; int old_allow=g_allow_pseudo; g_allow_pseudo=1;
+        Simple *sel=css_parse_selector_ex(&a,q,qn,&nsel); g_allow_pseudo=old_allow;
+        int ok=sel!=NULL&&nsel>0; afree(&a); return ok;
+    }
+    return css_supports_decl(s,n);
+}
+int css_supports_condition(const char *condition) {
+    return condition ? css_supports_eval(condition,strlen(condition),0) : 0;
 }
 
 /* ══════════════ цвета ══════════════ */
@@ -87,6 +397,26 @@ static uint32_t hsl2rgb(float h, float s, float l) {
 }
 
 static int clamp255(float v) { return v < 0 ? 0 : v > 255 ? 255 : (int)(v + .5f); }
+static float srgb_to_linear(float v) { return v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f); }
+static float linear_to_srgb(float v) { return v <= 0.0031308f ? 12.92f * v : 1.055f * powf(fmaxf(0.0f, v), 1.0f / 2.4f) - 0.055f; }
+/* A mix percentage is a trailing percentage token outside any nested color function. */
+static int css_mix_strip_weight(char* value, float* weight) {
+    size_t n = strlen(value);
+    while (n && isspace((unsigned char)value[n - 1])) value[--n] = 0;
+    if (!n || value[n - 1] != '%') return 0;
+    char* num_end = value + n - 1;
+    char* num = num_end;
+    while (num > value && isspace((unsigned char)num[-1])) num--;
+    while (num > value && (isdigit((unsigned char)num[-1]) || num[-1] == '.')) num--;
+    if (num == num_end) return 0;
+    char* sep = num;
+    while (sep > value && isspace((unsigned char)sep[-1])) sep--;
+    if (sep == num || sep == value) return 0; /* require a separate color token before the weight */
+    *weight = strtof(num, NULL);
+    while (sep > value && isspace((unsigned char)sep[-1])) sep--;
+    *sep = 0;
+    return 1;
+}
 
 int css_parse_color(const char* s, uint32_t* out, uint32_t cur) {
     while (isspace((unsigned char)*s)) s++;
@@ -112,6 +442,70 @@ int css_parse_color(const char* s, uint32_t* out, uint32_t cur) {
             p = strchr(c, ' '); if (!p) break; p++;
         }
         return 0;
+    }
+    if (!strncasecmp(s, "oklch(", 6)) {
+        /* The final ')' is mandatory: without this guard n - 7 could wrap to
+           SIZE_MAX for input such as "oklch(" and reach memcpy with a negative size. */
+        if (n < 7 || s[n - 1] != ')') return 0;
+        char buf[192]; if (n >= sizeof buf) return 0; memcpy(buf, s + 6, n - 7); buf[n - 7] = 0;
+        char* slash = strchr(buf, '/'); float alpha = 1.0f; if (slash) { *slash++ = 0; while (isspace((unsigned char)*slash)) slash++; alpha = strtof(slash, NULL); if (strchr(slash,'%')) alpha /= 100.0f; }
+        float vals[3] = {0,0,0}; int j=0; char* q=buf;
+        while (*q && j<3) { while (isspace((unsigned char)*q) || *q==',') q++; if (!*q) break; char* e; vals[j]=strtof(q,&e); if (e==q) break; if (strchr(q,'%') && (e==q || e[-1]=='%')) vals[j] /= 100.0f; q=e; if (*q=='%') q++; j++; }
+        if (j < 3) return 0;
+        float L=vals[0], C=vals[1], H=vals[2]; if (L>1) L/=100.0f; H*=0.01745329251994329577f;
+        float aa=C*cosf(H), bb=C*sinf(H);
+        float ll=L + 0.3963377774f*aa + 0.2158037573f*bb;
+        float mm=L - 0.1055613458f*aa - 0.0638541728f*bb;
+        float ss=L - 0.0894841775f*aa - 1.2914855480f*bb;
+        ll=ll*ll*ll; mm=mm*mm*mm; ss=ss*ss*ss;
+        float r= 4.0767416621f*ll - 3.3077115913f*mm + 0.2309699292f*ss;
+        float g=-1.2684380046f*ll + 2.6097574011f*mm - 0.3413193965f*ss;
+        float b=-0.0041960863f*ll - 0.7034186147f*mm + 1.7076147010f*ss;
+        #define SRGB(v) ((v) <= 0.0031308f ? 12.92f*(v) : 1.055f*powf(fmaxf(0.0f,(v)),1.0f/2.4f)-0.055f)
+        int R=clamp255(SRGB(r)*255), G=clamp255(SRGB(g)*255), B=clamp255(SRGB(b)*255);
+        #undef SRGB
+        int A=clamp255(alpha*255); *out=((uint32_t)A<<24)|((uint32_t)R<<16)|((uint32_t)G<<8)|(uint32_t)B; return 1;
+    }
+    if (!strncasecmp(s, "color-mix(", 10)) {
+        const char* q = s + 10; char parts[3][160] = {{0}}; int cnt = 0, dep = 0; size_t k = 0;
+        while (*q && cnt < 3) {
+            if (*q == '(') dep++;
+            else if (*q == ')') { if (dep == 0) break; dep--; }
+            if (*q == ',' && dep == 0) { if (cnt >= 2) return 0; parts[cnt][k] = 0; cnt++; k = 0; q++; continue; }
+            if (k < sizeof(parts[0]) - 1) parts[cnt][k++] = *q;
+            q++;
+        }
+        parts[cnt][k] = 0;
+        if (cnt != 2) return 0;
+        for (int i = 0; i < 3; i++) {
+            char* z = parts[i]; while (isspace((unsigned char)*z)) z++;
+            if (z != parts[i]) memmove(parts[i], z, strlen(z) + 1);
+            size_t l = strlen(parts[i]); while (l && isspace((unsigned char)parts[i][l - 1])) parts[i][--l] = 0;
+        }
+        int linear = !strncasecmp(parts[0], "in srgb-linear", 14);
+        if (!linear && strncasecmp(parts[0], "in srgb", 7)) return 0;
+        float weights[2] = {50.0f, 50.0f}; int has_weight[2] = {0, 0};
+        for (int i = 0; i < 2; i++) has_weight[i] = css_mix_strip_weight(parts[i + 1], &weights[i]);
+        if (has_weight[0] && !has_weight[1]) weights[1] = fmaxf(0.0f, 100.0f - weights[0]);
+        else if (!has_weight[0] && has_weight[1]) weights[0] = fmaxf(0.0f, 100.0f - weights[1]);
+        if (weights[0] < 0) weights[0] = 0; if (weights[1] < 0) weights[1] = 0;
+        uint32_t c1, c2;
+        if (!css_parse_color(parts[1], &c1, cur) || !css_parse_color(parts[2], &c2, cur)) return 0;
+        float sum = weights[0] + weights[1]; if (sum <= 0.00001f) return 0;
+        float t = weights[1] / sum;
+        float a1 = ((c1 >> 24) & 255) / 255.0f, a2 = ((c2 >> 24) & 255) / 255.0f;
+        float a = a1 * (1.0f - t) + a2 * t;
+        float out_a = a * fminf(1.0f, sum / 100.0f);
+        uint32_t out_rgb = 0;
+        for (int shift = 16; shift >= 0; shift -= 8) {
+            float u = ((c1 >> shift) & 255) / 255.0f, v = ((c2 >> shift) & 255) / 255.0f;
+            if (linear) { u = srgb_to_linear(u); v = srgb_to_linear(v); }
+            float mixed = a > 0.00001f ? (u * a1 * (1.0f - t) + v * a2 * t) / a : 0.0f;
+            if (linear) mixed = linear_to_srgb(mixed);
+            out_rgb = (out_rgb << 8) | (uint32_t)clamp255(mixed * 255.0f);
+        }
+        *out = ((uint32_t)clamp255(out_a * 255.0f) << 24) | out_rgb;
+        return 1;
     }
     int fn = 0;
     if (!strncasecmp(s, "rgba(", 5)) fn = 5; else if (!strncasecmp(s, "rgb(", 4)) fn = 4;
@@ -143,11 +537,11 @@ int css_parse_color(const char* s, uint32_t* out, uint32_t cur) {
 
 /* ══════════════ длины и calc() ══════════════ */
 typedef struct { Len v; int scalar; float num; } CVal;
-typedef struct { float em, rem; } LCtx;
+typedef struct { float em, rem, lh; } LCtx;
 
 static int calc_expr(const char** pp, CVal* out, LCtx* lc, int depth);
 
-static int pure_px(const CVal* c) { return c->v.pct == 0 && c->v.vw == 0 && c->v.vh == 0; }
+static int pure_px(const CVal* c) { const Len* l=&c->v; return l->pct==0 && l->vw==0 && l->vh==0 && l->svw==0 && l->svh==0 && l->dvw==0 && l->dvh==0 && l->lh==0; }
 
 static int calc_factor(const char** pp, CVal* out, LCtx* lc, int depth) {
     const char* p = *pp; while (isspace((unsigned char)*p)) p++;
@@ -184,10 +578,17 @@ static int calc_factor(const char** pp, CVal* out, LCtx* lc, int depth) {
     else if (!strncasecmp(p, "px", 2)) { out->v.px = num; p += 2; }
     else if (!strncasecmp(p, "rem", 3)) { out->v.px = num * lc->rem; p += 3; }
     else if (!strncasecmp(p, "em", 2)) { out->v.px = num * lc->em; p += 2; }
-    else if (!strncasecmp(p, "vmin", 4)) { out->v.vh = num / 100.0f; p += 4; }
-    else if (!strncasecmp(p, "vmax", 4)) { out->v.vw = num / 100.0f; p += 4; }
+    else if (!strncasecmp(p, "svw", 3)) { out->v.svw = num / 100.0f; p += 3; }
+    else if (!strncasecmp(p, "svh", 3)) { out->v.svh = num / 100.0f; p += 3; }
+    else if (!strncasecmp(p, "dvw", 3)) { out->v.dvw = num / 100.0f; p += 3; }
+    else if (!strncasecmp(p, "dvh", 3)) { out->v.dvh = num / 100.0f; p += 3; }
+    else if (!strncasecmp(p, "lvw", 3)) { out->v.vw = num / 100.0f; p += 3; }
+    else if (!strncasecmp(p, "lvh", 3)) { out->v.vh = num / 100.0f; p += 3; }
+    else if (!strncasecmp(p, "vmin", 4)) { out->v.px = num * fminf((float)SCREEN_WIDTH, (float)SCREEN_HEIGHT) / 100.0f; p += 4; }
+    else if (!strncasecmp(p, "vmax", 4)) { out->v.px = num * fmaxf((float)SCREEN_WIDTH, (float)SCREEN_HEIGHT) / 100.0f; p += 4; }
     else if (!strncasecmp(p, "vw", 2)) { out->v.vw = num / 100.0f; p += 2; }
     else if (!strncasecmp(p, "vh", 2)) { out->v.vh = num / 100.0f; p += 2; }
+    else if (!strncasecmp(p, "lh", 2)) { out->v.px = num * (lc->lh > 0 ? lc->lh : lc->em * 1.2f); p += 2; }
     else if (!strncasecmp(p, "pt", 2)) { out->v.px = num * 4.0f / 3.0f; p += 2; }
     else if (!strncasecmp(p, "pc", 2)) { out->v.px = num * 16; p += 2; }
     else if (!strncasecmp(p, "cm", 2)) { out->v.px = num * 37.795f; p += 2; }
@@ -208,8 +609,8 @@ static int calc_term(const char** pp, CVal* out, LCtx* lc, int depth) {
         if (!calc_factor(pp, &b, lc, depth)) return 0;
         if (op == '*') {
             CVal* len = out->scalar ? &b : out; float k = out->scalar ? out->num : (b.scalar ? b.num : 1);
-            CVal r = *len; r.v.px *= k; r.v.pct *= k; r.v.vw *= k; r.v.vh *= k; if (out->scalar && b.scalar) { r.scalar = 1; r.num = out->num * b.num; } else r.scalar = 0; *out = r;
-        } else if (b.scalar && b.num != 0) { out->v.px /= b.num; out->v.pct /= b.num; out->v.vw /= b.num; out->v.vh /= b.num; out->num /= b.num; }
+            CVal r = *len; r.v.px *= k; r.v.pct *= k; r.v.vw *= k; r.v.vh *= k; r.v.svw *= k; r.v.svh *= k; r.v.dvw *= k; r.v.dvh *= k; r.v.lh *= k; if (out->scalar && b.scalar) { r.scalar = 1; r.num = out->num * b.num; } else r.scalar = 0; *out = r;
+        } else if (b.scalar && b.num != 0) { out->v.px /= b.num; out->v.pct /= b.num; out->v.vw /= b.num; out->v.vh /= b.num; out->v.svw /= b.num; out->v.svh /= b.num; out->v.dvw /= b.num; out->v.dvh /= b.num; out->v.lh /= b.num; out->num /= b.num; }
         else return 0;
     }
 }
@@ -223,39 +624,51 @@ static int calc_expr(const char** pp, CVal* out, LCtx* lc, int depth) {
         char op = *p++; *pp = p; CVal b;
         if (!calc_term(pp, &b, lc, depth)) return 0;
         float k = op == '+' ? 1.0f : -1.0f;
-        out->v.px += k * b.v.px; out->v.pct += k * b.v.pct; out->v.vw += k * b.v.vw; out->v.vh += k * b.v.vh;
+        out->v.px += k * b.v.px; out->v.pct += k * b.v.pct; out->v.vw += k * b.v.vw; out->v.vh += k * b.v.vh; out->v.svw += k * b.v.svw; out->v.svh += k * b.v.svh; out->v.dvw += k * b.v.dvw; out->v.dvh += k * b.v.dvh; out->v.lh += k * b.v.lh;
         out->scalar = out->scalar && b.scalar; out->num += k * b.num;
     }
 }
 
-int css_parse_len(const char* s, Len* out, float em, float rem) {
+int css_parse_len_lh(const char* s, Len* out, float em, float rem, float lh) {
     while (isspace((unsigned char)*s)) s++;
     memset(out, 0, sizeof *out);
     if (!*s || !strncasecmp(s, "auto", 4) || !strncasecmp(s, "none", 4) || !strncasecmp(s, "normal", 6)) return 1;   /* set = 0 */
-    LCtx lc = {em, rem}; CVal c; const char* p = s;
+    LCtx lc = {em, rem, lh > 0 ? lh : em * 1.2f}; CVal c; const char* p = s;
     if (!calc_expr(&p, &c, &lc, 0)) return 0;
     while (isspace((unsigned char)*p)) p++;
     if (*p && *p != '!') return 0;
     *out = c.v; out->set = 1;
     return 1;
 }
+int css_parse_len(const char* s, Len* out, float em, float rem) {
+    return css_parse_len_lh(s, out, em, rem, em * 1.2f);
+}
 
 /* ══════════════ media queries ══════════════ */
 extern int SCREEN_WIDTH, SCREEN_HEIGHT;
 
 static float mq_num(const char* v) {
-    char* e; float n = strtof(v, &e);
-    if (!strncasecmp(e, "em", 2) || !strncasecmp(e, "rem", 3)) n *= 16;
-    return n;
+    if (!v) return NAN;
+    char* e = NULL;
+    float n = strtof(v, &e);
+    if (e == v || !isfinite(n)) return NAN;
+    while (isspace((unsigned char)*e)) e++;
+    if (!*e) return n;
+    if (!strcasecmp(e, "px")) return n;
+    if (!strcasecmp(e, "em") || !strcasecmp(e, "rem")) return n * 16.0f;
+    if (!strcasecmp(e, "dppx")) return n;
+    if (!strcasecmp(e, "dpi")) return n / 96.0f;
+    if (!strcasecmp(e, "dpcm")) return n * 2.54f / 96.0f;
+    return NAN;
 }
 static int mq_feature(const char* nm, const char* v) {
     float w = (float)SCREEN_WIDTH, h = (float)SCREEN_HEIGHT;
     if (!strcmp(nm, "min-width")) return v && w >= mq_num(v);
     if (!strcmp(nm, "max-width")) return v && w <= mq_num(v);
-    if (!strcmp(nm, "width")) return v && (int)w == (int)mq_num(v);
+    if (!strcmp(nm, "width")) { float n = mq_num(v); return isfinite(n) && (int)w == (int)n; }
     if (!strcmp(nm, "min-height")) return v && h >= mq_num(v);
     if (!strcmp(nm, "max-height")) return v && h <= mq_num(v);
-    if (!strcmp(nm, "height")) return v && (int)h == (int)mq_num(v);
+    if (!strcmp(nm, "height")) { float n = mq_num(v); return isfinite(n) && (int)h == (int)n; }
     if (!strcmp(nm, "orientation")) return v && (!strcmp(v, "landscape") == (w >= h));
     if (!strcmp(nm, "prefers-color-scheme")) return v && !strcmp(v, "light");
     if (!strcmp(nm, "prefers-reduced-motion")) return v && !strcmp(v, "no-preference");
@@ -269,23 +682,52 @@ static int mq_feature(const char* nm, const char* v) {
 }
 
 static int mq_one(const char* q, size_t n) {
-    char b[256]; if (n > 255) n = 255;
-    for (size_t i = 0; i < n; i++) b[i] = (char)tolower((unsigned char)q[i]); b[n] = 0;
+    char b[256];
+    /* Never evaluate a truncated prefix of an attacker-controlled media query. */
+    if (!q || n >= sizeof b) return 0;
+    for (size_t i = 0; i < n; i++) b[i] = (char)tolower((unsigned char)q[i]);
+    b[n] = 0;
     const char* p = b; int neg = 0, res = 1;
     while (*p) {
         while (isspace((unsigned char)*p)) p++;
         if (!*p) break;
         if (*p == '(') {
-            const char* e = strchr(p, ')'); if (!e) return 0;
-            char in[128]; size_t l = (size_t)(e - p - 1); if (l > 127) l = 127; memcpy(in, p + 1, l); in[l] = 0;
-            char* c = strchr(in, ':'); char nm[48]; const char* val = NULL; int ok;
-            if (c) { *c = 0; val = c + 1; while (isspace((unsigned char)*val)) val++; char* ve = (char*)val + strlen(val); while (ve > val && isspace((unsigned char)ve[-1])) *--ve = 0; }
-            { char* ne = in + strlen(in); while (ne > in && isspace((unsigned char)ne[-1])) *--ne = 0; char* ns = in; while (isspace((unsigned char)*ns)) ns++; snprintf(nm, sizeof nm, "%s", ns); }
-            if (!c && (strstr(nm, ">=") || strstr(nm, "<="))) {                       /* (width >= 600px) */
-                char f[32], op[3], v2[32];
-                if (sscanf(nm, "%31s %2s %31s", f, op, v2) == 3) ok = op[0] == '>' ? mq_feature(f[0] == 'w' ? "min-width" : "min-height", v2) : mq_feature(f[0] == 'w' ? "max-width" : "max-height", v2);
-                else ok = 0;
-            } else ok = mq_feature(nm, val);
+            const char* e = strchr(p, ')');
+            if (!e) return 0;
+            size_t l = (size_t)(e - p - 1);
+            char in[128];
+            if (l >= sizeof in) return 0;
+            memcpy(in, p + 1, l); in[l] = 0;
+            char* c = strchr(in, ':'); char nm[48]; const char* val = NULL; int ok = 0;
+            if (c) {
+                *c = 0; val = c + 1;
+                while (isspace((unsigned char)*val)) val++;
+                char* ve = (char*)val + strlen(val);
+                while (ve > val && isspace((unsigned char)ve[-1])) *--ve = 0;
+            }
+            char* ne = in + strlen(in);
+            while (ne > in && isspace((unsigned char)ne[-1])) *--ne = 0;
+            char* ns = in;
+            while (isspace((unsigned char)*ns)) ns++;
+            size_t nl = strlen(ns);
+            if (nl >= sizeof nm) return 0;
+            memcpy(nm, ns, nl + 1);
+            if (!c && (strstr(nm, ">=") || strstr(nm, "<="))) {
+                char f[32], op[3], v2[32]; int consumed = 0;
+                if (sscanf(nm, "%31s %2s %31s%n", f, op, v2, &consumed) == 3) {
+                    const char* tail = nm + consumed;
+                    while (isspace((unsigned char)*tail)) tail++;
+                    if (!*tail && (!strcmp(op, ">=") || !strcmp(op, "<=")) &&
+                        (!strcmp(f, "width") || !strcmp(f, "height"))) {
+                        const char* mapped = !strcmp(f, "width")
+                            ? (!strcmp(op, ">=") ? "min-width" : "max-width")
+                            : (!strcmp(op, ">=") ? "min-height" : "max-height");
+                        ok = mq_feature(mapped, v2);
+                    }
+                }
+            } else {
+                ok = mq_feature(nm, val);
+            }
             res = res && ok; p = e + 1; continue;
         }
         const char* e = p; while (*e && !isspace((unsigned char)*e) && *e != '(') e++;
@@ -293,7 +735,7 @@ static int mq_one(const char* q, size_t n) {
         if (l == 3 && !strncmp(p, "not", 3)) neg = 1;
         else if ((l == 4 && !strncmp(p, "only", 4)) || (l == 3 && !strncmp(p, "and", 3)) ||
                  (l == 6 && !strncmp(p, "screen", 6)) || (l == 3 && !strncmp(p, "all", 3))) {}
-        else res = 0;                                     /* print, speech, tty ... */
+        else res = 0;
         p = e;
     }
     return neg ? !res : res;
@@ -303,10 +745,19 @@ int css_media_matches(const char* q) {
     if (!q) return 1;
     while (isspace((unsigned char)*q)) q++;
     if (!*q) return 1;
-    const char* s = q; int d = 0;
+    const char* s = q; int depth = 0;
     for (const char* p = q;; p++) {
-        if (*p == '(') d++; else if (*p == ')') d--;
-        if ((*p == ',' && d == 0) || !*p) { if (mq_one(s, (size_t)(p - s))) return 1; if (!*p) break; s = p + 1; }
+        if (*p == '(') depth++;
+        else if (*p == ')') {
+            if (depth == 0) return 0;
+            depth--;
+        }
+        if ((*p == ',' && depth == 0) || !*p) {
+            if (depth != 0) return 0;
+            if (mq_one(s, (size_t)(p - s))) return 1;
+            if (!*p) break;
+            s = p + 1;
+        }
     }
     return 0;
 }
@@ -377,7 +828,6 @@ static size_t read_ident(const char* p, char* dst, size_t cap, int lower) {
 }
 
 int css_dyn_seen = 0;                             /* 1 — в разобранных таблицах встретились :hover/:active/:focus */
-static int g_allow_pseudo = 0;                    /* 1 только пока разбираем селекторы правил таблицы стилей */
 static Simple* parse_compound_list(Arena* a, const char* s, size_t n, uint32_t* spec);
 static int parse_nth(const char* s, int* A, int* B) {
     while (isspace((unsigned char)*s)) s++;
@@ -397,15 +847,30 @@ static int parse_compound(Arena* a, const char** pp, Simple* s, uint32_t* spec) 
     const char* p = *pp; int any = 0;
     while (*p && !isspace((unsigned char)*p) && *p != '>' && *p != '+' && *p != '~' && *p != ',') {
         if (*p == '*') { p++; any = 1; }
-        else if (is_ident((unsigned char)*p)) { p += read_ident(p, s->tag, sizeof s->tag, 1); spec[2]++; any = 1; }
-        else if (*p == '#') { p++; p += read_ident(p, s->id, sizeof s->id, 0); spec[0]++; any = 1; }
-        else if (*p == '.') { p++; char c[40]; p += read_ident(p, c, sizeof c, 0); if (s->ncls < 4) strcpy(s->cls[s->ncls++], c); spec[1]++; any = 1; }
+        else if (is_ident((unsigned char)*p)) {
+            size_t il = read_ident(p, s->tag, sizeof s->tag, 1);
+            if (!il || il >= sizeof s->tag) return 0;
+            p += il; spec[2]++; any = 1;
+        }
+        else if (*p == '#') {
+            p++; size_t il = read_ident(p, s->id, sizeof s->id, 0);
+            if (!il || il >= sizeof s->id || s->id[0] == 0) return 0;
+            p += il; spec[0]++; any = 1;
+        }
+        else if (*p == '.') {
+            p++; char c[40]; size_t il = read_ident(p, c, sizeof c, 0);
+            if (!il || il >= sizeof c || s->ncls >= 4) return 0;
+            p += il; memcpy(s->cls[s->ncls++], c, strlen(c) + 1); spec[1]++; any = 1;
+        }
         else if (*p == '[') {
             const char* e = p + 1; int d = 1; while (*e && d) { if (*e == '"' || *e == '\'') { e = skip_str(e); continue; } if (*e == '[') d++; else if (*e == ']') d--; e++; }
+            if (d != 0 || s->nat >= 3) return 0; /* malformed or beyond our exact representation */
             const char* in = p + 1; size_t l = (size_t)(e - 1 - in);
-            if (s->nat < 3) {
+            {
                 size_t k = 0; while (k < l && !strchr("=~|^$*] ", in[k])) k++;
-                size_t nl = k < 23 ? k : 23; memcpy(s->at[s->nat].n, in, nl); s->at[s->nat].n[nl] = 0;
+                size_t nl = k;
+                if (!nl || nl >= sizeof s->at[s->nat].n) return 0;
+                memcpy(s->at[s->nat].n, in, nl); s->at[s->nat].n[nl] = 0;
                 for (char* c = s->at[s->nat].n; *c; c++) *c = (char)tolower((unsigned char)*c);
                 while (k < l && in[k] == ' ') k++;
                 if (k < l) {
@@ -415,24 +880,67 @@ static int parse_compound(Arena* a, const char** pp, Simple* s, uint32_t* spec) 
                     const char* vs = in + k; size_t vl = l - k;
                     if (vl && (*vs == '"' || *vs == '\'')) { vs++; vl--; const char* q = memchr(vs, in[k], vl); if (q) vl = (size_t)(q - vs); }
                     else { size_t z = 0; while (z < vl && !isspace((unsigned char)vs[z])) z++; vl = z; }
-                    if (vl > 47) vl = 47; memcpy(s->at[s->nat].v, vs, vl); s->at[s->nat].v[vl] = 0; s->at[s->nat].op = op;
+                    if (vl >= sizeof s->at[s->nat].v) return 0;
+                    memcpy(s->at[s->nat].v, vs, vl); s->at[s->nat].v[vl] = 0; s->at[s->nat].op = op;
                 }
                 s->nat++;
             }
             spec[1]++; p = e; any = 1;
         }
         else if (*p == ':') {
-            {   /* ::before / ::after (и устаревшая запись :before / :after) — только в правилах таблиц стилей */
-                int dbl = p[1] == ':'; const char* q0 = p + (dbl ? 2 : 1); char pn[32]; size_t pl = read_ident(q0, pn, sizeof pn, 1);
-                if (dbl || !strcmp(pn, "before") || !strcmp(pn, "after") || !strcmp(pn, "first-line") || !strcmp(pn, "first-letter")) {
+            {
+                int dbl = p[1] == ':'; const char* q0 = p + (dbl ? 2 : 1); char pn[32];
+                size_t pl = read_ident(q0, pn, sizeof pn, 1);
+                if (!pl || pl >= sizeof pn) return 0;
+                int pseudo = 0;
+                if (!strcmp(pn, "before")) pseudo = WEBPAGE_VT_PSEUDO_BEFORE;
+                else if (!strcmp(pn, "after")) pseudo = WEBPAGE_VT_PSEUDO_AFTER;
+                else if (dbl && !strcmp(pn, "marker")) pseudo = WEBPAGE_VT_PSEUDO_MARKER;
+                else if (dbl && !strcmp(pn, "view-transition")) pseudo = WEBPAGE_VT_PSEUDO_ROOT;
+                else if (dbl && !strcmp(pn, "view-transition-group")) pseudo = WEBPAGE_VT_PSEUDO_GROUP;
+                else if (dbl && !strcmp(pn, "view-transition-image-pair")) pseudo = WEBPAGE_VT_PSEUDO_IMAGE_PAIR;
+                else if (dbl && !strcmp(pn, "view-transition-old")) pseudo = WEBPAGE_VT_PSEUDO_OLD;
+                else if (dbl && !strcmp(pn, "view-transition-new")) pseudo = WEBPAGE_VT_PSEUDO_NEW;
+                if (pseudo && (dbl || pseudo == WEBPAGE_VT_PSEUDO_BEFORE || pseudo == WEBPAGE_VT_PSEUDO_AFTER)) {
                     if (!g_allow_pseudo) return 0;
-                    if (!strcmp(pn, "before")) s->pseudo = 1; else if (!strcmp(pn, "after")) s->pseudo = 2; else return 0;
-                    p = q0 + pl; spec[2]++; any = 1; continue;
+                    p = q0 + pl;
+                    int needs_name = pseudo >= WEBPAGE_VT_PSEUDO_GROUP && pseudo <= WEBPAGE_VT_PSEUDO_NEW;
+                    if (needs_name) {
+                        if (*p != '(') return 0;
+                        const char* e = strchr(p + 1, ')');
+                        if (!e || (size_t)(e - (p + 1)) == 0 || (size_t)(e - (p + 1)) >= sizeof s->pseudo_arg) return 0;
+                        const char* a0 = p + 1; const char* a1 = e;
+                        while (a0 < a1 && isspace((unsigned char)*a0)) a0++;
+                        while (a1 > a0 && isspace((unsigned char)a1[-1])) a1--;
+                        if (a0 == a1 || (size_t)(a1-a0) >= sizeof s->pseudo_arg) return 0;
+                        /* Accept one custom-ident only; reject CSS-wide keywords and lists. */
+                        char name[48]; size_t nl = (size_t)(a1-a0); memcpy(name,a0,nl); name[nl]=0;
+                        if (!strcmp(name,"none") || !strcmp(name,"auto") || !strcmp(name,"initial") ||
+                            !strcmp(name,"inherit") || !strcmp(name,"unset") || strchr(name,' ') || strchr(name,'\t') || strchr(name,',')) return 0;
+                        for (size_t z=0; z<nl; z++) {
+                            unsigned char ch=(unsigned char)name[z];
+                            if (!(isalnum(ch) || ch=='_' || ch=='-' || ch>=0x80) || (z==0 && isdigit(ch))) return 0;
+                        }
+                        memcpy(s->pseudo_arg,name,nl+1); p=e+1;
+                    } else {
+                        if (*p == '(') return 0; /* ::view-transition has no name argument */
+                    }
+                    s->pseudo = (uint8_t)pseudo; spec[2]++; any = 1; continue;
                 }
+                if (dbl || !strcmp(pn, "before") || !strcmp(pn, "after") || !strcmp(pn, "first-line") || !strcmp(pn, "first-letter")) return 0;
             }
-            p++; char nm[32]; p += read_ident(p, nm, sizeof nm, 1);
-            char arg[128] = ""; 
-            if (*p == '(') { const char* e = p + 1; int d = 1; while (*e && d) { if (*e == '(') d++; else if (*e == ')') d--; e++; } size_t l = (size_t)(e - 1 - (p + 1)); if (l > 127) l = 127; memcpy(arg, p + 1, l); arg[l] = 0; p = e; }
+            p++; char nm[32]; size_t nl = read_ident(p, nm, sizeof nm, 1);
+            if (!nl || nl >= sizeof nm) return 0;
+            p += nl;
+            char arg[128] = "";
+            if (*p == '(') {
+                const char* e = p + 1; int d = 1;
+                while (*e && d) { if (*e == '(') d++; else if (*e == ')') d--; e++; }
+                if (d != 0) return 0;
+                size_t l = (size_t)(e - 1 - (p + 1));
+                if (l >= sizeof arg) return 0;
+                memcpy(arg, p + 1, l); arg[l] = 0; p = e;
+            }
             int k = 0, A = 0, B = 0;
             if (!strcmp(nm, "first-child")) k = PC_FIRST_CHILD; else if (!strcmp(nm, "last-child")) k = PC_LAST_CHILD; else if (!strcmp(nm, "only-child")) k = PC_ONLY_CHILD;
             else if (!strcmp(nm, "first-of-type")) k = PC_FIRST_TYPE; else if (!strcmp(nm, "last-of-type")) k = PC_LAST_TYPE; else if (!strcmp(nm, "only-of-type")) k = PC_ONLY_TYPE;
@@ -442,19 +950,23 @@ static int parse_compound(Arena* a, const char** pp, Simple* s, uint32_t* spec) 
             else if (!strcmp(nm, "link") || !strcmp(nm, "any-link")) k = PC_LINK; else if (!strcmp(nm, "checked")) k = PC_CHECKED;
             else if (!strcmp(nm, "disabled")) k = PC_DISABLED; else if (!strcmp(nm, "enabled")) k = PC_ENABLED;
             else if (!strcmp(nm, "hover")) { k = PC_HOVER; css_dyn_seen = 1; } else if (!strcmp(nm, "active")) { k = PC_ACTIVE; css_dyn_seen = 1; }
-            else if (!strcmp(nm, "focus") || !strcmp(nm, "focus-visible")) { k = PC_FOCUS; css_dyn_seen = 1; } else if (!strcmp(nm, "focus-within")) { k = PC_FOCUS + 100; css_dyn_seen = 1; }
+            else if (!strcmp(nm, "focus")) { k = PC_FOCUS; css_dyn_seen = 1; } else if (!strcmp(nm, "focus-visible")) { k = PC_FOCUS_VISIBLE; css_dyn_seen = 1; } else if (!strcmp(nm, "focus-within")) { k = PC_FOCUS + 100; css_dyn_seen = 1; }
             else if (!strcmp(nm, "visited") || !strcmp(nm, "target") || !strcmp(nm, "placeholder-shown")) k = PC_NEVER;
-            else if (!strcmp(nm, "not") || !strcmp(nm, "is") || !strcmp(nm, "where") || !strcmp(nm, "matches") || !strcmp(nm, "any")) {
+            else if (!strcmp(nm, "not") || !strcmp(nm, "is") || !strcmp(nm, "where") || !strcmp(nm, "matches") || !strcmp(nm, "any") || !strcmp(nm, "has")) {
                 if (s->sub) return 0;
                 uint32_t sp[3] = {0, 0, 0}; int sv = g_allow_pseudo; g_allow_pseudo = 0;
-                s->sub = parse_compound_list(a, arg, strlen(arg), sp); g_allow_pseudo = sv; if (!s->sub) return 0;
+                const char* subarg = arg; while (isspace((unsigned char)*subarg)) subarg++;
+                s->sub_has = !strcmp(nm, "has");
+                if (s->sub_has && *subarg == '>') { s->sub_direct = 1; subarg++; while (isspace((unsigned char)*subarg)) subarg++; }
+                s->sub = parse_compound_list(a, subarg, strlen(subarg), sp); g_allow_pseudo = sv; if (!s->sub) return 0;
                 s->sub_neg = !strcmp(nm, "not");
                 if (strcmp(nm, "where")) { spec[0] += sp[0]; spec[1] += sp[1]; spec[2] += sp[2]; }
                 any = 1; continue;
             }
             else if (!strcmp(nm, "defined") || !strcmp(nm, "lang") || !strcmp(nm, "dir")) { any = 1; continue; }
-            else return 0;                                                       /* :has(), :host и пр. */
-            if (s->npc < 6) { s->pc[s->npc] = (uint8_t)k; s->pa[s->npc] = (int16_t)A; s->pb[s->npc] = (int16_t)B; s->npc++; }
+            else return 0;                                                       /* unsupported pseudo-class */
+            if (s->npc >= 6) return 0;
+            s->pc[s->npc] = (uint8_t)k; s->pa[s->npc] = (int16_t)A; s->pb[s->npc] = (int16_t)B; s->npc++;
             spec[1]++; any = 1;
         }
         else return 0;
@@ -498,7 +1010,14 @@ static Simple* parse_selector(Arena* a, const char* s, size_t n, int* nsel, uint
         if (*p && !isspace((unsigned char)*p) && *p != '>' && *p != '+' && *p != '~') return NULL;
     }
     if (!cnt) return NULL;
-    for (int i = 0; i + 1 < cnt; i++) if (tmp[i].pseudo) return NULL;          /* псевдоэлемент допустим только в конце селектора */
+    for (int i = 0; i + 1 < cnt; i++) if (tmp[i].pseudo) {
+        /* View Transition pseudo-elements form a real selector tree. Other
+           pseudo-elements still must be terminal in this compact selector AST. */
+        if (tmp[i].pseudo < WEBPAGE_VT_PSEUDO_ROOT || tmp[i].pseudo > WEBPAGE_VT_PSEUDO_NEW) return NULL;
+        if (tmp[i+1].comb != '>') return NULL;
+    }
+    for (int i=1; i<cnt; i++) if (tmp[i].pseudo >= WEBPAGE_VT_PSEUDO_ROOT && tmp[i].pseudo <= WEBPAGE_VT_PSEUDO_NEW &&
+                                  tmp[i-1].pseudo && tmp[i-1].pseudo < WEBPAGE_VT_PSEUDO_ROOT) return NULL;
     Simple* out = aalloc(a, (size_t)cnt * sizeof(Simple)); memcpy(out, tmp, (size_t)cnt * sizeof(Simple));
     *nsel = cnt;
     *spec_out = ((spec[0] > 255 ? 255 : spec[0]) << 16) | ((spec[1] > 255 ? 255 : spec[1]) << 8) | (spec[2] > 255 ? 255 : spec[2]);
@@ -556,6 +1075,61 @@ static const char* scan_until(const char* p, const char* stops) {
     return p;
 }
 
+static int g_cq_active;
+static uint8_t g_cq_flags;
+static float g_cq_min_w, g_cq_max_w, g_cq_min_h, g_cq_max_h;
+static char g_cq_name[40];
+static float cq_len_value(const char* p) {
+    while (isspace((unsigned char)*p) || *p=='(') p++;
+    char* e=NULL; float v=strtof(p,&e); if (e==p) return 0;
+    while (isspace((unsigned char)*e)) e++;
+    if (!strncasecmp(e,"rem",3) || !strncasecmp(e,"em",2)) return v*16.0f;
+    if (!strncasecmp(e,"vw",2) || !strncasecmp(e,"svw",3) || !strncasecmp(e,"dvw",3)) return v*(float)SCREEN_WIDTH/100.0f;
+    if (!strncasecmp(e,"vh",2) || !strncasecmp(e,"svh",3) || !strncasecmp(e,"dvh",3)) return v*(float)SCREEN_HEIGHT/100.0f;
+    if (*e=='%') return v*(float)SCREEN_WIDTH/100.0f;
+    return v;
+}
+static void cq_apply_condition(char* cond) {
+    char* begin = cond; while (isspace((unsigned char)*begin)) begin++;
+    char* end = begin + strlen(begin); while (end > begin && isspace((unsigned char)end[-1])) *--end = 0;
+    char* colon = strchr(begin, ':');
+    if (colon) {
+        *colon++ = 0;
+        char* f = begin; while (isspace((unsigned char)*f)) f++;
+        char* fe = f + strlen(f); while (fe > f && isspace((unsigned char)fe[-1])) *--fe = 0;
+        while (isspace((unsigned char)*colon)) colon++;
+        float v = cq_len_value(colon);
+        if (!strcasecmp(f,"min-width") || !strcasecmp(f,"min-inline-size")) { g_cq_min_w=v; g_cq_flags|=1; }
+        else if (!strcasecmp(f,"max-width") || !strcasecmp(f,"max-inline-size")) { g_cq_max_w=v; g_cq_flags|=2; }
+        else if (!strcasecmp(f,"min-height") || !strcasecmp(f,"min-block-size")) { g_cq_min_h=v; g_cq_flags|=4; }
+        else if (!strcasecmp(f,"max-height") || !strcasecmp(f,"max-block-size")) { g_cq_max_h=v; g_cq_flags|=8; }
+        return;
+    }
+    /* Range syntax: (width >= 240px), (height < 40rem), and aliases. */
+    char* f = begin; char* p = f;
+    while (*p && !isspace((unsigned char)*p) && *p!='>' && *p!='<' && *p!='=') p++;
+    if (p == f) return;
+    char feature[40]; size_t fl=(size_t)(p-f); if (fl >= sizeof feature) return; memcpy(feature,f,fl); feature[fl]=0;
+    while (isspace((unsigned char)*p)) p++;
+    char op[3]={0,0,0};
+    if (*p=='>' || *p=='<' || *p=='=') { op[0]=*p++; if (*p=='=') op[1]=*p++; }
+    else return;
+    while (isspace((unsigned char)*p)) p++;
+    if (!*p) return;
+    float v=cq_len_value(p); int width=!strcasecmp(feature,"width")||!strcasecmp(feature,"inline-size");
+    int height=!strcasecmp(feature,"height")||!strcasecmp(feature,"block-size");
+    if (!width && !height) return;
+    uint8_t minflag=width?1:4, maxflag=width?2:8;
+    float* minv=width?&g_cq_min_w:&g_cq_min_h; float* maxv=width?&g_cq_max_w:&g_cq_max_h;
+    if (!strcmp(op,">") || !strcmp(op,">=")) { *minv = v + (op[1] ? 0.0f : 0.02f); g_cq_flags|=minflag; }
+    else if (!strcmp(op,"<") || !strcmp(op,"<=")) { *maxv = v - (op[1] ? 0.0f : 0.02f); g_cq_flags|=maxflag; }
+    else if (!strcmp(op,"=")) { *minv=v; *maxv=v; g_cq_flags|=minflag|maxflag; }
+}
+static void copy_cq_to_rule(Rule* r) {
+    r->has_container_query=(uint8_t)g_cq_active; r->cq_flags=g_cq_flags;
+    r->cq_min_w=g_cq_min_w; r->cq_max_w=g_cq_max_w; r->cq_min_h=g_cq_min_h; r->cq_max_h=g_cq_max_h;
+    snprintf(r->cq_name,sizeof r->cq_name,"%s",g_cq_name);
+}
 static void add_rule(RuleSet* rs, Rule* r) {
     if (rs->n == rs->cap) { rs->cap = rs->cap ? rs->cap * 2 : 512; rs->v = realloc(rs->v, (size_t)rs->cap * sizeof(Rule*)); }
     rs->v[rs->n++] = r;
@@ -564,7 +1138,7 @@ static void add_rule(RuleSet* rs, Rule* r) {
 static void parse_rule_block(Arena* a, RuleSet* rs, const char* sel, size_t sel_len, const char* body, size_t body_len, int origin) {
     int nd = 0; Decl* decls = css_parse_decls(a, body, body_len, &nd);
     if (!decls) return;
-    for (int i = 0; i < nd; i++) if (decls[i].prop >= P_TRANSITION && decls[i].prop <= P_ANIMATION_PLAY) { rs->has_trans = 1; break; }
+    for (int i = 0; i < nd; i++) if (decls[i].prop >= P_TRANSITION && decls[i].prop <= P_ANIMATION_RANGE) { rs->has_trans = 1; break; }
     char* selz = astrdup(a, sel, sel_len);                 /* NUL-терминированная копия: scan_until не должен уходить за селектор */
     const char* s = selz; const char* end = selz + sel_len;
     while (s < end) {
@@ -576,11 +1150,76 @@ static void parse_rule_block(Arena* a, RuleSet* rs, const char* sel, size_t sel_
             g_allow_pseudo = 1; Simple* sp = parse_selector(a, ss, (size_t)(se - ss), &nsel, &spec); g_allow_pseudo = 0;
             if (sp) {
                 Rule* r = aalloc(a, sizeof(Rule)); r->sel = sp; r->nsel = nsel; r->spec = spec; r->order = rs->next_order++; r->pseudo = sp[nsel - 1].pseudo;
-                r->origin = origin; r->decls = decls; r->ndecls = nd; add_rule(rs, r);
+                r->origin = origin; r->decls = decls; r->ndecls = nd; copy_cq_to_rule(r); add_rule(rs, r);
             }
         }
         s = c + 1;
     }
+}
+
+static void trim_selector(const char** p, size_t* n) {
+    while (*n && isspace((unsigned char)**p)) { (*p)++; (*n)--; }
+    while (*n && isspace((unsigned char)(*p)[*n-1])) (*n)--;
+}
+static char* combine_nested_selectors(const char* parent, const char* child) {
+    char* out=calloc(1,8192); if(!out) return NULL; size_t used=0;
+    const char* pp=parent;
+    while (*pp) {
+        const char* pe=scan_until(pp,","); size_t pl=(size_t)(pe-pp); trim_selector(&pp,&pl);
+        const char* cp=child;
+        while (*cp) {
+            const char* ce=scan_until(cp,","); size_t cl=(size_t)(ce-cp); trim_selector(&cp,&cl);
+            char pbuf[1024], cbuf[1024], one[3072];
+            if(pl>=sizeof pbuf) pl=sizeof pbuf-1; if(cl>=sizeof cbuf) cl=sizeof cbuf-1;
+            memcpy(pbuf,pp,pl); pbuf[pl]=0; memcpy(cbuf,cp,cl); cbuf[cl]=0;
+            one[0]=0;
+            if (strchr(cbuf,'&')) {
+                size_t z=0;
+                for(const char* t=cbuf; *t && z+2<sizeof one;) {
+                    if(*t=='&') { size_t q=strlen(pbuf); if(z+q+1>=sizeof one) break; memcpy(one+z,pbuf,q); z+=q; t++; }
+                    else one[z++]=*t++;
+                }
+                one[z]=0;
+            } else {
+                const char* t=cbuf; while(isspace((unsigned char)*t))t++;
+                if(*t=='>'||*t=='+'||*t=='~') snprintf(one,sizeof one,"%s %s",pbuf,t);
+                else snprintf(one,sizeof one,"%s %s",pbuf,cbuf);
+            }
+            size_t ol=strlen(one); if(used+ol+3<8192) { if(used) {out[used++]=',';out[used++]=' ';} memcpy(out+used,one,ol); used+=ol; out[used]=0; }
+            cp= *ce ? ce+1 : ce;
+        }
+        pp= *pe ? pe+1 : pe;
+    }
+    return out;
+}
+static void parse_nested_block(Arena* a, RuleSet* rs, const char* sel, size_t sel_len, const char* body, size_t body_len, int origin, int depth) {
+    if (depth > 10) { parse_rule_block(a,rs,sel,sel_len,body,body_len,origin); return; }
+    const char* p=body; const char* end=body+body_len; char direct[8192]; size_t dn=0; direct[0]=0;
+    while (p<end) {
+        const char* q=skip_ws(p); if(q>=end) break;
+        const char* sep=scan_until(q,";{}");
+        if(sep>=end) { size_t n=(size_t)(end-q); if(dn+n<sizeof direct-1) {memcpy(direct+dn,q,n);dn+=n;direct[dn]=0;} p=end; break; }
+        if(*sep==';') { size_t n=(size_t)(sep+1-q); if(dn+n<sizeof direct-1) {memcpy(direct+dn,q,n);dn+=n;direct[dn]=0;} p=sep+1; continue; }
+        if(*sep=='}') { size_t n=(size_t)(sep-q); if(dn+n<sizeof direct-1) {memcpy(direct+dn,q,n);dn+=n;direct[dn]=0;} p=sep+1; continue; }
+        if(*sep=='{') {
+            size_t clen=(size_t)(sep-q); const char* cs=q; trim_selector(&cs,&clen);
+            if(dn) { parse_rule_block(a,rs,sel,sel_len,direct,dn,origin); dn=0; direct[0]=0; }
+            const char* be=block_end(sep); const char* in=sep+1; size_t il=be>in?(size_t)(be-1-in):0;
+            if(clen && cs[0]=='@') {
+                char* at=malloc(clen+il+4); if(at) {memcpy(at,cs,clen);at[clen]='{';memcpy(at+clen+1,in,il);at[clen+1+il]='}';at[clen+2+il]=0; css_parse_sheet(a,rs,at,NULL,origin,depth+1);free(at);}
+            } else if(clen) {
+                /* `sel` may point into a larger stylesheet buffer and is not
+                   necessarily NUL-terminated at sel_len. Selector combination
+                   scans comma-separated lists, so bound it with an arena copy. */
+                char* parent_sel=astrdup(a,sel,sel_len);
+                char* csel=astrdup(a,cs,clen);
+                char* merged=combine_nested_selectors(parent_sel,csel);
+                if(merged) parse_nested_block(a,rs,merged,strlen(merged),in,il,origin,depth+1);
+            }
+            p=be;
+        }
+    }
+    if(dn) parse_rule_block(a,rs,sel,sel_len,direct,dn,origin);
 }
 
 void css_parse_sheet(Arena* a, RuleSet* rs, const char* css, const char* sheet_url, int origin, int depth) {
@@ -600,7 +1239,7 @@ void css_parse_sheet(Arena* a, RuleSet* rs, const char* css, const char* sheet_u
                     if (url[0] && css_media_matches(media)) {
                         char abs[1200]; webpage_resolve_url(sheet_url, url, abs, sizeof abs);
                         if (!strncmp(abs, "http", 4) && !webpage_mixed_blocked(abs)) {
-                            css_fetch_budget--; char* sub = nal_http_get(abs);
+                            css_fetch_budget--; char* sub = nal_http_get_kind(abs, NAL_RESOURCE_STYLE);
                             if (sub) { css_parse_sheet(a, rs, sub, abs, origin, depth + 1); free(sub); }
                         }
                     }
@@ -644,9 +1283,25 @@ void css_parse_sheet(Arena* a, RuleSet* rs, const char* css, const char* sheet_u
             if (nl == 5 && !strncasecmp(ns, "media", 5)) {
                 char q[256]; size_t ql = (size_t)(semi - ne); if (ql > 255) ql = 255; memcpy(q, ne, ql); q[ql] = 0;
                 if (css_media_matches(q)) { char* in = malloc(il + 1); if (in) { memcpy(in, inner, il); in[il] = 0; css_parse_sheet(a, rs, in, sheet_url, origin, depth + 1); free(in); } }
-            } else if ((nl == 8 && !strncasecmp(ns, "supports", 8)) || (nl == 5 && !strncasecmp(ns, "layer", 5))) {
-                const char* q = skip_ws(ne);
-                if (!(nl == 8 && !strncasecmp(q, "not", 3))) { char* in = malloc(il + 1); if (in) { memcpy(in, inner, il); in[il] = 0; css_parse_sheet(a, rs, in, sheet_url, origin, depth + 1); free(in); } }
+            } else if (nl == 9 && !strncasecmp(ns, "container", 9)) {
+                char q[512]; size_t ql=(size_t)(semi-ne); if(ql>511)ql=511; memcpy(q,ne,ql);q[ql]=0;
+                int old_active=g_cq_active; uint8_t old_flags=g_cq_flags; float omw=g_cq_min_w, oxw=g_cq_max_w, omh=g_cq_min_h, oxh=g_cq_max_h; char oname[40]; snprintf(oname,sizeof oname,"%s",g_cq_name);
+                g_cq_active=1; g_cq_flags=0; g_cq_min_w=0;g_cq_max_w=-1;g_cq_min_h=0;g_cq_max_h=-1;g_cq_name[0]=0;
+                const char* paren=strchr(q,'('); if(paren) { const char* nm=q; while(isspace((unsigned char)*nm))nm++; if(paren>nm) { size_t nl2=(size_t)(paren-nm); while(nl2&&isspace((unsigned char)nm[nl2-1]))nl2--; if(nl2>0&&nl2<sizeof g_cq_name) { memcpy(g_cq_name,nm,nl2);g_cq_name[nl2]=0; } } }
+                const char* tests=q;
+                while((tests=strchr(tests,'('))!=NULL) { const char* ce=strchr(tests,')'); if(!ce)break; char cond[128]; size_t ln=(size_t)(ce-tests-1);if(ln>127)ln=127;memcpy(cond,tests+1,ln);cond[ln]=0;cq_apply_condition(cond); tests=ce+1; }
+                char* in=malloc(il+1); if(in){memcpy(in,inner,il);in[il]=0;css_parse_sheet(a,rs,in,sheet_url,origin,depth+1);free(in);}
+                g_cq_active=old_active;g_cq_flags=old_flags;g_cq_min_w=omw;g_cq_max_w=oxw;g_cq_min_h=omh;g_cq_max_h=oxh;snprintf(g_cq_name,sizeof g_cq_name,"%s",oname);
+            } else if (nl == 8 && !strncasecmp(ns, "supports", 8)) {
+                char cond[512]; size_t ql=(size_t)(semi-ne); if(ql>=sizeof cond) ql=sizeof cond-1;
+                memcpy(cond,ne,ql); cond[ql]=0;
+                if (css_supports_condition(cond)) { char* in=malloc(il+1); if(in){memcpy(in,inner,il);in[il]=0;css_parse_sheet(a,rs,in,sheet_url,origin,depth+1);free(in);} }
+            } else if (nl == 5 && !strncasecmp(ns, "layer", 5)) {
+                char* in = malloc(il + 1); if (in) { memcpy(in, inner, il); in[il] = 0; css_parse_sheet(a, rs, in, sheet_url, origin, depth + 1); free(in); }
+            } else if (nl == 8 && !strncasecmp(ns, "property", 8) && origin != 0) {
+                char prelude[96]; size_t ql=(size_t)(semi-ne); if(ql>=sizeof prelude)ql=sizeof prelude-1;
+                memcpy(prelude,ne,ql);prelude[ql]=0;
+                css_parse_property_rule(a,rs,prelude,inner,il);
             } else if (nl == 9 && !strncasecmp(ns, "font-face", 9) && origin != 0) {
                 int nd = 0; Decl* d = css_parse_decls(a, inner, il, &nd);
                 const char *fam = NULL, *src = NULL, *wt = NULL, *st = NULL;
@@ -675,7 +1330,7 @@ void css_parse_sheet(Arena* a, RuleSet* rs, const char* css, const char* sheet_u
         if (!*brace) break;
         const char* bend = block_end(brace);
         const char* inner = brace + 1; size_t il = bend > inner ? (size_t)(bend - 1 - inner) : 0;
-        parse_rule_block(a, rs, p, (size_t)(brace - p), inner, il, origin);
+        parse_nested_block(a, rs, p, (size_t)(brace - p), inner, il, origin, depth);
         p = bend;
     }
 }

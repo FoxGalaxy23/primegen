@@ -25,7 +25,7 @@ static FxLen fx_len_of(Cx* c, const char* tk, int* ok) {
     if (!strcasecmp(tk, "left") || !strcasecmp(tk, "top")) { *ok = 1; return r; }
     if (!strcasecmp(tk, "center")) { r.pct = 50; *ok = 1; return r; }
     if (!strcasecmp(tk, "right") || !strcasecmp(tk, "bottom")) { r.pct = 100; *ok = 1; return r; }
-    if (len_of(c, tk, &l) && l.set) { r.px = l.px + l.vw * SCREEN_WIDTH + l.vh * SCREEN_HEIGHT; r.pct = l.pct; *ok = 1; }
+    if (len_of(c, tk, &l) && l.set) { r.px = l.px + (l.vw + l.svw + l.dvw) * SCREEN_WIDTH + (l.vh + l.svh + l.dvh) * SCREEN_HEIGHT + l.lh; r.pct = l.pct; *ok = 1; }
     else if (!strcmp(tk, "0")) *ok = 1;
     return r;
 }
@@ -117,12 +117,26 @@ static void parse_mask_image(Cx* c, FxMask* m, const char* tk) {
     int lin = !strncasecmp(tk, "linear-gradient(", 16) || !strncasecmp(tk, "-webkit-linear-gradient(", 24) || !strncasecmp(tk, "repeating-linear-gradient(", 26);
     int rad = !strncasecmp(tk, "radial-gradient(", 16) || !strncasecmp(tk, "-webkit-radial-gradient(", 24) || !strncasecmp(tk, "repeating-radial-gradient(", 26);
     if (!strncasecmp(tk, "url(", 4)) {
-        const char* q = tk + 4; while (isspace((unsigned char)*q)) q++; char qc = (*q == '"' || *q == '\'') ? *q++ : 0; size_t k = 0; const char* qe = q;
+        const char* q = tk + 4; while (isspace((unsigned char)*q)) q++; char qc = (*q == '"' || *q == '\'') ? *q++ : 0; const char* qe = q;
         while (*qe && (qc ? *qe != qc : *qe != ')')) qe++;
         m->url[0] = 0;
-        if (qe - q > 5 && !strncasecmp(q, "data:", 5)) { char dp[200]; if (!webpage_data_uri_to_file(q, (size_t)(qe - q), dp, sizeof dp)) dp[0] = 0; snprintf(m->url, sizeof m->url, "%s", dp); }
-        else { while (*q && (qc ? *q != qc : *q != ')') && k < 190) m->url[k++] = *q++; m->url[k] = 0; }
-        if (m->url[0]) { m->kind = MK_IMAGE; if (strncmp(m->url, "cache/data_", 11) != 0) { char ab[512]; webpage_resolve_url(g_base, m->url, ab, sizeof ab); snprintf(m->url, sizeof m->url, "%s", ab); } }
+        if (qe - q > 5 && !strncasecmp(q, "data:", 5)) {
+            char dp[200];
+            if (!webpage_data_uri_to_file(q, (size_t)(qe - q), dp, sizeof dp) || strlen(dp) >= sizeof m->url) dp[0] = 0;
+            memcpy(m->url, dp, strlen(dp) + 1);
+        } else {
+            size_t url_len = (size_t)(qe - q);
+            if (url_len >= sizeof m->url) m->url[0] = 0;
+            else { memcpy(m->url, q, url_len); m->url[url_len] = 0; }
+        }
+        if (m->url[0]) {
+            if (strncmp(m->url, "cache/data_", 11) != 0) {
+                char ab[8192]; webpage_resolve_url(g_base, m->url, ab, sizeof ab);
+                if (!ab[0] || strlen(ab) >= sizeof m->url) m->url[0] = 0;
+                else memcpy(m->url, ab, strlen(ab) + 1);
+            }
+            if (m->url[0]) m->kind = MK_IMAGE;
+        }
         return;
     }
     if (!lin && !rad) return;
@@ -284,7 +298,9 @@ static void parse_transition_short(Cx* c, NodeStyle* st, const char* v) {
     if (!strncasecmp(v, "none", 4)) { st->tp_prop[0] = 0; st->tp_prop_n = 1; st->tp_dur[0] = 0; st->tp_dur_n = 1; trans_rebuild(st); return; }
     for (int i = 0; i < n; i++) {
         char tk[128]; const char* p = part[i]; int tn = 0; uint64_t pm = AP_ALL_MASK; FxEase e; ease_default(&e); float dur = 0, del = 0, ms;
-        while (tok_next(&p, tk, sizeof tk)) {
+        int token_status;
+        while ((token_status = tok_next_exact(&p, tk, sizeof tk)) != 0) {
+            if (token_status < 0) continue;
             if (fx_time(tk, &ms)) { if (tn == 0) dur = ms; else del = ms; tn++; }
             else if (parse_ease(tk, &e)) {}
             else pm = !strcasecmp(tk, "none") ? 0 : fx_prop_mask(tk, strlen(tk));
@@ -310,6 +326,9 @@ static void parse_animation_list(Cx* c, NodeStyle* st, int prop, const char* v) 
         case P_ANIMATION_DIR: a->dir = !strcasecmp(s, "reverse") ? 1 : !strcasecmp(s, "alternate") ? 2 : !strcasecmp(s, "alternate-reverse") ? 3 : 0; break;
         case P_ANIMATION_FILL: a->fill = !strcasecmp(s, "forwards") ? 1 : !strcasecmp(s, "backwards") ? 2 : !strcasecmp(s, "both") ? 3 : 0; break;
         case P_ANIMATION_PLAY: a->paused = !strcasecmp(s, "paused"); break;
+        case P_ANIMATION_COMPOSITION:
+            a->composition = !strcasecmp(s, "add") ? 1 : !strcasecmp(s, "accumulate") ? 2 : 0;
+            break;
         default: break;
         }
     }
@@ -327,7 +346,10 @@ static void parse_animation_short(Cx* c, NodeStyle* st, const char* v) {
             else if (parse_ease(tk, &e)) a->ease = e;
             else if ((isdigit((unsigned char)tk[0]) || tk[0] == '.') && strtof(tk, NULL) >= 0) a->iter = strtof(tk, NULL);
             else if (!strcasecmp(tk, "none")) {}
-            else if (!named) { snprintf(a->name, sizeof a->name, "%s", tk); named = 1; }
+            else if (!named) {
+                /* Never alias a long animation name to a shorter keyframe name. */
+                if (strlen(tk) < sizeof a->name) { memcpy(a->name, tk, strlen(tk) + 1); named = 1; }
+            }
         }
     }
     st->an_n = (uint8_t)n;

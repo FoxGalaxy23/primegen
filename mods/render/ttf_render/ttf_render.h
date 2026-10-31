@@ -131,6 +131,20 @@ int   ttf_render_string_ex(TTFFont* font, const char* text, uint32_t* buffer, in
                            int font_size, int x, int y, uint32_t color, int style);
 float ttf_text_width_f(TTFFont* font, const char* text, int font_size, int style);
 int   ttf_text_offsets_ex(TTFFont* font, const char* text, int font_size, int style, int* out, int cap);
+/* CSS bidi-aware counterparts. direction: -1=first-strong/default LTR, 0=ltr,
+ * 1=rtl; bidi_override enables unicode-bidi:bidi-override behavior. The offsets
+ * array contains logical caret positions (so offsets[n] can be 0 in RTL); the
+ * function return value is the visual width. */
+int   ttf_render_string_ex_bidi(TTFFont* font, const char* text, uint32_t* buffer, int stride,
+                                int cx0, int cy0, int cx1, int cy1,
+                                int font_size, int x, int y, uint32_t color, int style,
+                                int direction, int bidi_override);
+int   ttf_text_offsets_ex_bidi(TTFFont* font, const char* text, int font_size, int style,
+                               int* out, int cap, int direction, int bidi_override);
+/* Hit-test an x coordinate against logical caret positions. Returns the UTF-8 byte
+ * offset nearest to x, snapped to a stable grapheme boundary when possible. */
+int   ttf_text_hit_test_ex_bidi(TTFFont* font, const char* text, int font_size, int style,
+                                float x, int direction, int bidi_override, size_t* out_byte_offset);
 
 /* Собран ли рендерер с поддержкой WOFF1 (нужен zlib). */
 int ttf_supports_woff(void);

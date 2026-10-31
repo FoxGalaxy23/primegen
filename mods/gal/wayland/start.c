@@ -155,6 +155,11 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32
         last_event.key_char = 0;
     }
     last_event.key_code = (int)utf32;
+    last_event.modifiers = 0;
+    if (xkb_state_mod_name_is_active(xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE)) last_event.modifiers |= GAL_MOD_CTRL;
+    if (xkb_state_mod_name_is_active(xkb_state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE)) last_event.modifiers |= GAL_MOD_SHIFT;
+    if (xkb_state_mod_name_is_active(xkb_state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE)) last_event.modifiers |= GAL_MOD_ALT;
+    if (xkb_state_mod_name_is_active(xkb_state, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE)) last_event.modifiers |= GAL_MOD_SUPER;
     has_event = 1;
 }
 
@@ -345,5 +350,26 @@ void gal_close(void) {
     xkb_context_unref(xkb_ctx);
 }
 
-void gal_set_clipboard(const char* text) { (void)text; } // TODO: Implement Wayland clipboard
-char* gal_get_clipboard(void) { return NULL; }
+void gal_set_clipboard(const char* text) {
+    if (!text) text = "";
+    const char* commands[] = {"wl-copy 2>/dev/null", "xclip -selection clipboard 2>/dev/null", "xsel --clipboard --input 2>/dev/null"};
+    for (size_t i = 0; i < sizeof commands / sizeof commands[0]; i++) {
+        char check[160]; snprintf(check, sizeof check, "command -v %s >/dev/null 2>&1", i == 0 ? "wl-copy" : i == 1 ? "xclip" : "xsel");
+        if (system(check) != 0) continue;
+        FILE* fp = popen(commands[i], "w"); if (!fp) continue;
+        size_t n = strlen(text), done = fwrite(text, 1, n, fp); int rc = pclose(fp);
+        if (done == n && rc == 0) return;
+    }
+}
+char* gal_get_clipboard(void) {
+    const char* commands[] = {"wl-paste --no-newline 2>/dev/null", "xclip -selection clipboard -o 2>/dev/null", "xsel --clipboard --output 2>/dev/null"};
+    for (size_t i = 0; i < sizeof commands / sizeof commands[0]; i++) {
+        char check[160]; snprintf(check, sizeof check, "command -v %s >/dev/null 2>&1", i == 0 ? "wl-paste" : i == 1 ? "xclip" : "xsel");
+        if (system(check) != 0) continue;
+        FILE* fp = popen(commands[i], "r"); if (!fp) continue;
+        size_t cap = 4096, n = 0; char* out = malloc(cap); if (!out) { pclose(fp); return NULL; }
+        int c; while ((c = fgetc(fp)) != EOF && n < 1024 * 1024) { if (n + 2 > cap) { cap *= 2; char* q = realloc(out, cap); if (!q) { free(out); out = NULL; break; } out = q; } out[n++] = (char)c; }
+        int rc = pclose(fp); if (out && rc == 0) { out[n] = 0; return out; } free(out);
+    }
+    return NULL;
+}

@@ -1,36 +1,113 @@
 #include "worker.h"
+#ifdef _WIN32
+#include <string.h>
+int worker_start(const char* script_url, WorkerConn* out) { (void)script_url; if (out) memset(out, 0, sizeof *out); return 0; }
+int worker_poll(WorkerConn* c, char* type, unsigned char** data, size_t* len) { (void)c; if (type) *type = 'X'; if (data) *data = NULL; if (len) *len = 0; return 0; }
+int worker_post(WorkerConn* c, const unsigned char* data, size_t len) { (void)c; (void)data; (void)len; return 0; }
+void worker_terminate(WorkerConn* c) { if (c) memset(c, 0, sizeof *c); }
+#else
 #include "webpage.h"
 #include "quickjs.h"
 #include "nal.h"
 #include "gal.h"
+#include "security_sandbox.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
+#include <stdint.h>
 #include <sys/wait.h>
 #include <sys/select.h>
+#ifdef HAVE_OPENSSL_VAULT
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
+#endif
 #if __has_include(<sqlite3.h>)
 #include <sqlite3.h>
 #define WORKER_HAS_SQLITE 1
 #endif
 
 /* Протокол по внутренним пайпам — как в ws.c: 1 байт type + 4 байта BE length + payload. */
-static void emit(int fd, char type, const void* payload, uint32_t len) {
+#define WORKER_MAX_MESSAGE (64u * 1024u * 1024u)
+static int write_all(int fd, const void* data, size_t len) {
+    const unsigned char* p = (const unsigned char*)data;
+    while (len) { ssize_t n = write(fd, p, len); if (n < 0 && errno == EINTR) continue; if (n <= 0) return 0; p += (size_t)n; len -= (size_t)n; }
+    return 1;
+}
+static int read_all(int fd, void* data, size_t len) {
+    unsigned char* p = (unsigned char*)data;
+    while (len) { ssize_t n = read(fd, p, len); if (n < 0 && errno == EINTR) continue; if (n <= 0) return 0; p += (size_t)n; len -= (size_t)n; }
+    return 1;
+}
+static int emit(int fd, char type, const void* payload, uint32_t len) {
+    if (len > WORKER_MAX_MESSAGE) return 0;
     unsigned char h[5]; h[0] = (unsigned char)type; h[1] = (unsigned char)(len >> 24); h[2] = (unsigned char)(len >> 16); h[3] = (unsigned char)(len >> 8); h[4] = (unsigned char)len;
-    write(fd, h, 5); if (len && payload) write(fd, payload, len);
+    return write_all(fd, h, sizeof h) && (!len || (payload && write_all(fd, payload, len)));
 }
 
 static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6; }
 
 static int g_out_fd;                                                /* дочерний -> родитель, видно нативным функциям воркера */
 
+typedef struct { JSValue* items; int count; } WorkerTransferList;
+static void worker_transfer_free(JSContext* c, WorkerTransferList* list) {
+    if (!list) return;
+    for (int i = 0; i < list->count; i++) JS_FreeValue(c, list->items[i]);
+    free(list->items); list->items = NULL; list->count = 0;
+}
+static int worker_transfer_collect(JSContext* c, JSValueConst arg, WorkerTransferList* out) {
+    memset(out, 0, sizeof *out);
+    if (JS_IsUndefined(arg) || JS_IsNull(arg)) return 1;
+    if (!JS_IsArray(c, arg)) { JS_ThrowTypeError(c, "DataCloneError: transfer must be an array"); return 0; }
+    JSValue lv = JS_GetPropertyStr(c, arg, "length"); uint32_t count = 0;
+    if (JS_IsException(lv) || JS_ToUint32(c, &count, lv) < 0) { JS_FreeValue(c, lv); return 0; }
+    JS_FreeValue(c, lv);
+    if (count > 1024) { JS_ThrowRangeError(c, "DataCloneError: too many transferable objects"); return 0; }
+    if (!count) return 1;
+    out->items = calloc(count, sizeof(JSValue));
+    if (!out->items) { JS_ThrowOutOfMemory(c); return 0; }
+    for (uint32_t i = 0; i < count; i++) {
+        JSValue item = JS_GetPropertyUint32(c, arg, i);
+        if (JS_IsException(item)) { worker_transfer_free(c, out); return 0; }
+        size_t byte_len = 0; uint8_t* data = JS_GetArrayBuffer(c, &byte_len, item);
+        if (!data) {
+            JSValue exc = JS_GetException(c); JS_FreeValue(c, exc); JS_FreeValue(c, item);
+            worker_transfer_free(c, out);
+            JS_ThrowTypeError(c, "DataCloneError: only attached ArrayBuffer objects are transferable"); return 0;
+        }
+        for (int j = 0; j < out->count; j++) {
+            if (JS_StrictEq(c, out->items[j], item)) {
+                JS_FreeValue(c, item); worker_transfer_free(c, out);
+                JS_ThrowTypeError(c, "DataCloneError: duplicate transferable object"); return 0;
+            }
+        }
+        out->items[out->count++] = item;
+    }
+    return 1;
+}
 static JSValue w_post(JSContext* c, JSValueConst t, int argc, JSValueConst* argv) {
-    (void)t; if (argc < 1) return JS_UNDEFINED;
-    const char* s = JS_ToCString(c, argv[0]); if (s) { emit(g_out_fd, 'M', s, (uint32_t)strlen(s)); JS_FreeCString(c, s); }
+    (void)t;
+    JSValueConst value = argc > 0 ? argv[0] : JS_UNDEFINED;
+    JSValueConst transfer_arg = argc > 1 ? argv[1] : JS_UNDEFINED;
+    WorkerTransferList transfer;
+    if (!worker_transfer_collect(c, transfer_arg, &transfer)) return JS_EXCEPTION;
+    size_t len = 0; uint8_t* bytes = JS_WriteObject(c, &len, value, JS_WRITE_OBJ_REFERENCE);
+    if (!bytes) { worker_transfer_free(c, &transfer); return JS_EXCEPTION; }
+    if (len > WORKER_MAX_MESSAGE) {
+        js_free(c, bytes); worker_transfer_free(c, &transfer);
+        return JS_ThrowRangeError(c, "DataCloneError: worker message exceeds 64 MiB");
+    }
+    int ok = emit(g_out_fd, 'M', bytes, (uint32_t)len);
+    js_free(c, bytes);
+    if (!ok) { worker_transfer_free(c, &transfer); return JS_ThrowTypeError(c, "Worker message transport failed"); }
+    for (int i = 0; i < transfer.count; i++) JS_DetachArrayBuffer(c, transfer.items[i]);
+    worker_transfer_free(c, &transfer);
     return JS_UNDEFINED;
 }
 static JSValue w_log(JSContext* c, JSValueConst t, int argc, JSValueConst* argv) {
@@ -44,12 +121,53 @@ static JSValue w_error(JSContext* c, JSValueConst t, int argc, JSValueConst* arg
     return JS_UNDEFINED;
 }
 static JSValue w_now(JSContext* c, JSValueConst t, int argc, JSValueConst* argv) { (void)t; (void)argc; (void)argv; return JS_NewFloat64(c, now_ms()); }
+static JSValue w_crypto_random(JSContext* c, JSValueConst t, int argc, JSValueConst* argv) {
+    (void)t;
+#ifdef HAVE_OPENSSL_VAULT
+    if (argc < 3) return JS_ThrowTypeError(c, "crypto random expects an ArrayBuffer, offset and length");
+    size_t total = 0; uint8_t* data = JS_GetArrayBuffer(c, &total, argv[0]);
+    if (!data) return JS_EXCEPTION;
+    uint64_t off = 0, len = 0;
+    if (JS_ToIndex(c, &off, argv[1]) < 0 || JS_ToIndex(c, &len, argv[2]) < 0) return JS_EXCEPTION;
+    if (off > total || len > (uint64_t)total - off) return JS_ThrowRangeError(c, "crypto random byte range is outside the buffer");
+    if (len > 65536) return JS_ThrowRangeError(c, "getRandomValues may request at most 65536 bytes");
+    if (len && RAND_bytes(data + (size_t)off, (int)len) != 1) return JS_ThrowTypeError(c, "system cryptographic random generator failed");
+    return JS_UNDEFINED;
+#else
+    (void)argc; (void)argv; return JS_ThrowTypeError(c, "Web Crypto requires an OpenSSL-enabled build");
+#endif
+}
+static JSValue w_crypto_digest(JSContext* c, JSValueConst t, int argc, JSValueConst* argv) {
+    (void)t;
+#ifdef HAVE_OPENSSL_VAULT
+    if (argc < 4) return JS_ThrowTypeError(c, "crypto digest expects algorithm, ArrayBuffer, offset and length");
+    const char* raw = JS_ToCString(c, argv[0]); if (!raw) return JS_EXCEPTION;
+    char name[32]; size_t nl = strlen(raw);
+    if (!nl || nl >= sizeof name) { JS_FreeCString(c, raw); return JS_ThrowRangeError(c, "unsupported digest algorithm name"); }
+    for (size_t i = 0; i <= nl; i++) name[i] = (char)toupper((unsigned char)raw[i]);
+    JS_FreeCString(c, raw);
+    if (strcmp(name, "SHA-1") && strcmp(name, "SHA-256") && strcmp(name, "SHA-384") && strcmp(name, "SHA-512"))
+        return JS_ThrowTypeError(c, "unsupported Web Crypto digest algorithm");
+    const EVP_MD* md = EVP_get_digestbyname(name); if (!md) return JS_ThrowTypeError(c, "requested digest unavailable");
+    size_t total = 0; uint8_t* data = JS_GetArrayBuffer(c, &total, argv[1]); if (!data) return JS_EXCEPTION;
+    uint64_t off = 0, len = 0;
+    if (JS_ToIndex(c, &off, argv[2]) < 0 || JS_ToIndex(c, &len, argv[3]) < 0) return JS_EXCEPTION;
+    if (off > total || len > (uint64_t)total - off) return JS_ThrowRangeError(c, "digest byte range is outside the buffer");
+    if (len > 64u * 1024u * 1024u) return JS_ThrowRangeError(c, "digest input exceeds the 64 MiB implementation limit");
+    unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int digest_len = 0; static const unsigned char empty = 0;
+    const void* input = len ? (const void*)(data + (size_t)off) : (const void*)&empty;
+    if (EVP_Digest(input, (size_t)len, digest, &digest_len, md, NULL) != 1) return JS_ThrowTypeError(c, "digest calculation failed");
+    JSValue out = JS_NewArrayBufferCopy(c, digest, digest_len); OPENSSL_cleanse(digest, sizeof digest); return out;
+#else
+    (void)argc; (void)argv; return JS_ThrowTypeError(c, "crypto.subtle.digest requires an OpenSSL-enabled build");
+#endif
+}
 static JSValue w_close(JSContext* c, JSValueConst t, int argc, JSValueConst* argv) { (void)c; (void)t; (void)argc; (void)argv; emit(g_out_fd, 'X', NULL, 0); _exit(0); }
 /* Синхронный fetch внутри воркера — блокировать можно, это отдельный процесс, на интерфейс браузера это не влияет. */
 static JSValue w_fetch_sync(JSContext* c, JSValueConst t, int argc, JSValueConst* argv) {
     (void)t; if (argc < 1) return JS_NULL;
     const char* url = JS_ToCString(c, argv[0]); if (!url) return JS_NULL;
-    char* body = webpage_mixed_blocked(url) ? NULL : nal_http_get(url); JS_FreeCString(c, url);
+    char* body = (webpage_mixed_blocked(url) || !nal_security_allows(url, NAL_RESOURCE_CONNECT)) ? NULL : nal_http_get_kind(url, NAL_RESOURCE_CONNECT); JS_FreeCString(c, url);
     if (!body) return JS_NULL;
     JSValue r = JS_NewString(c, body); free(body); return r;
 }
@@ -144,10 +262,12 @@ static const char* WORKER_BOOTSTRAP =
 "self.removeEventListener = function(t,f){ var a = self.__listeners[t]; if (!a) return; var i = a.indexOf(f); if (i >= 0) a.splice(i, 1); };\n"
 "self.__dispatch = function(t,ev){ if (typeof self['on'+t] === 'function') { try { self['on'+t](ev); } catch (e) { __nativeError(String(e && e.stack || e)); } }\n"
 "  var a = self.__listeners[t]; if (a) for (var i = 0; i < a.length; i++) { try { a[i](ev); } catch (e) { __nativeError(String(e && e.stack || e)); } } };\n"
-"self.postMessage = function(d){ __nativePost(JSON.stringify(d === undefined ? null : d)); };\n"
+"self.postMessage = function(d,o){var tr=Array.isArray(o)?o:(o&&o.transfer)||[];__nativePost(d,tr);};\n"
 "self.close = function(){ __nativeClose(); };\n"
 "self.importScripts = function(){ for(var i=0;i<arguments.length;i++){var u=__swResolve(arguments[i]);var src=__nativeFetchSync(u);if(src===null)throw new Error('Failed to import script: '+u);(0,eval)(src);} };\n"
 "self.location = { href: __workerScriptURL, toString: function(){ return this.href; } }; self.location.origin = (function(){ var m = /^([a-z]+:\\/\\/[^/]+)/i.exec(self.location.href); return m ? m[1] : 'null'; })();\n"
+"self.isSecureContext = /^https:\\/\\//i.test(self.location.href) || /^file:/i.test(self.location.href) || /^http:\\/\\/(localhost|127(?:\\.\\d+){3})(:\\d+)?(?:\\/|$)/i.test(self.location.href);\n"
+"self.crypto = { getRandomValues: function(a){if(!ArrayBuffer.isView(a)||a instanceof DataView||a instanceof Float32Array||a instanceof Float64Array)throw new TypeError('getRandomValues requires an integer TypedArray');if(a.byteLength>65536)throw new RangeError('getRandomValues exceeds 65536 bytes');__nativeCryptoRandom(a.buffer,a.byteOffset,a.byteLength);return a;}, randomUUID: function(){var b=new Uint8Array(16);__nativeCryptoRandom(b.buffer,0,16);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;var h='';for(var i=0;i<16;i++){if(i===4||i===6||i===8||i===10)h+='-';h+=('0'+b[i].toString(16)).slice(-2);}return h;}, subtle: { digest: function(algorithm,data){return Promise.resolve().then(function(){if(!self.isSecureContext)throw new TypeError('crypto.subtle requires a secure context');var name=typeof algorithm==='string'?algorithm:algorithm&&algorithm.name;var buffer,offset=0,length;if(data instanceof ArrayBuffer){buffer=data;length=data.byteLength;}else if(ArrayBuffer.isView(data)){buffer=data.buffer;offset=data.byteOffset;length=data.byteLength;}else throw new TypeError('digest data must be an ArrayBuffer or view');if(!name)throw new TypeError('digest algorithm name is required');return __nativeCryptoDigest(String(name),buffer,offset,length);});} } };\n"
 "function __swResolve(u){u=String(u);if(/^[a-z][a-z0-9+.-]*:/i.test(u))return u;if(u.slice(0,2)==='//')return self.location.href.slice(0,self.location.href.indexOf(':')+1)+u;var path;if(u.charAt(0)==='/')path=u;else{var base=self.location.href.split(/[?#]/)[0];base=base.slice(0,base.lastIndexOf('/')+1);path=base.slice(self.location.origin.length)+u;}var suffix='',q=path.search(/[?#]/);if(q>=0){suffix=path.slice(q);path=path.slice(0,q);}var parts=path.split('/'),out=[];for(var j=0;j<parts.length;j++){if(!parts[j]||parts[j]==='.')continue;if(parts[j]==='..')out.pop();else out.push(parts[j]);}return self.location.origin+'/'+out.join('/')+suffix;}\n"
 "self.Headers = function(init){ this.__h = Object.create(null); if (init && typeof init === 'object') { if(init instanceof self.Headers)init=init.__h; var ks = Object.keys(init); for (var i=0;i<ks.length;i++) this.set(ks[i],init[ks[i]]); } }; self.Headers.prototype.set=function(k,v){this.__h[String(k).toLowerCase()]=String(v);}; self.Headers.prototype.get=function(k){var v=this.__h[String(k).toLowerCase()];return v===undefined?null:v;}; self.Headers.prototype.has=function(k){return this.get(k)!==null;}; self.Headers.prototype.delete=function(k){delete this.__h[String(k).toLowerCase()];}; self.Headers.prototype.entries=function(){return Object.keys(this.__h).map(function(k){return [k,this.__h[k]];},this);}; self.Headers.prototype.forEach=function(cb,thisArg){var h=this;Object.keys(this.__h).forEach(function(k){cb.call(thisArg,h.__h[k],k,h);});};\n"
 "self.Response = function(body,init){init=init||{};this.__body=body==null?'':String(body);this.status=init.status===undefined?200:+init.status;this.statusText=init.statusText||'OK';this.ok=this.status>=200&&this.status<300;this.url=init.url||'';this.headers=init.headers instanceof self.Headers?init.headers:new self.Headers(init.headers);this.bodyUsed=false;}; self.Response.prototype.text=function(){if(this.bodyUsed)return Promise.reject(new TypeError('Body is unusable'));this.bodyUsed=true;return Promise.resolve(this.__body);}; self.Response.prototype.json=function(){return this.text().then(JSON.parse);}; self.Response.prototype.clone=function(){if(this.bodyUsed)throw new TypeError('Body is unusable');return new self.Response(this.__body,{status:this.status,statusText:this.statusText,url:this.url,headers:this.headers.__h});}; self.Response.error=function(){return new self.Response('',{status:0,statusText:'error'});}; self.Response.redirect=function(u,s){return new self.Response('',{status:s||302,headers:{location:String(u)}});};\n"
@@ -156,7 +276,7 @@ static const char* WORKER_BOOTSTRAP =
 "function __swKey(r){return __swResolve(typeof r==='string'?r:(r&&r.url)||String(r));} function __swResponse(o){return new self.Response(o.body,{status:o.status||200,statusText:o.statusText||'OK',url:o.url||'',headers:o.headers||{}});} function __swScope(){return self.registration.scope;} function __swProfile(){return String(self.__mlProfileId||0);} function __swParse(s,fallback){try{return JSON.parse(s);}catch(e){return fallback;}}\n"
 "function __swCache(name){name=String(name);var scope=__swScope(),profile=__swProfile();return {put:function(req,res){var k=__swKey(req);return Promise.resolve(res&&res.clone?res.clone():res).then(function(r){if(!r||typeof r.text!=='function')throw new TypeError('Cache.put requires a Response');return r.text().then(function(body){var hs={};if(r.headers&&r.headers.entries)r.headers.entries().forEach(function(p){hs[p[0]]=p[1];});var entry={body:body,status:r.status||200,statusText:r.statusText||'OK',headers:hs,url:r.url||k};if(!__nativeCacheSet(scope,name,k,JSON.stringify(entry),profile))throw new Error('CacheStorage write failed');});});},match:function(req){var x=__nativeCacheGet(scope,name,__swKey(req),profile);if(x===null)return Promise.resolve(undefined);var o=__swParse(x,null);return Promise.resolve(o?__swResponse(o):undefined);},delete:function(req){return Promise.resolve(!!__nativeCacheRemove(scope,name,__swKey(req),profile));},keys:function(req){var list=__swParse(__nativeCacheKeys(scope,name,profile),[]);if(req===undefined)return Promise.resolve(list.map(function(k){return new self.Request(k);}));var key=__swKey(req);return Promise.resolve(list.indexOf(key)>=0?[new self.Request(key)]:[]);},add:function(req){var k=__swKey(req);return self.fetch(k).then(function(r){if(!r.ok)throw new TypeError('Request failed');return this.put(k,r);}.bind(this));},addAll:function(reqs){var cache=this;return Promise.all(Array.prototype.map.call(reqs,function(r){return cache.add(r);})).then(function(){return undefined;});}};}\n"
 "self.caches = {open:function(n){var name=String(n);if(!__nativeCacheOpen(self.registration.scope,name,__swProfile()))return Promise.reject(new Error('CacheStorage unavailable'));return Promise.resolve(__swCache(name));},has:function(n){return Promise.resolve(__swParse(__nativeCacheNames(self.registration.scope,__swProfile()),[]).indexOf(String(n))>=0);},delete:function(n){return Promise.resolve(!!__nativeCacheDelete(self.registration.scope,String(n),__swProfile()));},keys:function(){return Promise.resolve(__swParse(__nativeCacheNames(self.registration.scope,__swProfile()),[]));},match:function(req){var ks=__swParse(__nativeCacheNames(self.registration.scope,__swProfile()),[]);return ks.reduce(function(p,k){return p.then(function(v){return v!==undefined?v:__swCache(k).match(req);});},Promise.resolve(undefined));}}; self.skipWaiting=function(){return Promise.resolve();}; self.clients={claim:function(){return Promise.resolve();},matchAll:function(){return Promise.resolve([]);},get:function(){return Promise.resolve(undefined);},openWindow:function(){return Promise.resolve(null);}}; self.registration={scope:self.location.origin+'/',active:self,waiting:null,installing:null,update:function(){return Promise.resolve(self.registration);},unregister:function(){return Promise.resolve(false);}};\n"
-"self.__dispatchSW = function(d){var type=String(d.__ml_sw_event||''),waits=[],hasResponse=false,responsePromise=null;var ev={type:type,waitUntil:function(p){waits.push(Promise.resolve(p));},respondWith:function(p){if(hasResponse)throw new TypeError('respondWith called more than once');hasResponse=true;responsePromise=Promise.resolve(p);}};if(type==='fetch'){ev.request=new self.Request(d.request||d.url||'',d.request||{});ev.clientId=d.clientId||'';ev.resultingClientId=d.resultingClientId||'';ev.preloadResponse=Promise.resolve(undefined);}if(d.__ml_sw_scope)self.registration.scope=String(d.__ml_sw_scope);if(d.__ml_sw_profile!==undefined)self.__mlProfileId=d.__ml_sw_profile;self.__dispatch(type,ev);if(type==='fetch'){if(!hasResponse){__nativePost(JSON.stringify({__ml_sw_reply:d.id,fallback:true}));return;}responsePromise.then(function(r){if(typeof r==='string')r=new self.Response(r);if(!r||typeof r.text!=='function')throw new TypeError('respondWith must receive a Response or promise');return r.clone?r.clone().text().then(function(body){var hs={};if(r.headers&&r.headers.entries)r.headers.entries().forEach(function(p){hs[p[0]]=p[1];});return {body:body,status:r.status||200,statusText:r.statusText||'OK',headers:hs,url:r.url||''};}):r.text().then(function(body){return {body:body,status:r.status||200,statusText:r.statusText||'OK',headers:{},url:r.url||''};});}).then(function(r){__nativePost(JSON.stringify({__ml_sw_reply:d.id,fallback:false,response:r}));},function(e){__nativePost(JSON.stringify({__ml_sw_reply:d.id,fallback:false,error:String(e&&e.message||e)}));});}else{Promise.all(waits).then(function(){__nativePost(JSON.stringify({__ml_sw_lifecycle:type,ok:true}));},function(e){__nativePost(JSON.stringify({__ml_sw_lifecycle:type,ok:false,error:String(e&&e.message||e)}));});}};\n"
+"self.__dispatchSW = function(d){var type=String(d.__ml_sw_event||''),waits=[],hasResponse=false,responsePromise=null;var ev={type:type,waitUntil:function(p){waits.push(Promise.resolve(p));},respondWith:function(p){if(hasResponse)throw new TypeError('respondWith called more than once');hasResponse=true;responsePromise=Promise.resolve(p);}};if(type==='fetch'){ev.request=new self.Request(d.request||d.url||'',d.request||{});ev.clientId=d.clientId||'';ev.resultingClientId=d.resultingClientId||'';ev.preloadResponse=Promise.resolve(undefined);}if(d.__ml_sw_scope)self.registration.scope=String(d.__ml_sw_scope);if(d.__ml_sw_profile!==undefined)self.__mlProfileId=d.__ml_sw_profile;self.__dispatch(type,ev);if(type==='fetch'){if(!hasResponse){__nativePost({__ml_sw_reply:d.id,fallback:true});return;}responsePromise.then(function(r){if(typeof r==='string')r=new self.Response(r);if(!r||typeof r.text!=='function')throw new TypeError('respondWith must receive a Response or promise');return r.clone?r.clone().text().then(function(body){var hs={};if(r.headers&&r.headers.entries)r.headers.entries().forEach(function(p){hs[p[0]]=p[1];});return {body:body,status:r.status||200,statusText:r.statusText||'OK',headers:hs,url:r.url||''};}):r.text().then(function(body){return {body:body,status:r.status||200,statusText:r.statusText||'OK',headers:{},url:r.url||''};});}).then(function(r){__nativePost({__ml_sw_reply:d.id,fallback:false,response:r});},function(e){__nativePost({__ml_sw_reply:d.id,fallback:false,error:String(e&&e.message||e)});});}else{Promise.all(waits).then(function(){__nativePost({__ml_sw_lifecycle:type,ok:true});},function(e){__nativePost({__ml_sw_lifecycle:type,ok:false,error:String(e&&e.message||e)});});}};\n"
 "self.console = { log: function(){ __nativeLog(Array.prototype.slice.call(arguments).map(String).join(' ')); }, warn: function(){ self.console.log.apply(null, arguments); }, error: function(){ self.console.log.apply(null, arguments); }, info: function(){ self.console.log.apply(null, arguments); } };\n"
 "var __timers = [], __nextTimerId = 1;\n"
 "self.setTimeout = function(f, ms){ var id = __nextTimerId++; __timers.push({ id: id, fn: f, due: __nativeNow() + (ms || 0), interval: 0 }); return id; };\n"
@@ -182,9 +302,9 @@ static void worker_run_tick(JSContext* ctx) {
     if (JS_IsException(r)) { JSValue exc = JS_GetException(ctx); const char* s = JS_ToCString(ctx, exc); if (s) { emit(g_out_fd, 'E', s, (uint32_t)strlen(s)); JS_FreeCString(ctx, s); } JS_FreeValue(ctx, exc); }
     JS_FreeValue(ctx, r); JS_FreeValue(ctx, fn); JS_FreeValue(ctx, g);
 }
-static void worker_dispatch_message(JSContext* ctx, const char* json) {
-    JSValue val = JS_ParseJSON(ctx, json, strlen(json), "<message>");
-    if (JS_IsException(val)) { JS_FreeValue(ctx, val); val = JS_NULL; }
+static void worker_dispatch_message(JSContext* ctx, const uint8_t* bytes, size_t len) {
+    JSValue val = JS_ReadObject(ctx, bytes, len, JS_READ_OBJ_REFERENCE);
+    if (JS_IsException(val)) { JSValue exc = JS_GetException(ctx); const char* s = JS_ToCString(ctx, exc); if (s) { emit(g_out_fd, 'E', s, (uint32_t)strlen(s)); JS_FreeCString(ctx, s); } JS_FreeValue(ctx, exc); return; }
     JSValue sw_event = JS_IsObject(val) ? JS_GetPropertyStr(ctx, val, "__ml_sw_event") : JS_UNDEFINED;
     JSValue g = JS_GetGlobalObject(ctx); JSValue fn; JSValue r;
     if (!JS_IsUndefined(sw_event) && !JS_IsNull(sw_event)) {
@@ -201,14 +321,19 @@ static void worker_dispatch_message(JSContext* ctx, const char* json) {
     JS_FreeValue(ctx, r); JS_FreeValue(ctx, fn); JS_FreeValue(ctx, sw_event); JS_FreeValue(ctx, val); JS_FreeValue(ctx, g);
 }
 static void child_main(const char* script_url, int out_fd, int in_fd) {
+    int sandbox = mlb_sandbox_apply();
+    if ((sandbox & MLB_SANDBOX_SECCOMP) == 0 || (sandbox & MLB_SANDBOX_ERROR)) {
+        const char msg[] = "Linux worker sandbox could not be established";
+        emit(out_fd, 'E', msg, (uint32_t)(sizeof msg - 1)); _exit(126);
+    }
     g_out_fd = out_fd;
-    char* src = webpage_mixed_blocked(script_url) ? NULL : nal_http_get(script_url);
+    char* src = (webpage_mixed_blocked(script_url) || !nal_security_allows(script_url, NAL_RESOURCE_WORKER)) ? NULL : nal_http_get_kind(script_url, NAL_RESOURCE_WORKER);
     if (!src) { emit(out_fd, 'E', "worker: failed to load script", 30); _exit(0); }
 
     JSRuntime* rt = JS_NewRuntime(); JSContext* ctx = JS_NewContext(rt);
     JSValue g = JS_GetGlobalObject(ctx);
 #define WFN(name, fn, n) JS_SetPropertyStr(ctx, g, name, JS_NewCFunction(ctx, fn, name, n))
-    WFN("__nativePost", w_post, 1); WFN("__nativeLog", w_log, 1); WFN("__nativeError", w_error, 1); WFN("__nativeNow", w_now, 0); WFN("__nativeClose", w_close, 0); WFN("__nativeFetchSync", w_fetch_sync, 1); WFN("__nativeCacheOpen", w_cache_open, 3); WFN("__nativeCacheGet", w_cache_get, 4); WFN("__nativeCacheSet", w_cache_set, 5); WFN("__nativeCacheRemove", w_cache_remove, 4); WFN("__nativeCacheDelete", w_cache_delete, 3); WFN("__nativeCacheNames", w_cache_names, 2); WFN("__nativeCacheKeys", w_cache_keys, 3);
+    WFN("__nativePost", w_post, 1); WFN("__nativeLog", w_log, 1); WFN("__nativeError", w_error, 1); WFN("__nativeNow", w_now, 0); WFN("__nativeCryptoRandom", w_crypto_random, 3); WFN("__nativeCryptoDigest", w_crypto_digest, 4); WFN("__nativeClose", w_close, 0); WFN("__nativeFetchSync", w_fetch_sync, 1); WFN("__nativeCacheOpen", w_cache_open, 3); WFN("__nativeCacheGet", w_cache_get, 4); WFN("__nativeCacheSet", w_cache_set, 5); WFN("__nativeCacheRemove", w_cache_remove, 4); WFN("__nativeCacheDelete", w_cache_delete, 3); WFN("__nativeCacheNames", w_cache_names, 2); WFN("__nativeCacheKeys", w_cache_keys, 3);
     JS_SetPropertyStr(ctx, g, "__workerScriptURL", JS_NewString(ctx, script_url));
 #undef WFN
     JS_FreeValue(ctx, g);
@@ -231,12 +356,15 @@ static void child_main(const char* script_url, int out_fd, int in_fd) {
         int sel = select(in_fd + 1, &rf, NULL, NULL, tvp);
         if (sel < 0 && errno != EINTR) break;
         if (sel > 0 && FD_ISSET(in_fd, &rf)) {
-            unsigned char h[5]; ssize_t r = read(in_fd, h, 5);
-            if (r <= 0) break;                                     /* родитель закрыл пайп — завершаемся */
+            unsigned char h[5];
+            if (!read_all(in_fd, h, sizeof h)) break;
             uint32_t len = ((uint32_t)h[1] << 24) | ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 8) | h[4];
-            char* buf = malloc(len + 1); size_t got = 0;
-            while (buf && got < len) { ssize_t rr = read(in_fd, buf + got, len - got); if (rr <= 0) break; got += (size_t)rr; }
-            if (buf) { buf[len] = 0; if (h[0] == 'M') worker_dispatch_message(ctx, buf); else if (h[0] == 'X') { free(buf); break; } free(buf); }
+            if (len > WORKER_MAX_MESSAGE) { const char msg[] = "Worker message exceeds 64 MiB"; emit(out_fd, 'E', msg, (uint32_t)(sizeof msg - 1)); break; }
+            unsigned char* buf = len ? malloc(len) : NULL;
+            if (len && (!buf || !read_all(in_fd, buf, len))) { free(buf); break; }
+            if (h[0] == 'M' && buf) worker_dispatch_message(ctx, buf, len);
+            else if (h[0] == 'X') { free(buf); break; }
+            free(buf);
         }
         worker_run_tick(ctx);
         JSContext* c1; while (JS_ExecutePendingJob(rt, &c1) > 0) {}   /* микрозадачи (Promise) */
@@ -258,21 +386,38 @@ int worker_start(const char* script_url, WorkerConn* out) {
     return 1;
 }
 
-int worker_poll(WorkerConn* c, char* type, char** text) {
+int worker_poll(WorkerConn* c, char* type, unsigned char** data, size_t* len) {
+    if (data) *data = NULL; if (len) *len = 0;
     if (!c->used) return 0;
-    unsigned char h[5]; ssize_t r = read(c->rfd, h, 5);
+    unsigned char h[5]; ssize_t r = read(c->rfd, h, sizeof h);
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
     if (r <= 0) return 0;
-    uint32_t len = ((uint32_t)h[1] << 24) | ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 8) | h[4];
-    char* buf = len ? malloc(len + 1) : NULL; size_t got = 0;
-    while (buf && got < len) { ssize_t rr = read(c->rfd, buf + got, len - got); if (rr <= 0) { if (rr < 0 && errno == EAGAIN) continue; break; } got += (size_t)rr; }
-    if (buf) buf[len] = 0;
-    *type = (char)h[0]; *text = buf;
+    /* A <= PIPE_BUF header is written atomically by emit(). */
+    if ((size_t)r != sizeof h) { if (!read_all(c->rfd, h + r, sizeof h - (size_t)r)) return 0; }
+    uint32_t n = ((uint32_t)h[1] << 24) | ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 8) | h[4];
+    if (n > WORKER_MAX_MESSAGE) { *type = 'E'; const char msg[] = "Worker message exceeds 64 MiB"; unsigned char* out = malloc(sizeof msg); if (out) memcpy(out, msg, sizeof msg); if (data) *data = out; if (len) *len = sizeof msg - 1; return 1; }
+    unsigned char* buf = n ? malloc((size_t)n + (h[0] == 'E' ? 1u : 0u)) : NULL;
+    if (n && !buf) return 0;
+    /* Once an atomic header is consumed, read the whole frame. The child writes the payload
+       with a blocking write loop, so temporarily blocking here avoids losing partial payloads. */
+    int old_flags = fcntl(c->rfd, F_GETFL, 0);
+    if (old_flags >= 0) fcntl(c->rfd, F_SETFL, old_flags & ~O_NONBLOCK);
+    int read_ok = !n || read_all(c->rfd, buf, n);
+    if (old_flags >= 0) fcntl(c->rfd, F_SETFL, old_flags);
+    if (!read_ok) { free(buf); return 0; }
+    if (h[0] == 'E' && buf) buf[n] = 0;
+    *type = (char)h[0]; if (data) *data = buf; else free(buf); if (len) *len = n;
     if (*type == 'X') { close(c->rfd); close(c->wfd); int st; waitpid(c->pid, &st, WNOHANG); c->used = 0; }
     return 1;
 }
-void worker_post(WorkerConn* c, const char* json) { if (c->used) emit(c->wfd, 'M', json, (uint32_t)strlen(json)); }
+int worker_post(WorkerConn* c, const unsigned char* data, size_t len) {
+    if (!c->used || len > WORKER_MAX_MESSAGE || (len && !data)) return 0;
+    return emit(c->wfd, 'M', data, (uint32_t)len);
+}
 void worker_terminate(WorkerConn* c) {
     if (!c->used) return;
     kill(c->pid, SIGKILL); int st; waitpid(c->pid, &st, WNOHANG);
     close(c->rfd); close(c->wfd); c->used = 0;
 }
+
+#endif /* _WIN32 */

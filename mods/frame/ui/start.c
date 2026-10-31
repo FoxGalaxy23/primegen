@@ -192,43 +192,38 @@ int draw_browser_frame(BrowserTab* tabs, int tab_count, int active_idx) {
     last->next = add_node;
     last = add_node;
 
-    // 6. Append dynamic Dropdown Menu if open
+    // 6. Browser tools menu
     if (menu_open) {
-        int hist_items_to_show = global_history_count > 5 ? 5 : global_history_count;
-        int menu_h = 90 + hist_items_to_show * 35;
-        if (menu_h < 90) menu_h = 90;
-        
-        snprintf(style_buf, sizeof(style_buf), 
-                 "position: absolute; left: %d; top: 45; width: 220; height: %d; background-color: #%s;", 
+        const char* labels[] = {
+            "New Incognito Window", "History", "Downloads", "Bookmark / Remove bookmark",
+            "Bookmarks", "Find on page", "Zoom in", "Zoom out", "Reset zoom",
+            "Print / Save PDF", "View source", "Developer tools", "Password manager",
+            "Save current login", "Restore session", "Choose download folder", "Use default download folder",
+            "Local script extensions", "Profile backup / transfer"
+        };
+        const char* commands[] = {
+            "Browser.openIncognito()", "Browser.openHistory()", "Browser.openDownloads()",
+            "Browser.toggleBookmark()", "Browser.openBookmarks()", "Browser.findInPage()",
+            "Browser.zoomIn()", "Browser.zoomOut()", "Browser.zoomReset()", "Browser.printPDF()",
+            "Browser.viewSource()", "Browser.openDevtools()", "Browser.openPasswordManager()",
+            "Browser.saveCurrentPassword()", "Browser.restoreSession()", "Browser.chooseDownloadDirectory()",
+            "Browser.resetDownloadDirectory()", "Browser.openExtensions()", "Browser.openProfileBackup()"
+        };
+        const int item_count = (int)(sizeof(labels)/sizeof(labels[0]));
+        int menu_h = 14 + item_count * 30;
+        snprintf(style_buf, sizeof(style_buf),
+                 "position: absolute; left: %d; top: 45; width: 220; height: %d; background-color: #%s;",
                  SCREEN_WIDTH - 230, menu_h, anonymous_mode ? "1F2937" : "F3F4F6");
         DOMNode* dropdown_bg = create_dom_node(TAG_DIV, "menu-dropdown", "", "", style_buf);
-        last->next = dropdown_bg;
-        last = dropdown_bg;
-
-        // New Incognito Window button
-        char anon_text[32] = "New Incognito Window";
-        snprintf(style_buf, sizeof(style_buf), 
-                 "position: absolute; left: %d; top: 50; width: 210; height: 30; background-color: #374151; color: #FFFFFF;",
-                 SCREEN_WIDTH - 225);
-        DOMNode* anon_node = create_dom_node(TAG_BUTTON, "menu-anon", anon_text, "Browser.openIncognito()", style_buf);
-        last->next = anon_node;
-        last = anon_node;
-
-        // History button
-        snprintf(style_buf, sizeof(style_buf), 
-                 "position: absolute; left: %d; top: 85; width: 210; height: 30; background-color: #374151; color: #FFFFFF;", 
-                 SCREEN_WIDTH - 225);
-        DOMNode* history_node = create_dom_node(TAG_BUTTON, "menu-history", "History", "Browser.openHistory()", style_buf);
-        last->next = history_node;
-        last = history_node;
-
-        // Downloads button
-        snprintf(style_buf, sizeof(style_buf),
-                 "position: absolute; left: %d; top: 120; width: 210; height: 30; background-color: #374151; color: #FFFFFF;",
-                 SCREEN_WIDTH - 225);
-        DOMNode* downloads_node = create_dom_node(TAG_BUTTON, "menu-downloads", "Downloads", "Browser.openDownloads()", style_buf);
-        last->next = downloads_node;
-        last = downloads_node;
+        last->next = dropdown_bg; last = dropdown_bg;
+        for (int mi=0; mi<item_count; mi++) {
+            snprintf(style_buf, sizeof(style_buf),
+                     "position: absolute; left: %d; top: %d; width: 210; height: 27; background-color: #374151; color: #FFFFFF;",
+                     SCREEN_WIDTH - 225, 48 + mi*30);
+            char idbuf[32]; snprintf(idbuf,sizeof idbuf,"menu-item-%d",mi);
+            DOMNode* item = create_dom_node(TAG_BUTTON, idbuf, labels[mi], commands[mi], style_buf);
+            last->next=item; last=item;
+        }
     }
 
     // 7. Render navigation bar DOM tree

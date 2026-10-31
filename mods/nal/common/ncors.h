@@ -15,11 +15,15 @@ typedef struct {
     const unsigned char* body; size_t body_len;
     const char* page_url;                                                    /* страница-инициатор; NULL — доверенный запрос браузера, политика не применяется */
     int credentials, mode;
+    int redirect;                                                           /* 0 follow, 1 manual, 2 error */
     NJar* jar;                                                               /* куки пользователя; используется только если политика разрешает отправку */
     int jar_used;                                                            /* (вывод) куки реально участвовали — вызывающий сохранит изменения */
     int timeout_ms;
+    FILE* sink;
+    NHttpHeadersCallback headers_cb; void* headers_user;
 } NCorsReq;
 
 int ncors_fetch(NCorsReq* r, NHttpResp* out);                                /* 1 — ответ получен и разрешён политикой; 0 — ошибка (out->err) */
 void ncors_origin(const char* url, char* out, size_t cap);                   /* "https://host[:порт]" или "null" */
+int ncors_same_site(const char* a, const char* b);                           /* schemeful same-site по PSL, без учёта порта */
 #endif

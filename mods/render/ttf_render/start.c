@@ -2,6 +2,7 @@
 #include "gal.h"
 #include "woff2.h"
 #include "cff.h"
+#include "shaping.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1004,7 +1005,7 @@ static int is_space_cp(uint32_t cp) {
 }
 
 /* Единый проход для измерения и отрисовки — ширина всегда совпадает с рендером. */
-static float run_text(TTFFont* f, const char* text, size_t nbytes, int size, int style, const DrawCtx* dc, float* marks) {
+static float run_text_legacy(TTFFont* f, const char* text, size_t nbytes, int size, int style, const DrawCtx* dc, float* marks) {
     const uint8_t* p = (const uint8_t*)text;
     const uint8_t* end = p + nbytes;
     float pen = 0.0f;
@@ -1053,11 +1054,173 @@ static float run_text(TTFFont* f, const char* text, size_t nbytes, int size, int
     return pen;
 }
 
+/* Resolve each codepoint through the font fallback chain before shaping.
+ * HarfBuzz still shapes contiguous same-face spans as whole runs, so GSUB/GPOS
+ * and ICU bidi aren't disabled just because one character needs another face. */
+static int shape_resolve_font(void* context, uint32_t cp, TTFShapeFace* out) {
+    TTFFont* base = (TTFFont*)context;
+    int gid = 0;
+    TTFFont* chosen = resolve_glyph(base, cp, &gid);
+    if (!chosen || !out) return 0;
+    out->data = chosen->data;
+    out->data_len = chosen->data_len;
+    out->upem = chosen->units_per_em;
+    out->token = (uintptr_t)chosen;
+    out->covered = gid != 0;
+    return out->data != NULL && out->data_len != 0 && out->upem > 0;
+}
+
+static int shape_cp_ignorable_for_coverage(uint32_t cp) {
+    /* These code points affect shaping/sequence presentation but normally do
+     * not require an independently mapped glyph in the selected font. */
+    return cp == 0x200C || cp == 0x200D || cp == 0x00AD || cp == 0xFEFF ||
+           (cp >= 0x200B && cp <= 0x200F) || (cp >= 0x202A && cp <= 0x202E) ||
+           (cp >= 0x2060 && cp <= 0x206F) || (cp >= 0xFE00 && cp <= 0xFE0F) ||
+           (cp >= 0xE0100 && cp <= 0xE01EF) || (cp >= 0xE0020 && cp <= 0xE007F);
+}
+
+/* Select a single typeface for an entire grapheme. Prefer the font covering
+ * the most required code points; on ties, prefer one covering the first
+ * meaningful/base code point and then the earlier font in the fallback chain.
+ * This avoids splitting a combining sequence or emoji ZWJ sequence across
+ * fonts, which no shaping engine can correctly position as one run. */
+static int shape_resolve_cluster(void* context, const uint32_t* cps, size_t count,
+                                 TTFShapeFace* out) {
+    TTFFont* base = (TTFFont*)context;
+    if (!base || !cps || !count || !out) return 0;
+    size_t anchor = 0;
+    while (anchor < count && shape_cp_ignorable_for_coverage(cps[anchor])) anchor++;
+    if (anchor == count) anchor = 0;
+
+    TTFFont* best = NULL;
+    int64_t best_score = -1;
+    TTFFont* face = base;
+    TTFFont* next = NULL;
+    for (int depth = 0; face && depth < 4; depth++, face = next) {
+        next = face->fallback;
+        if (!face->data || !face->data_len || face->units_per_em <= 0) continue;
+        size_t covered = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (shape_cp_ignorable_for_coverage(cps[i])) continue;
+            if (glyph_index(face, cps[i]) != 0) covered++;
+        }
+        int anchor_covered = !shape_cp_ignorable_for_coverage(cps[anchor]) &&
+                             glyph_index(face, cps[anchor]) != 0;
+        int64_t score = (int64_t)covered * 100 + (anchor_covered ? 25 : 0);
+        if (!best || score > best_score) { best = face; best_score = score; }
+    }
+    if (!best) return 0;
+    int all_covered = 1;
+    for (size_t i = 0; i < count; i++) {
+        if (!shape_cp_ignorable_for_coverage(cps[i]) && glyph_index(best, cps[i]) == 0) {
+            all_covered = 0;
+            break;
+        }
+    }
+    out->data = best->data;
+    out->data_len = best->data_len;
+    out->upem = best->units_per_em;
+    out->token = (uintptr_t)best;
+    out->covered = all_covered;
+    return 1;
+}
+
+/* OpenType shaping path: GSUB/GPOS substitutions/positioning, Unicode bidi,
+ * and fallback fonts. Caret offsets are mapped from visual glyph extents back
+ * to logical UTF-8 cluster boundaries (RTL cluster starts are on the right). */
+typedef struct {
+    uint32_t byte;
+    float left, right;
+    int rtl;
+} ShapeClusterExtent;
+
+static int shape_cluster_byte_compare(const void* a, const void* b) {
+    const ShapeClusterExtent* x=(const ShapeClusterExtent*)a;
+    const ShapeClusterExtent* y=(const ShapeClusterExtent*)b;
+    return x->byte < y->byte ? -1 : x->byte > y->byte ? 1 : 0;
+}
+
+static float run_text(TTFFont* f, const char* text, size_t nbytes, int size, int style, const DrawCtx* dc, float* marks, int base_direction, int bidi_override) {
+    if (!f || !text || !nbytes) return run_text_legacy(f,text,nbytes,size,style,dc,marks);
+    TTFShapedGlyph *glyphs=NULL; size_t count=0;
+    if (!ttf_shape_text_resolved_clusters_bidi(text,nbytes,shape_resolve_font,shape_resolve_cluster,f,base_direction,bidi_override,&glyphs,&count))
+        return run_text_legacy(f,text,nbytes,size,style,dc,marks);
+
+    ShapeClusterExtent* extents = marks ? calloc(count ? count : 1, sizeof(*extents)) : NULL;
+    if (marks && !extents) {
+        ttf_shape_free(glyphs);
+        return run_text_legacy(f,text,nbytes,size,style,dc,marks);
+    }
+    size_t extent_count=0;
+    float pen=0.0f;
+    TTFFont* strike_font=NULL; TTFStrike* strike=NULL;
+    for(size_t i=0;i<count;i++) {
+        TTFShapedGlyph *sg=&glyphs[i];
+        TTFFont* face=sg->font_token ? (TTFFont*)sg->font_token : f;
+        if (!face || face->units_per_em <= 0) face=f;
+        float scale=(float)size/face->units_per_em;
+        float adv=(float)sg->x_advance*scale;
+        float next_pen=pen+adv;
+        if (extents && sg->cluster<=nbytes) {
+            float left=fminf(pen,next_pen), right=fmaxf(pen,next_pen);
+            if (extent_count && extents[extent_count-1].byte==sg->cluster) {
+                if (left<extents[extent_count-1].left) extents[extent_count-1].left=left;
+                if (right>extents[extent_count-1].right) extents[extent_count-1].right=right;
+            } else {
+                extents[extent_count].byte=sg->cluster;
+                extents[extent_count].left=left;
+                extents[extent_count].right=right;
+                extents[extent_count].rtl=sg->rtl!=0;
+                extent_count++;
+            }
+        }
+        if(dc) {
+            float gx=(float)dc->x0+pen+(float)sg->x_offset*scale;
+            int ix=(int)floorf(gx); int sub=(int)((gx-(float)ix)*4.0f+0.5f);
+            if(sub>=4){ix++;sub=0;}
+            if(face!=strike_font) { strike_font=face; strike=get_strike(face,size,style); }
+            if(strike) {
+                const TTFGlyphBmp *bmp=strike_get(face,strike,(int)sg->glyph,sub,scale);
+                if(bmp) blit_glyph(dc,bmp,ix+bmp->left,dc->baseline-(int)floorf((float)sg->y_offset*scale+0.5f)-bmp->top);
+            }
+        }
+        pen=next_pen;
+    }
+    if(marks) {
+        for(size_t i=0;i<=nbytes;i++) marks[i]=NAN;
+        if (extent_count) {
+            qsort(extents,extent_count,sizeof(*extents),shape_cluster_byte_compare);
+            /* Each cluster's logical leading edge is left for LTR and right for
+             * RTL. UTF-8 continuation bytes share the same caret position. */
+            for(size_t i=0;i<extent_count;i++) {
+                size_t begin=extents[i].byte;
+                size_t end=(i+1<extent_count)?extents[i+1].byte:nbytes;
+                if(begin>nbytes) continue;
+                if(end>nbytes) end=nbytes;
+                float leading=extents[i].rtl?extents[i].right:extents[i].left;
+                for(size_t b=begin;b<end;b++) marks[b]=leading;
+                if(i+1==extent_count) marks[nbytes]=extents[i].rtl?extents[i].left:extents[i].right;
+            }
+            /* Empty/leading bytes and any unusual zero-width cluster get a
+             * deterministic nearest-boundary position rather than an uninit. */
+            float last=marks[0];
+            for(size_t b=0;b<=nbytes;b++) {
+                if(isfinite(marks[b])) last=marks[b];
+                else marks[b]=last;
+            }
+        } else marks[nbytes]=pen;
+    }
+    free(extents);
+    ttf_shape_free(glyphs);
+    return pen;
+}
+
 static int valid_size(int s) { return s > 0 && s <= 512; }
 
-int ttf_render_string_ex(TTFFont* font, const char* text, uint32_t* buffer, int stride,
-                         int cx0, int cy0, int cx1, int cy1,
-                         int font_size, int x, int y, uint32_t color, int style) {
+int ttf_render_string_ex_bidi(TTFFont* font, const char* text, uint32_t* buffer, int stride,
+                               int cx0, int cy0, int cx1, int cy1,
+                               int font_size, int x, int y, uint32_t color, int style,
+                               int direction, int bidi_override) {
     if (!font || !text || !buffer || !valid_size(font_size)) return 0;
     if (!g_lut_ready) init_luts();
     float scale = (float)font_size / font->units_per_em;
@@ -1073,8 +1236,14 @@ int ttf_render_string_ex(TTFFont* font, const char* text, uint32_t* buffer, int 
     /* Строка вне области отсечения по вертикали — только меряем, не растеризуем. */
     int margin = font_size * 2;
     int visible = baseline + margin > cy0 && baseline - margin < cy1 && x < cx1;
-    float w = run_text(font, text, strlen(text), font_size, style, visible ? &dc : NULL, NULL);
+    float w = run_text(font, text, strlen(text), font_size, style, visible ? &dc : NULL, NULL, direction < 0 ? -1 : (direction ? 1 : 0), bidi_override != 0);
     return (int)floorf(w + 0.5f);
+}
+
+int ttf_render_string_ex(TTFFont* font, const char* text, uint32_t* buffer, int stride,
+                         int cx0, int cy0, int cx1, int cy1,
+                         int font_size, int x, int y, uint32_t color, int style) {
+    return ttf_render_string_ex_bidi(font,text,buffer,stride,cx0,cy0,cx1,cy1,font_size,x,y,color,style,0,0);
 }
 
 int ttf_render_string(TTFFont* font, const char* text, uint32_t* buffer, int buf_w, int buf_h,
@@ -1084,14 +1253,14 @@ int ttf_render_string(TTFFont* font, const char* text, uint32_t* buffer, int buf
 
 float ttf_text_width_f(TTFFont* font, const char* text, int font_size, int style) {
     if (!font || !text || !valid_size(font_size)) return 0.0f;
-    return run_text(font, text, strlen(text), font_size, style, NULL, NULL);
+    return run_text(font, text, strlen(text), font_size, style, NULL, NULL, -1, 0);
 }
 
 int ttf_text_width_n(TTFFont* font, const char* text, size_t nbytes, int font_size) {
     if (!font || !text || !valid_size(font_size)) return 0;
     size_t n = strlen(text);
     if (nbytes > n) nbytes = n;
-    return (int)floorf(run_text(font, text, nbytes, font_size, 0, NULL, NULL) + 0.5f);
+    return (int)floorf(run_text(font, text, nbytes, font_size, 0, NULL, NULL, -1, 0) + 0.5f);
 }
 
 int ttf_text_width(TTFFont* font, const char* text, int font_size) {
@@ -1109,16 +1278,37 @@ int ttf_font_descent(TTFFont* font, int font_size) {
     return (int)floorf(-font->descent * (float)font_size / font->units_per_em + 0.5f);
 }
 
-int ttf_text_offsets_ex(TTFFont* font, const char* text, int font_size, int style, int* out, int cap) {
+int ttf_text_offsets_ex_bidi(TTFFont* font, const char* text, int font_size, int style, int* out, int cap, int direction, int bidi_override) {
     if (!font || !text || !out || !valid_size(font_size)) return 0;
     size_t n = strlen(text);
     if (cap < 0 || (size_t)cap < n + 1) return 0;
     float* marks = malloc((n + 1) * sizeof(float));
     if (!marks) return 0;
-    run_text(font, text, n, font_size, style, NULL, marks);
+    float total_width = run_text(font, text, n, font_size, style, NULL, marks,
+                                 direction < 0 ? -1 : (direction ? 1 : 0), bidi_override != 0);
     for (size_t i = 0; i <= n; i++) out[i] = (int)floorf(marks[i] + 0.5f);
     free(marks);
-    return out[n];
+    /* For RTL, the logical end caret can be at x=0. Return visual width
+     * separately instead of incorrectly treating out[n] as the width. */
+    return (int)floorf(total_width + 0.5f);
+}
+
+int ttf_text_hit_test_ex_bidi(TTFFont* font, const char* text, int font_size, int style,
+                              float x, int direction, int bidi_override, size_t* out_byte_offset) {
+    if (!font || !text || !out_byte_offset || !valid_size(font_size) || !isfinite(x)) return 0;
+    size_t n = strlen(text);
+    if (n > (size_t)INT_MAX - 1) return 0;
+    int* offsets = malloc((n + 1) * sizeof(*offsets));
+    if (!offsets) return 0;
+    int width = ttf_text_offsets_ex_bidi(font, text, font_size, style, offsets, (int)n + 1,
+                                         direction, bidi_override);
+    int ok = width >= 0 && ttf_hit_test_byte_offset(text, n, offsets, n + 1, x, out_byte_offset);
+    free(offsets);
+    return ok;
+}
+
+int ttf_text_offsets_ex(TTFFont* font, const char* text, int font_size, int style, int* out, int cap) {
+    return ttf_text_offsets_ex_bidi(font,text,font_size,style,out,cap,0,0);
 }
 
 int ttf_text_offsets(TTFFont* font, const char* text, int font_size, int* out, int cap) {

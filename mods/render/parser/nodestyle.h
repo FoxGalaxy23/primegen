@@ -3,13 +3,13 @@
 #include <stdint.h>
 
 /* Значение длины: px + pct% + vw + vh (хватает для calc() вида «100% - 20px»). set=0 -> auto/none */
-typedef struct { float px, pct, vw, vh; uint8_t set; } Len;
+typedef struct { float px, pct, vw, vh, svw, svh, dvw, dvh, lh; uint8_t set; } Len;
 
 enum { DSP_NONE, DSP_INLINE, DSP_BLOCK, DSP_INLINE_BLOCK, DSP_FLEX, DSP_INLINE_FLEX, DSP_LIST_ITEM,
        DSP_TABLE, DSP_ROW_GROUP, DSP_ROW, DSP_CELL, DSP_CAPTION, DSP_CONTENTS };
 enum { POS_STATIC, POS_RELATIVE, POS_ABSOLUTE, POS_FIXED };
 enum { FLT_NONE, FLT_LEFT, FLT_RIGHT };
-enum { ALIGN_LEFT, ALIGN_RIGHT, ALIGN_CENTER, ALIGN_JUSTIFY };
+enum { ALIGN_LEFT, ALIGN_RIGHT, ALIGN_CENTER, ALIGN_JUSTIFY, ALIGN_START, ALIGN_END };
 enum { WS_NORMAL, WS_NOWRAP, WS_PRE, WS_PRE_WRAP, WS_PRE_LINE };
 enum { VA_BASELINE, VA_TOP, VA_MIDDLE, VA_BOTTOM, VA_SUB, VA_SUPER };
 enum { DECO_UNDERLINE = 1, DECO_LINE_THROUGH = 2, DECO_OVERLINE = 4 };
@@ -44,17 +44,33 @@ typedef struct {
 } FxMask;
 typedef struct { uint8_t kind; float a, b, c, d; } FxEase;      /* kind 0: cubic-bezier(a,b,c,d); 1: steps(a, b=0 end/1 start) */
 typedef struct { uint64_t mask; float dur, delay; FxEase ease; } FxTrans;   /* mask: набор анимируемых свойств (0 — запись пуста) */
-typedef struct { char name[40]; float dur, delay, iter; FxEase ease; uint8_t dir, fill, paused; } FxAnim;   /* iter < 0 — infinite */
+typedef struct { char name[40]; float dur, delay, iter; FxEase ease; uint8_t dir, fill, paused, composition; } FxAnim;   /* iter < 0 — infinite; composition 0 replace, 1 add, 2 accumulate */
 
 typedef struct NodeStyle {
     uint8_t display, position, float_, clear, visibility, overflow_hidden, text_align, white_space;
     uint8_t deco, bold, italic, vertical_align, box_sizing, list_style, text_transform;
+    uint8_t text_wrap, content_visibility; /* text-wrap: 0 wrap, 1 nowrap, 2 balance, 3 pretty, 4 stable */
+    uint8_t text_orientation, text_combine_upright; /* vertical text orientation / short horizontal runs */
+    uint8_t column_count, column_fill, column_span, column_rule_style;
+    float column_rule_width; uint32_t column_rule_color;
+    Len column_width, contain_intrinsic_w, contain_intrinsic_h;
+    uint8_t grid_subgrid_cols, grid_subgrid_rows;
+    uint8_t animation_timeline, animation_timeline_axis; /* 0 document time, 1 scroll(), 2 view() ; 0 block/y, 1 inline/x, 2 x, 3 y */
+    float animation_range_start, animation_range_end; /* normalized range of timeline */
+    char anchor_name[48], position_anchor[48], position_area[24], view_transition_name[48];
     uint16_t weight;                            /* font-weight 100..900 (0 — не задан: bold ? 700 : 400); bold = weight >= 600 */
     uint8_t flex_dir, flex_wrap, justify, align_items, align_self, break_word, pointer, no_ring, center_blocks;
+    uint8_t pointer_events, user_select, text_overflow, object_fit, writing_mode, direction, unicode_bidi, bidi_context;
+    uint8_t blend_mode, scroll_behavior, scroll_snap_type, scroll_snap_align;
+    uint8_t container_type, container_name_set, counter_dummy;
     uint8_t border_style[4];
     uint8_t has_z; int16_t z_index;
     uint8_t sticky, sc_x, sc_y;                 /* position:sticky; overflow-x/y: auto|scroll (прокручиваемый контейнер) */
     float font_size, lh_px, lh_mult;
+    float aspect_ratio, zoom, text_indent, word_spacing, outline_offset;
+    Len text_indent_len, word_spacing_len;
+    float object_pos_x, object_pos_y;
+    int16_t order; uint8_t line_clamp;
     float flex_grow, flex_shrink; Len flex_basis;
     Len width, height, min_w, max_w, min_h, max_h;
     Len margin[4], padding[4], inset[4];        /* порядок: top, right, bottom, left */
@@ -63,13 +79,17 @@ typedef struct NodeStyle {
     uint32_t color, bg;                         /* 0xAARRGGBB; alpha 0 = прозрачный */
     float opacity, gap_r, gap_c, spacing;
     float sh_x, sh_y, sh_blur, sh_spread; uint32_t sh_color;
+    float ts_x, ts_y, ts_blur; uint32_t ts_color;
+    float outline_w; uint32_t outline_c; uint8_t outline_style, outline_set;
+    char container_name[40];
+    char counter_reset[96], counter_increment[96], counter_set[96];
     char  bg_url[192];
     char  grid_cols[160]; uint8_t is_grid, grid_span;
     char  grid_areas[220];              /* сырое значение grid-template-areas, строки разделены '\n' */
     char  grid_area_name[32];           /* значение grid-area на самом элементе (имя области) */
     uint8_t bg_repeat, bg_size_mode;            /* repeat: 0 both,1 x,2 y,3 none; size: 0 auto,1 cover,2 contain,3 explicit */
     Len bg_w, bg_h, bg_px, bg_py;
-    /* градиент фона: 0 нет, 1 linear-gradient, 2 radial-gradient */
+    /* градиент фона: 0 нет, 1 linear-gradient, 2 radial-gradient, 3 conic-gradient */
     uint8_t bg_grad_type, bg_grad_n, bg_clip_text;
     float bg_grad_angle;                        /* градусы, для linear */
     uint32_t bg_grad_c[4];                       /* цвета остановок, 0xAARRGGBB */
@@ -100,6 +120,7 @@ typedef struct PseudoBox {
     NodeStyle st;
     char font_family[128];
     char content[248];          /* уже разобранное значение content (без кавычек, escape-последовательности раскрыты) */
+    int8_t content_state;       /* -1: none, 0: normal/не задано, 1: задано автором */
 } PseudoBox;
 
 #endif

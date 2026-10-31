@@ -32,6 +32,10 @@
 #include <time.h>
 #include <fenv.h>
 #include <math.h>
+#if defined(__linux__) && defined(__x86_64__) && !defined(__SANITIZE_ADDRESS__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
 #elif defined(__linux__) || defined(__GLIBC__)
@@ -225,6 +229,21 @@ typedef struct JSShape JSShape;
 typedef struct JSString JSString;
 typedef struct JSString JSAtomStruct;
 typedef struct JSObject JSObject;
+struct JSJITRootFrame;
+
+/* Small monomorphic cache for ordinary named-property bytecodes.  Entries are
+   guarded by site, shape, atom and property flags; they never own GC objects. */
+#define JS_PROPERTY_IC_SIZE 256
+#define JS_PROPERTY_IC_GET  1
+#define JS_PROPERTY_IC_PUT  2
+typedef struct JSPropertyICEntry {
+    uintptr_t site;
+    uintptr_t shape_id;
+    JSAtom atom;
+    uint32_t slot;
+    uint8_t kind;
+    uint8_t valid;
+} JSPropertyICEntry;
 
 #define JS_VALUE_GET_OBJ(v) ((JSObject *)JS_VALUE_GET_PTR(v))
 #define JS_VALUE_GET_STRING(v) ((JSString *)JS_VALUE_GET_PTR(v))
@@ -355,10 +374,35 @@ struct JSRuntime {
     /* true if inside an out of memory error, to avoid recursing */
     BOOL in_out_of_memory : 8;
 
+    /* Statistics for the optional guarded x86-64 baseline JIT. */
+    uint64_t jit_compiled_functions;
+    uint64_t jit_executed_functions;
+    uint64_t jit_deoptimizations;
+    int jit_enabled;
+
+    /* Per-runtime monomorphic inline caches for ordinary named properties. */
+    JSPropertyICEntry property_ic[JS_PROPERTY_IC_SIZE];
+    uint64_t property_ic_get_hits;
+    uint64_t property_ic_get_misses;
+    uint64_t property_ic_put_hits;
+    uint64_t property_ic_put_misses;
+
+    /* Explicit reference-counted roots held by the active native JIT frame. */
+    struct JSJITRootFrame *current_jit_root_frame;
+    uint64_t jit_object_roots_created;
+    uint64_t jit_object_roots_released;
+    uint64_t jit_bigint_roots_created;
+    uint64_t jit_bigint_roots_released;
+    uint64_t jit_bigint_plans_compiled;
+    uint64_t jit_bigint_plan_executions;
+    uint64_t jit_bigint_plan_dispatches;
+
     struct JSStackFrame *current_stack_frame;
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
+    JSExecutionTraceHook *execution_trace_hook;
+    void *execution_trace_opaque;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -414,6 +458,8 @@ typedef struct JSStackFrame {
                         instruction after the call */
     int arg_count;
     int js_mode; /* not supported for C functions */
+    int debug_last_line; /* last line reported to the optional trace hook */
+    int debug_last_pc;   /* detects backward branches to the same source line */
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -710,6 +756,19 @@ typedef struct JSFunctionBytecode {
     uint16_t stack_size; /* maximum stack size */
     uint16_t var_ref_count; /* number of local variable references */
     JSContext *realm; /* function realm */
+    /* Runtime-only JIT state; bytecode serialization intentionally omits it. */
+    void *jit_code;
+    size_t jit_code_size;
+    /* Optional specialized single-dispatch plan for straight-line BigInt expressions. */
+    void *jit_bigint_plan_code;
+    size_t jit_bigint_plan_code_size;
+    void *jit_bigint_plan;
+    size_t jit_bigint_plan_size;
+    uint32_t jit_bigint_plan_arg_mask;
+    uint16_t jit_call_count;
+    uint8_t jit_compile_attempted;
+    uint8_t jit_required_args;
+    uint8_t jit_bigint_plan_required_args;
     JSValue *cpool; /* constant pool (self pointer) */
     int cpool_count;
     int closure_var_count;
@@ -2116,6 +2175,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     JS_UpdateStackTop(rt);
 
     rt->current_exception = JS_UNINITIALIZED;
+    rt->jit_enabled = 1;
 
     return rt;
  fail:
@@ -2237,6 +2297,15 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 {
     rt->interrupt_handler = cb;
     rt->interrupt_opaque = opaque;
+}
+
+void JS_SetExecutionTraceHook(JSRuntime *rt, JSExecutionTraceHook *cb,
+                              void *opaque)
+{
+    if (!rt)
+        return;
+    rt->execution_trace_hook = cb;
+    rt->execution_trace_opaque = opaque;
 }
 
 void JS_SetCanBlock(JSRuntime *rt, BOOL can_block)
@@ -6156,6 +6225,90 @@ static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
     return NULL;
 }
 
+
+static inline size_t js_property_ic_index(uintptr_t site, JSAtom atom,
+                                          uint8_t kind)
+{
+    uintptr_t h = (site >> 2) ^ ((uintptr_t)(uint32_t)atom * 0x9e3779b1u) ^
+                  ((uintptr_t)kind * 0x85ebca6bu);
+    return (size_t)(h & (JS_PROPERTY_IC_SIZE - 1));
+}
+
+/* Return a cached own-property slot only after rechecking the immutable shape
+   and the slot's atom/flags.  The latter also makes allocator address reuse
+   harmless if a shape object was freed and another one later occupies it. */
+static inline BOOL js_property_ic_lookup(JSRuntime *rt, uintptr_t site,
+                                         JSObject *obj, JSAtom atom,
+                                         uint8_t kind, JSProperty **ppr,
+                                         JSShapeProperty **pprs)
+{
+    JSShape *sh = obj->shape;
+    JSPropertyICEntry *entry = &rt->property_ic[
+        js_property_ic_index(site, atom, kind)];
+    JSShapeProperty *shape_prop;
+    uint32_t flags;
+    BOOL eligible;
+
+    if (entry->valid && entry->site == site && entry->shape_id == (uintptr_t)sh &&
+        entry->atom == atom && entry->kind == kind &&
+        entry->slot < (uint32_t)sh->prop_count &&
+        entry->slot < (uint32_t)sh->prop_size) {
+        shape_prop = &get_shape_prop(sh)[entry->slot];
+        flags = shape_prop->flags;
+        eligible = shape_prop->atom == atom &&
+            (kind == JS_PROPERTY_IC_GET ?
+             ((flags & JS_PROP_TMASK) == 0) :
+             ((flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) ==
+              JS_PROP_WRITABLE));
+        if (eligible) {
+            *ppr = &obj->prop[entry->slot];
+            *pprs = shape_prop;
+            if (kind == JS_PROPERTY_IC_GET)
+                rt->property_ic_get_hits++;
+            else
+                rt->property_ic_put_hits++;
+            return TRUE;
+        }
+        entry->valid = 0;
+    }
+    if (kind == JS_PROPERTY_IC_GET)
+        rt->property_ic_get_misses++;
+    else
+        rt->property_ic_put_misses++;
+    return FALSE;
+}
+
+static inline void js_property_ic_update(JSRuntime *rt, uintptr_t site,
+                                         JSObject *obj, JSAtom atom,
+                                         uint8_t kind,
+                                         JSShapeProperty *shape_prop)
+{
+    JSShape *sh = obj->shape;
+    ptrdiff_t slot = shape_prop - get_shape_prop(sh);
+    uint32_t flags = shape_prop->flags;
+    JSPropertyICEntry *entry;
+
+    if (slot < 0 || slot >= sh->prop_count || slot >= sh->prop_size ||
+        shape_prop->atom != atom)
+        return;
+    if (kind == JS_PROPERTY_IC_GET) {
+        if (flags & JS_PROP_TMASK)
+            return;
+    } else if ((flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) !=
+               JS_PROP_WRITABLE) {
+        return;
+    }
+
+    entry = &rt->property_ic[js_property_ic_index(site, atom, kind)];
+    entry->valid = 0;
+    entry->site = site;
+    entry->shape_id = (uintptr_t)sh;
+    entry->atom = atom;
+    entry->slot = (uint32_t)slot;
+    entry->kind = kind;
+    entry->valid = 1;
+}
+
 /* indicate that the object may be part of a function prototype cycle */
 static void set_cycle_flag(JSContext *ctx, JSValueConst obj)
 {
@@ -6896,6 +7049,10 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     if (!b->read_only_bytecode && b->byte_code_buf) {
         hp->js_func_code_size += b->byte_code_len;
     }
+    /* Include the separately mmap()ed native baseline-JIT page(s). */
+    js_func_size += (int)b->jit_code_size;
+    js_func_size += (int)b->jit_bigint_plan_code_size;
+    js_func_size += (int)b->jit_bigint_plan_size;
     if (b->has_debug) {
         js_func_size += sizeof(*b) - offsetof(JSFunctionBytecode, debug);
         if (b->debug.source) {
@@ -17737,12 +17894,3612 @@ typedef enum {
 #define FUNC_RET_YIELD_STAR    2
 #define FUNC_RET_INITIAL_YIELD 3
 
+/*
+ * Experimental baseline JIT. This tier compiles a restricted bytecode subset
+ * to native x86-64 code: arithmetic/control-flow paths are side-effect-free,
+ * except for narrowly guarded existing-property/array writes that are only
+ * allowed when no potentially failing native operation follows them. It supports
+ * guarded int32 operations, selected IEEE-754 Float64 operations, short-BigInt
+ * add/sub/mul with signed-overflow deoptimization, and guarded property/array/
+ * numeric TypedArray access. Every other function stays on QuickJS's interpreter
+ * path. Guards and loop fuel deopt to preserve semantics/polling.
+ */
+#if defined(__linux__) && defined(__x86_64__) && !defined(__SANITIZE_ADDRESS__)
+#define JS_BASELINE_JIT_THRESHOLD 32
+#define JS_BASELINE_JIT_MAX_ARGS 32
+#define JS_BASELINE_JIT_MAX_STACK 64
+#define JS_BASELINE_JIT_MAX_BYTECODE 256
+#define JS_BASELINE_JIT_CODE_CAP 4096
+
+/* Experimental baseline JIT, x86-64 System V ABI. The tagged native stack
+   remains (int32 payload, kind) pairs while Float64, object-pointer and
+   BigInt payload bits live in a parallel 64-bit lane. BigInt values never pass
+   through numeric conversion: short values use checked machine operations where
+   safe, and heap-backed values dispatch to exact QuickJS limb helpers under the
+   current root frame. */
+enum {
+    JS_JIT_KIND_INT32 = 0,
+    JS_JIT_KIND_BOOL = 1,
+    JS_JIT_KIND_UNINITIALIZED = 2,
+    JS_JIT_KIND_UINT32 = 3,
+    JS_JIT_KIND_FLOAT64 = 4,
+    /* Object pointers live in the parallel 64-bit lane and remain rooted by argv. */
+    JS_JIT_KIND_OBJECT = 5,
+    /* Signed short-BigInt payloads use the 64-bit lane as raw int64 bits. */
+    JS_JIT_KIND_BIGINT = 6,
+    /* Heap-backed BigInts use a rooted JSBigInt pointer in the 64-bit lane.
+       They may be copied/returned and add/sub/mul use QuickJS's exact BigInt helpers. */
+    JS_JIT_KIND_HEAP_BIGINT = 7,
+};
+typedef union JSJITNativePayload {
+    uint64_t u64;
+    int32_t i32;
+    double f64;
+} JSJITNativePayload;
+typedef struct JSJITNativeValue {
+    JSJITNativePayload payload;
+    int32_t kind;
+    int32_t reserved;
+} JSJITNativeValue;
+
+enum {
+    JS_JIT_PLAN_PUSH_ARG = 1,
+    JS_JIT_PLAN_PUSH_BIGINT = 2,
+    JS_JIT_PLAN_DUP = 3,
+    JS_JIT_PLAN_DROP = 4,
+    JS_JIT_PLAN_BINARY = 5,
+    JS_JIT_PLAN_RETURN = 6,
+};
+typedef struct JSJITBigIntPlanInsn {
+    uint8_t kind;
+    uint8_t operand;
+    uint16_t opcode;
+    int64_t immediate;
+} JSJITBigIntPlanInsn;
+typedef struct JSJITBigIntPlan {
+    uint32_t instruction_count;
+    uint32_t arg_mask;
+    uint8_t required_args;
+    uint8_t peak_depth;
+    uint8_t result_kind;
+    uint8_t reserved;
+    uint16_t binary_count;
+    JSJITBigIntPlanInsn insns[];
+} JSJITBigIntPlan;
+
+typedef struct JSJITBigIntPlanValue {
+    JSValue value;
+    uint8_t owned;
+} JSJITBigIntPlanValue;
+
+/* Fused plans keep intermediate BigInts as ordinary owned JSValues in this
+   C frame. BigInt is refcounted (not a GC graph node), so these values remain
+   alive across limb allocations without registering every intermediate in the
+   shared native root frame. Only a heap-BigInt return value is transferred to
+   that frame for the common JS_CallInternal return path. */
+static void js_baseline_jit_plan_release_values(JSContext *ctx,
+                                                JSJITBigIntPlanValue *values,
+                                                int depth)
+{
+    int i;
+    if (!ctx || !values)
+        return;
+    for (i = 0; i < depth; i++) {
+        if (values[i].owned)
+            JS_FreeValue(ctx, values[i].value);
+        values[i].value = JS_UNDEFINED;
+        values[i].owned = 0;
+    }
+}
+
+/* Object-valued native stack lanes are not GC roots by themselves. Keep an
+   owned JSValue for every object loaded from a property until the native frame
+   exits (or deoptimizes), then release all roots in reverse order. This uses
+   QuickJS reference counting rather than assuming that raw native pointers are
+   visible to the collector. */
+typedef struct JSJITRootFrame {
+    struct JSJITRootFrame *prev;
+    JSContext *ctx;
+    uint32_t count;
+    JSValue values[JS_BASELINE_JIT_MAX_BYTECODE];
+} JSJITRootFrame;
+
+/* Root frames can contain holes after a value's last native use. Reuse those
+   slots rather than letting a long arithmetic chain or loop exhaust the frame. */
+static int js_baseline_jit_store_root(JSJITRootFrame *frame, JSValue value)
+{
+    uint32_t i;
+    if (!frame || !frame->ctx)
+        return 0;
+    for (i = 0; i < frame->count; i++) {
+        if (JS_VALUE_GET_TAG(frame->values[i]) == JS_TAG_UNDEFINED) {
+            frame->values[i] = value;
+            return 1;
+        }
+    }
+    if (frame->count >= JS_BASELINE_JIT_MAX_BYTECODE)
+        return 0;
+    frame->values[frame->count++] = value;
+    return 1;
+}
+
+static BOOL js_baseline_jit_has_root_capacity(JSJITRootFrame *frame)
+{
+    uint32_t i;
+    if (!frame || !frame->ctx)
+        return FALSE;
+    if (frame->count < JS_BASELINE_JIT_MAX_BYTECODE)
+        return TRUE;
+    for (i = 0; i < frame->count; i++) {
+        if (JS_VALUE_GET_TAG(frame->values[i]) == JS_TAG_UNDEFINED)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void js_baseline_jit_drop_root_slot(JSJITRootFrame *frame, uint32_t slot)
+{
+    JSValue value;
+    int tag;
+    if (!frame || !frame->ctx || slot >= frame->count)
+        return;
+    value = frame->values[slot];
+    tag = JS_VALUE_GET_TAG(value);
+    if (tag == JS_TAG_UNDEFINED)
+        return;
+    JS_FreeValue(frame->ctx, value);
+    if (tag == JS_TAG_BIG_INT)
+        frame->ctx->rt->jit_bigint_roots_released++;
+    else if (tag == JS_TAG_OBJECT)
+        frame->ctx->rt->jit_object_roots_released++;
+    frame->values[slot] = JS_UNDEFINED;
+    while (frame->count > 0 &&
+           JS_VALUE_GET_TAG(frame->values[frame->count - 1]) == JS_TAG_UNDEFINED)
+        frame->count--;
+}
+
+/* A pointer in a native stack slot is live only when that slot is inside the
+   active prefix and has the matching tagged kind. The caller supplies an
+   exclusive end and can ignore a local slot about to be overwritten. */
+static BOOL js_baseline_jit_bigint_is_live(int32_t *stack, double *numbers,
+                                           uint32_t active_end,
+                                           int ignored_slot, uint64_t bits)
+{
+    uint32_t i;
+    if (!stack || !numbers || active_end > JS_BASELINE_JIT_MAX_STACK)
+        return TRUE; /* conservative: never drop a root on an invalid descriptor */
+    for (i = 0; i < active_end; i++) {
+        uint64_t slot_bits;
+        if ((int)i == ignored_slot ||
+            stack[i * 2 + 1] != JS_JIT_KIND_HEAP_BIGINT)
+            continue;
+        memcpy(&slot_bits, &numbers[i], sizeof(slot_bits));
+        if (slot_bits == bits)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void js_baseline_jit_prune_bigint_root(JSContext *ctx, int32_t *stack,
+                                              double *numbers,
+                                              uint32_t active_end,
+                                              int ignored_slot,
+                                              uint64_t bits)
+{
+    JSJITRootFrame *frame;
+    uint32_t i;
+    if (!ctx || !bits || active_end > JS_BASELINE_JIT_MAX_STACK)
+        return;
+    frame = ctx->rt->current_jit_root_frame;
+    if (!frame || frame->ctx != ctx)
+        return;
+    /* Fast path for argument operands: they are owned by argv and therefore
+       have no entry in this frame. Avoid scanning the native stack unless a
+       matching temporary root actually exists. */
+    for (i = 0; i < frame->count; i++) {
+        JSValue value = frame->values[i];
+        if (JS_VALUE_GET_TAG(value) == JS_TAG_BIG_INT &&
+            (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(value) == bits) {
+            if (!js_baseline_jit_bigint_is_live(stack, numbers, active_end,
+                                                ignored_slot, bits))
+                js_baseline_jit_drop_root_slot(frame, i);
+            return;
+        }
+    }
+}
+
+/* Called immediately before assigning to a local. The target local is ignored
+   during liveness scanning, while the RHS remains in the active prefix. */
+/* Prune both consumed operands in one root-frame pass. Chained BigInt
+   expressions often have one rooted intermediate and one argv operand; a
+   single scan avoids two helper/loop passes per arithmetic operation. */
+static void js_baseline_jit_prune_bigint_roots(JSContext *ctx, int32_t *stack,
+                                               double *numbers,
+                                               uint32_t active_end,
+                                               int ignored_slot,
+                                               uint64_t bits_a,
+                                               uint64_t bits_b)
+{
+    JSJITRootFrame *frame;
+    uint32_t i = 0;
+    if (!ctx || active_end > JS_BASELINE_JIT_MAX_STACK ||
+        (!bits_a && !bits_b))
+        return;
+    frame = ctx->rt->current_jit_root_frame;
+    if (!frame || frame->ctx != ctx || frame->count == 0)
+        return;
+    while (i < frame->count) {
+        JSValue value = frame->values[i];
+        uint64_t root_bits;
+        if (JS_VALUE_GET_TAG(value) != JS_TAG_BIG_INT) {
+            i++;
+            continue;
+        }
+        root_bits = (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(value);
+        if ((root_bits == bits_a || root_bits == bits_b) && root_bits != 0 &&
+            !js_baseline_jit_bigint_is_live(stack, numbers, active_end,
+                                            ignored_slot, root_bits)) {
+            js_baseline_jit_drop_root_slot(frame, i);
+            /* drop_root_slot may trim the tail; inspect the new occupant. */
+            continue;
+        }
+        i++;
+    }
+}
+
+static void js_baseline_jit_prune_local_bigint_root(JSContext *ctx,
+                                                    int32_t *stack,
+                                                    double *numbers,
+                                                    uint32_t descriptor)
+{
+    uint32_t slot = descriptor & 0xffu;
+    uint32_t active_end = descriptor >> 24;
+    uint64_t bits;
+    if (!ctx || !stack || !numbers || slot >= JS_BASELINE_JIT_MAX_STACK ||
+        active_end > JS_BASELINE_JIT_MAX_STACK ||
+        stack[slot * 2 + 1] != JS_JIT_KIND_HEAP_BIGINT)
+        return;
+    memcpy(&bits, &numbers[slot], sizeof(bits));
+    js_baseline_jit_prune_bigint_root(ctx, stack, numbers, active_end,
+                                      (int)slot, bits);
+}
+
+/* If the native return value already owns a root in this frame, transfer that
+   reference to the caller instead of doing a duplicate/free pair. */
+static int js_baseline_jit_take_bigint_root(JSJITRootFrame *frame,
+                                            uint64_t bits, JSValue *out_value)
+{
+    uint32_t i;
+    if (!frame || !frame->ctx || !out_value || !bits)
+        return 0;
+    for (i = 0; i < frame->count; i++) {
+        JSValue value = frame->values[i];
+        if (JS_VALUE_GET_TAG(value) == JS_TAG_BIG_INT &&
+            (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(value) == bits) {
+            *out_value = value;
+            frame->values[i] = JS_UNDEFINED;
+            frame->ctx->rt->jit_bigint_roots_released++;
+            while (frame->count > 0 &&
+                   JS_VALUE_GET_TAG(frame->values[frame->count - 1]) == JS_TAG_UNDEFINED)
+                frame->count--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+typedef int (*JSBaselineJITFunction)(const JSJITNativeValue *,
+                                     JSJITNativePayload *, int32_t *,
+                                     int32_t *, int32_t *, double *);
+
+/* Add an owned reference to the active native frame. Rooting itself performs
+   no allocation and cannot invoke JavaScript. A full frame deoptimizes before
+   exposing an unrooted pointer to generated code. */
+static int js_baseline_jit_add_object_root(JSContext *ctx, JSValueConst value)
+{
+    JSJITRootFrame *frame;
+    JSValue dup;
+    if (!ctx)
+        return 0;
+    uint32_t i;
+    JSObject *obj;
+    frame = ctx->rt->current_jit_root_frame;
+    if (!frame || frame->ctx->rt != ctx->rt || JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT)
+        return 0;
+    obj = JS_VALUE_GET_OBJ(value);
+    /* Loops may execute the same property read many times. Reuse a root for
+       an identical object so a hot loop does not consume one slot per iteration. */
+    for (i = 0; i < frame->count; i++) {
+        if (JS_VALUE_GET_TAG(frame->values[i]) == JS_TAG_OBJECT &&
+            JS_VALUE_GET_OBJ(frame->values[i]) == obj)
+            return 1;
+    }
+    dup = JS_DupValue(frame->ctx, value);
+    if (!js_baseline_jit_store_root(frame, dup)) {
+        JS_FreeValue(frame->ctx, dup);
+        return 0;
+    }
+    ctx->rt->jit_object_roots_created++;
+    return 1;
+}
+
+/* Heap BigInts are refcounted QuickJS values too. Keep an owned JSValue root
+   before exposing the JSBigInt pointer to generated code; short-BigInt values
+   are immediate and never enter this helper. */
+static int js_baseline_jit_add_bigint_root(JSContext *ctx, JSValueConst value)
+{
+    JSJITRootFrame *frame;
+    JSValue dup;
+    uint32_t i;
+    void *ptr;
+    if (!ctx || JS_VALUE_GET_TAG(value) != JS_TAG_BIG_INT)
+        return 0;
+    frame = ctx->rt->current_jit_root_frame;
+    if (!frame || !frame->ctx || frame->ctx->rt != ctx->rt)
+        return 0;
+    ptr = JS_VALUE_GET_PTR(value);
+    for (i = 0; i < frame->count; i++) {
+        if (JS_VALUE_GET_TAG(frame->values[i]) == JS_TAG_BIG_INT &&
+            JS_VALUE_GET_PTR(frame->values[i]) == ptr)
+            return 1;
+    }
+    dup = JS_DupValue(frame->ctx, value);
+    if (!js_baseline_jit_store_root(frame, dup)) {
+        JS_FreeValue(frame->ctx, dup);
+        return 0;
+    }
+    ctx->rt->jit_bigint_roots_created++;
+    return 1;
+}
+
+/* Transfer ownership of a freshly allocated heap-BigInt result into the
+   active root frame. Arithmetic helpers return a new refcount-1 allocation,
+   so duplicating then freeing it is unnecessary. The caller must only use this
+   for values whose owned reference it relinquishes on success. */
+static int js_baseline_jit_adopt_bigint_root(JSContext *ctx, JSValue value)
+{
+    JSJITRootFrame *frame;
+    if (!ctx || JS_VALUE_GET_TAG(value) != JS_TAG_BIG_INT)
+        return 0;
+    frame = ctx->rt->current_jit_root_frame;
+    if (!frame || !frame->ctx || frame->ctx->rt != ctx->rt)
+        return 0;
+    if (!js_baseline_jit_store_root(frame, value))
+        return 0; /* ownership remains with caller on failure */
+    ctx->rt->jit_bigint_roots_created++;
+    return 1;
+}
+
+static void js_baseline_jit_release_roots(JSJITRootFrame *frame)
+{
+    if (!frame || !frame->ctx)
+        return;
+    while (frame->count > 0) {
+        JSValue value = frame->values[--frame->count];
+        int tag = JS_VALUE_GET_TAG(value);
+        if (tag == JS_TAG_UNDEFINED)
+            continue;
+        JS_FreeValue(frame->ctx, value);
+        if (tag == JS_TAG_BIG_INT)
+            frame->ctx->rt->jit_bigint_roots_released++;
+        else if (tag == JS_TAG_OBJECT)
+            frame->ctx->rt->jit_object_roots_released++;
+    }
+}
+
+/* Heap-backed BigInt arithmetic, bitwise operations and comparisons dispatch to
+   QuickJS's exact limb primitives without converting to Number or comparing raw
+   pointers. Short BigInts are reconstructed into local JSBigIntBuf objects;
+   heap-backed operands are protected by the active root frame. Return 1 on
+   success, 0 for a guard miss (safe interpreter fallback), and 2 on exception. */
+static int js_baseline_jit_bigint_binary(JSContext *ctx, int32_t *stack,
+                                         double *numbers, uint32_t descriptor)
+{
+    int32_t left_slot = (int32_t)(descriptor & 0xffu);
+    int32_t right_slot = (int32_t)((descriptor >> 8) & 0xffu);
+    int32_t opcode = (int32_t)((descriptor >> 16) & 0xffu);
+    uint32_t active_end = descriptor >> 24;
+    JSBigIntBuf left_buf, right_buf;
+    JSBigInt *left, *right, *raw_result;
+    JSValue result;
+    uint64_t left_bits, right_bits, result_bits;
+    int left_kind, right_kind, tag;
+    BOOL should_prune_operands = FALSE;
+    JSJITRootFrame *root_frame;
+
+    if (!ctx || !stack || !numbers || left_slot < 0 || right_slot < 0 ||
+        left_slot >= JS_BASELINE_JIT_MAX_STACK ||
+        right_slot >= JS_BASELINE_JIT_MAX_STACK ||
+        active_end > JS_BASELINE_JIT_MAX_STACK || left_slot >= (int32_t)active_end)
+        return 0;
+    left_kind = stack[left_slot * 2 + 1];
+    right_kind = stack[right_slot * 2 + 1];
+    int comparison;
+    BOOL is_comparison;
+
+    if ((left_kind != JS_JIT_KIND_BIGINT &&
+         left_kind != JS_JIT_KIND_HEAP_BIGINT) ||
+        (right_kind != JS_JIT_KIND_BIGINT &&
+         right_kind != JS_JIT_KIND_HEAP_BIGINT))
+        return 0;
+    switch (opcode) {
+    case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod:
+    case OP_and: case OP_or: case OP_xor:
+    case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq:
+    case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+        break;
+    default:
+        return 0;
+    }
+
+    memcpy(&left_bits, &numbers[left_slot], sizeof(left_bits));
+    memcpy(&right_bits, &numbers[right_slot], sizeof(right_bits));
+    /* If no heap-backed operand can have a temporary root yet, skip the
+       cleanup calls entirely. This is the common path for function arguments;
+       chained expressions set this once an intermediate heap result is rooted. */
+    root_frame = ctx->rt->current_jit_root_frame;
+    should_prune_operands = root_frame && root_frame->ctx == ctx &&
+                            root_frame->count != 0;
+    if (left_kind == JS_JIT_KIND_BIGINT) {
+        left = js_bigint_set_si64(&left_buf, (int64_t)left_bits);
+    } else {
+        left = (JSBigInt *)(uintptr_t)left_bits;
+        if (!left)
+            return 0;
+    }
+    if (right_kind == JS_JIT_KIND_BIGINT) {
+        right = js_bigint_set_si64(&right_buf, (int64_t)right_bits);
+    } else {
+        right = (JSBigInt *)(uintptr_t)right_bits;
+        if (!right)
+            return 0;
+    }
+
+    /* The operands are never mutated. Every heap-backed operand pointer in a
+       native slot is owned by JSJITRootFrame for the duration of this call.
+       Comparisons do not allocate; all other operations use the same exact
+       limb routines as the interpreter. */
+    is_comparison = (opcode == OP_eq || opcode == OP_neq ||
+                     opcode == OP_strict_eq || opcode == OP_strict_neq ||
+                     opcode == OP_lt || opcode == OP_lte ||
+                     opcode == OP_gt || opcode == OP_gte);
+    /* All non-comparison operators may allocate a heap result. Check the root
+       slot before doing the operation so a root-capacity miss cannot occur
+       after arithmetic and force the interpreter to repeat it. */
+    if (!is_comparison) {
+        JSJITRootFrame *frame = ctx->rt->current_jit_root_frame;
+        if (!js_baseline_jit_has_root_capacity(frame) || frame->ctx->rt != ctx->rt)
+            return 0;
+    }
+    if (is_comparison) {
+        comparison = js_bigint_cmp(ctx, left, right);
+        switch (opcode) {
+        case OP_eq: case OP_strict_eq: stack[left_slot * 2] = (comparison == 0); break;
+        case OP_neq: case OP_strict_neq: stack[left_slot * 2] = (comparison != 0); break;
+        case OP_lt: stack[left_slot * 2] = (comparison < 0); break;
+        case OP_lte: stack[left_slot * 2] = (comparison <= 0); break;
+        case OP_gt: stack[left_slot * 2] = (comparison > 0); break;
+        case OP_gte: stack[left_slot * 2] = (comparison >= 0); break;
+        default: abort();
+        }
+        stack[left_slot * 2 + 1] = JS_JIT_KIND_BOOL;
+        if (should_prune_operands)
+            js_baseline_jit_prune_bigint_roots(ctx, stack, numbers, active_end,
+                                               -1,
+                                               left_kind == JS_JIT_KIND_HEAP_BIGINT ? left_bits : 0,
+                                               right_kind == JS_JIT_KIND_HEAP_BIGINT ? right_bits : 0);
+        return 1;
+    }
+    if (opcode == OP_add)
+        raw_result = js_bigint_add(ctx, left, right, 0);
+    else if (opcode == OP_sub)
+        raw_result = js_bigint_add(ctx, left, right, 1);
+    else if (opcode == OP_mul)
+        raw_result = js_bigint_mul(ctx, left, right);
+    else if (opcode == OP_div)
+        raw_result = js_bigint_divrem(ctx, left, right, FALSE);
+    else if (opcode == OP_mod)
+        raw_result = js_bigint_divrem(ctx, left, right, TRUE);
+    else
+        raw_result = js_bigint_logic(ctx, left, right, (OPCodeEnum)opcode);
+    if (!raw_result)
+        return 2;
+
+    result = JS_CompactBigInt(ctx, raw_result);
+    tag = JS_VALUE_GET_TAG(result);
+    if (tag == JS_TAG_SHORT_BIG_INT) {
+        result_bits = (uint64_t)JS_VALUE_GET_SHORT_BIG_INT(result);
+        memcpy(&numbers[left_slot], &result_bits, sizeof(result_bits));
+        stack[left_slot * 2 + 1] = JS_JIT_KIND_BIGINT;
+        if (should_prune_operands)
+            js_baseline_jit_prune_bigint_roots(ctx, stack, numbers, active_end,
+                                               -1,
+                                               left_kind == JS_JIT_KIND_HEAP_BIGINT ? left_bits : 0,
+                                               right_kind == JS_JIT_KIND_HEAP_BIGINT ? right_bits : 0);
+        return 1;
+    }
+    if (tag == JS_TAG_BIG_INT) {
+        result_bits = (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(result);
+        /* Transfer the freshly allocated result reference into the root frame.
+           This avoids a duplicate/free pair and an O(root-count) identity scan. */
+        if (!js_baseline_jit_adopt_bigint_root(ctx, result)) {
+            JS_FreeValue(ctx, result);
+            return 0;
+        }
+        memcpy(&numbers[left_slot], &result_bits, sizeof(result_bits));
+        stack[left_slot * 2 + 1] = JS_JIT_KIND_HEAP_BIGINT;
+        if (should_prune_operands)
+            js_baseline_jit_prune_bigint_roots(ctx, stack, numbers, active_end,
+                                               -1,
+                                               left_kind == JS_JIT_KIND_HEAP_BIGINT ? left_bits : 0,
+                                               right_kind == JS_JIT_KIND_HEAP_BIGINT ? right_bits : 0);
+        return 1;
+    }
+    JS_FreeValue(ctx, result);
+    return 0;
+}
+
+/* A compact, pre-decoded straight-line expression plan. Types and stack depth
+   are verified by the compiler, while dispatch guards every referenced
+   argument. Intermediate BigInts stay as owned JSValues in this local stack;
+   only the final heap-backed result is adopted by the native root frame. This
+   avoids repeated root-frame scans and native-lane encode/decode for each node. */
+static int js_baseline_jit_execute_bigint_plan(const JSJITNativeValue *args,
+                                                JSJITNativePayload *out,
+                                                int32_t *out_kind,
+                                                JSContext *ctx,
+                                                const JSJITBigIntPlan *plan)
+{
+    JSJITBigIntPlanValue values[JS_BASELINE_JIT_MAX_STACK];
+    int depth = 0, i;
+
+    if (!args || !out || !out_kind || !ctx || !plan ||
+        plan->instruction_count == 0 || plan->peak_depth > JS_BASELINE_JIT_MAX_STACK ||
+        (plan->result_kind != JS_JIT_KIND_BOOL &&
+         plan->result_kind != JS_JIT_KIND_BIGINT))
+        return 0;
+
+    /* Refuse before performing any operation if a BigInt result could not be
+       transferred to the root frame. The frame is unchanged during execution. */
+    if (plan->result_kind == JS_JIT_KIND_BIGINT &&
+        !js_baseline_jit_has_root_capacity(ctx->rt->current_jit_root_frame))
+        return 0;
+
+    ctx->rt->jit_bigint_plan_dispatches++;
+    for (i = 0; i < JS_BASELINE_JIT_MAX_STACK; i++) {
+        values[i].value = JS_UNDEFINED;
+        values[i].owned = 0;
+    }
+    for (i = 0; i < (int)plan->instruction_count; i++) {
+        const JSJITBigIntPlanInsn *insn = &plan->insns[i];
+        switch (insn->kind) {
+        case JS_JIT_PLAN_PUSH_ARG: {
+            const JSJITNativeValue *arg;
+            uint64_t bits;
+            if (insn->operand >= JS_BASELINE_JIT_MAX_ARGS ||
+                depth >= JS_BASELINE_JIT_MAX_STACK) {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "invalid argument in verified JIT BigInt plan");
+                return 2;
+            }
+            arg = &args[insn->operand];
+            bits = arg->payload.u64;
+            if (arg->kind == JS_JIT_KIND_BIGINT) {
+                values[depth].value = __JS_NewShortBigInt(ctx, (int64_t)bits);
+            } else if (arg->kind == JS_JIT_KIND_HEAP_BIGINT && bits != 0) {
+                /* Borrowed from argv, whose ref remains owned by caller. */
+                values[depth].value = JS_MKPTR(JS_TAG_BIG_INT, (void *)(uintptr_t)bits);
+            } else {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "invalid BigInt argument in verified JIT plan");
+                return 2;
+            }
+            values[depth].owned = 0;
+            depth++;
+            break;
+        }
+        case JS_JIT_PLAN_PUSH_BIGINT:
+            if (depth >= JS_BASELINE_JIT_MAX_STACK) {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "stack overflow in verified JIT BigInt plan");
+                return 2;
+            }
+            values[depth].value = __JS_NewShortBigInt(ctx, insn->immediate);
+            values[depth].owned = 0;
+            depth++;
+            break;
+        case JS_JIT_PLAN_DUP:
+            if (depth < 1 || depth >= JS_BASELINE_JIT_MAX_STACK) {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "invalid dup in verified JIT BigInt plan");
+                return 2;
+            }
+            values[depth].value = JS_DupValue(ctx, values[depth - 1].value);
+            values[depth].owned = 1;
+            depth++;
+            break;
+        case JS_JIT_PLAN_DROP:
+            if (depth < 1) {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "invalid drop in verified JIT BigInt plan");
+                return 2;
+            }
+            if (values[depth - 1].owned)
+                JS_FreeValue(ctx, values[depth - 1].value);
+            values[depth - 1].value = JS_UNDEFINED;
+            values[depth - 1].owned = 0;
+            depth--;
+            break;
+        case JS_JIT_PLAN_BINARY: {
+            JSValue left_value, right_value, result_value;
+            JSBigIntBuf left_buf, right_buf;
+            JSBigInt *left, *right, *raw_result = NULL;
+            int left_tag, right_tag, comparison;
+            BOOL is_comparison;
+            int left_slot, right_slot;
+
+            if (depth < 2) {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "invalid binary op in verified JIT BigInt plan");
+                return 2;
+            }
+            left_slot = depth - 2;
+            right_slot = depth - 1;
+            left_value = values[left_slot].value;
+            right_value = values[right_slot].value;
+            left_tag = JS_VALUE_GET_TAG(left_value);
+            right_tag = JS_VALUE_GET_TAG(right_value);
+            if ((left_tag != JS_TAG_SHORT_BIG_INT && left_tag != JS_TAG_BIG_INT) ||
+                (right_tag != JS_TAG_SHORT_BIG_INT && right_tag != JS_TAG_BIG_INT)) {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "non-BigInt operand in verified JIT BigInt plan");
+                return 2;
+            }
+            left = left_tag == JS_TAG_SHORT_BIG_INT ?
+                   js_bigint_set_short(&left_buf, left_value) : JS_VALUE_GET_PTR(left_value);
+            right = right_tag == JS_TAG_SHORT_BIG_INT ?
+                    js_bigint_set_short(&right_buf, right_value) : JS_VALUE_GET_PTR(right_value);
+            is_comparison = (insn->opcode == OP_eq || insn->opcode == OP_neq ||
+                             insn->opcode == OP_strict_eq || insn->opcode == OP_strict_neq ||
+                             insn->opcode == OP_lt || insn->opcode == OP_lte ||
+                             insn->opcode == OP_gt || insn->opcode == OP_gte);
+            if (is_comparison) {
+                comparison = js_bigint_cmp(ctx, left, right);
+                switch (insn->opcode) {
+                case OP_eq: case OP_strict_eq:
+                    result_value = JS_NewBool(ctx, comparison == 0); break;
+                case OP_neq: case OP_strict_neq:
+                    result_value = JS_NewBool(ctx, comparison != 0); break;
+                case OP_lt: result_value = JS_NewBool(ctx, comparison < 0); break;
+                case OP_lte: result_value = JS_NewBool(ctx, comparison <= 0); break;
+                case OP_gt: result_value = JS_NewBool(ctx, comparison > 0); break;
+                case OP_gte: result_value = JS_NewBool(ctx, comparison >= 0); break;
+                default:
+                    js_baseline_jit_plan_release_values(ctx, values, depth);
+                    JS_ThrowInternalError(ctx, "invalid comparison in verified JIT BigInt plan");
+                    return 2;
+                }
+            } else {
+                switch (insn->opcode) {
+                case OP_add: raw_result = js_bigint_add(ctx, left, right, 0); break;
+                case OP_sub: raw_result = js_bigint_add(ctx, left, right, 1); break;
+                case OP_mul: raw_result = js_bigint_mul(ctx, left, right); break;
+                case OP_div: raw_result = js_bigint_divrem(ctx, left, right, FALSE); break;
+                case OP_mod: raw_result = js_bigint_divrem(ctx, left, right, TRUE); break;
+                case OP_and: case OP_or: case OP_xor:
+                    raw_result = js_bigint_logic(ctx, left, right, (OPCodeEnum)insn->opcode); break;
+                default:
+                    js_baseline_jit_plan_release_values(ctx, values, depth);
+                    JS_ThrowInternalError(ctx, "invalid arithmetic in verified JIT BigInt plan");
+                    return 2;
+                }
+                if (!raw_result) {
+                    js_baseline_jit_plan_release_values(ctx, values, depth);
+                    return 2;
+                }
+                result_value = JS_CompactBigInt(ctx, raw_result);
+                if (JS_VALUE_GET_TAG(result_value) != JS_TAG_SHORT_BIG_INT &&
+                    JS_VALUE_GET_TAG(result_value) != JS_TAG_BIG_INT) {
+                    JS_FreeValue(ctx, result_value);
+                    js_baseline_jit_plan_release_values(ctx, values, depth);
+                    JS_ThrowInternalError(ctx, "invalid result in verified JIT BigInt plan");
+                    return 2;
+                }
+            }
+            /* The result is fully computed before releasing owned operands. */
+            if (values[left_slot].owned)
+                JS_FreeValue(ctx, values[left_slot].value);
+            if (values[right_slot].owned)
+                JS_FreeValue(ctx, values[right_slot].value);
+            values[left_slot].value = result_value;
+            values[left_slot].owned = 1;
+            values[right_slot].value = JS_UNDEFINED;
+            values[right_slot].owned = 0;
+            depth--;
+            break;
+        }
+        case JS_JIT_PLAN_RETURN: {
+            int tag;
+            if (depth != 1) {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "invalid return in verified JIT BigInt plan");
+                return 2;
+            }
+            tag = JS_VALUE_GET_TAG(values[0].value);
+            if (tag == JS_TAG_BOOL) {
+                *out_kind = JS_JIT_KIND_BOOL;
+                out->i32 = JS_VALUE_GET_BOOL(values[0].value);
+            } else if (tag == JS_TAG_SHORT_BIG_INT) {
+                *out_kind = JS_JIT_KIND_BIGINT;
+                out->u64 = (uint64_t)JS_VALUE_GET_SHORT_BIG_INT(values[0].value);
+            } else if (tag == JS_TAG_BIG_INT) {
+                uint64_t pointer = (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(values[0].value);
+                if (!values[0].owned ||
+                    !js_baseline_jit_adopt_bigint_root(ctx, values[0].value)) {
+                    js_baseline_jit_plan_release_values(ctx, values, depth);
+                    JS_ThrowInternalError(ctx, "cannot adopt BigInt result from verified JIT plan");
+                    return 2;
+                }
+                values[0].owned = 0; /* transferred to root frame */
+                *out_kind = JS_JIT_KIND_HEAP_BIGINT;
+                out->u64 = pointer;
+            } else {
+                js_baseline_jit_plan_release_values(ctx, values, depth);
+                JS_ThrowInternalError(ctx, "invalid result in verified JIT BigInt plan");
+                return 2;
+            }
+            js_baseline_jit_plan_release_values(ctx, values, depth);
+            ctx->rt->jit_bigint_plan_executions++;
+            return 1;
+        }
+        default:
+            js_baseline_jit_plan_release_values(ctx, values, depth);
+            JS_ThrowInternalError(ctx, "invalid opcode in verified JIT BigInt plan");
+            return 2;
+        }
+    }
+    js_baseline_jit_plan_release_values(ctx, values, depth);
+    JS_ThrowInternalError(ctx, "missing return in verified JIT BigInt plan");
+    return 2;
+}
+
+/* Native property reads are deliberately narrow: only a guarded ordinary own
+   data property with supported primitive values or an object reference is
+   accepted. A child object receives an explicit owned root before its pointer
+   enters the native stack. A miss requests deoptimization so the interpreter
+   can preserve all JavaScript property semantics. */
+static int js_baseline_jit_get_property(JSObject *obj, JSShape *expected_shape,
+                                        uint32_t slot, JSAtom atom,
+                                        int32_t *out_slot, double *out_number,
+                                        JSContext *ctx)
+{
+    JSShape *sh;
+    JSShapeProperty *prs;
+    JSValue value;
+    int tag;
+
+    /* The native guard intentionally accepts only ordinary objects. Arrays,
+       proxies, typed arrays and host/exotic objects keep their interpreter path. */
+    if (!obj || obj->class_id != JS_CLASS_OBJECT || obj->is_exotic ||
+        obj->shape != expected_shape)
+        return 0;
+    sh = obj->shape; /* safe to dereference only after checking the live object */
+    if (slot >= (uint32_t)sh->prop_count || slot >= (uint32_t)sh->prop_size)
+        return 0;
+    prs = &get_shape_prop(sh)[slot];
+    if (prs->atom != atom || (prs->flags & JS_PROP_TMASK) != 0)
+        return 0;
+
+    value = obj->prop[slot].u.value;
+    tag = JS_VALUE_GET_TAG(value);
+    if (tag == JS_TAG_INT) {
+        out_slot[0] = JS_VALUE_GET_INT(value);
+        out_slot[1] = JS_JIT_KIND_INT32;
+        return 1;
+    }
+    if (tag == JS_TAG_BOOL) {
+        out_slot[0] = JS_VALUE_GET_BOOL(value);
+        out_slot[1] = JS_JIT_KIND_BOOL;
+        return 1;
+    }
+    if (tag == JS_TAG_FLOAT64) {
+        *out_number = JS_VALUE_GET_FLOAT64(value);
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_FLOAT64;
+        return 1;
+    }
+    if (tag == JS_TAG_OBJECT) {
+        /* The native stack is invisible to the GC. Acquire a real owned ref
+           before publishing this pointer into its 64-bit lane. */
+        uint64_t object_bits;
+        if (!js_baseline_jit_add_object_root(ctx, value))
+            return 0;
+        object_bits = (uint64_t)(uintptr_t)JS_VALUE_GET_OBJ(value);
+        memcpy(out_number, &object_bits, sizeof(object_bits));
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_OBJECT;
+        return 1;
+    }
+    if (tag == JS_TAG_SHORT_BIG_INT) {
+        uint64_t bigint_bits = (uint64_t)JS_VALUE_GET_SHORT_BIG_INT(value);
+        memcpy(out_number, &bigint_bits, sizeof(bigint_bits));
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_BIGINT;
+        return 1;
+    }
+    if (tag == JS_TAG_BIG_INT) {
+        uint64_t bigint_ptr_bits;
+        if (!js_baseline_jit_add_bigint_root(ctx, value))
+            return 0;
+        bigint_ptr_bits = (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(value);
+        memcpy(out_number, &bigint_ptr_bits, sizeof(bigint_ptr_bits));
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_HEAP_BIGINT;
+        return 1;
+    }
+    return 0;
+}
+
+/* Return a stable pointer to one element of a TypedArray supported by this
+   native tier. DataView, SharedArrayBuffer, resizable/detached buffers and
+   out-of-bounds views remain on QuickJS's interpreter path. Rejecting
+   resizable/shared backing stores avoids stale pointers and C data races. */
+static int js_baseline_jit_typed_array_element_ptr(JSObject *obj, int32_t index,
+                                                   uint8_t **out_ptr,
+                                                   uint16_t *out_class_id)
+{
+    JSTypedArray *ta;
+    JSObject *buffer_obj;
+    JSArrayBuffer *abuf;
+    uint32_t elem_size, expected_count;
+    int size_log2;
+
+    if (!obj || !out_ptr || !out_class_id ||
+        obj->class_id < JS_CLASS_UINT8C_ARRAY ||
+        obj->class_id > JS_CLASS_FLOAT64_ARRAY || !obj->fast_array || index < 0)
+        return 0;
+
+    ta = obj->u.array.u1.typed_array;
+    if (!ta || !(buffer_obj = ta->buffer) ||
+        buffer_obj->class_id != JS_CLASS_ARRAY_BUFFER)
+        return 0;
+    abuf = buffer_obj->u.array_buffer;
+    if (!abuf || abuf->detached || abuf->shared ||
+        abuf->max_byte_length >= 0 || !abuf->data || abuf->byte_length < 0)
+        return 0;
+
+    size_log2 = typed_array_size_log2(obj->class_id);
+    elem_size = 1u << size_log2;
+    if (ta->offset > (uint32_t)abuf->byte_length ||
+        ta->length > (uint32_t)abuf->byte_length - ta->offset ||
+        (ta->length & (elem_size - 1)) != 0)
+        return 0;
+    expected_count = ta->length >> size_log2;
+    if (obj->u.array.count != expected_count || (uint32_t)index >= expected_count ||
+        obj->u.array.u.ptr != (void *)(abuf->data + ta->offset))
+        return 0;
+
+    *out_ptr = abuf->data + ta->offset + ((size_t)(uint32_t)index << size_log2);
+    *out_class_id = obj->class_id;
+    return 1;
+}
+
+/* Native TypedArray reads preserve the element's JS type. Numeric kinds use
+   the int32 or Float64 lane. BigInt64Array uses the short-BigInt lane for every
+   signed 64-bit element; BigUint64Array is native only while the value fits the
+   configured short-BigInt range. Larger unsigned values fall back to QuickJS,
+   which can materialize an arbitrary-precision positive BigInt. */
+static int js_baseline_jit_get_typed_array_element(JSObject *obj, int32_t index,
+                                                    int32_t *out_slot,
+                                                    double *out_number)
+{
+    uint8_t *ptr;
+    uint16_t class_id;
+    int8_t i8;
+    uint8_t u8;
+    int16_t i16;
+    uint16_t u16;
+    int32_t i32;
+    uint32_t u32;
+    uint64_t u64;
+    int64_t i64;
+    float f32;
+    double f64;
+
+    if (!out_slot || !out_number ||
+        !js_baseline_jit_typed_array_element_ptr(obj, index, &ptr, &class_id))
+        return 0;
+
+    switch (class_id) {
+    case JS_CLASS_UINT8C_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:
+        memcpy(&u8, ptr, sizeof(u8));
+        out_slot[0] = u8; out_slot[1] = JS_JIT_KIND_INT32;
+        return 1;
+    case JS_CLASS_INT8_ARRAY:
+        memcpy(&i8, ptr, sizeof(i8));
+        out_slot[0] = i8; out_slot[1] = JS_JIT_KIND_INT32;
+        return 1;
+    case JS_CLASS_INT16_ARRAY:
+        memcpy(&i16, ptr, sizeof(i16));
+        out_slot[0] = i16; out_slot[1] = JS_JIT_KIND_INT32;
+        return 1;
+    case JS_CLASS_UINT16_ARRAY:
+        memcpy(&u16, ptr, sizeof(u16));
+        out_slot[0] = u16; out_slot[1] = JS_JIT_KIND_INT32;
+        return 1;
+    case JS_CLASS_INT32_ARRAY:
+        memcpy(&i32, ptr, sizeof(i32));
+        out_slot[0] = i32; out_slot[1] = JS_JIT_KIND_INT32;
+        return 1;
+    case JS_CLASS_UINT32_ARRAY:
+        memcpy(&u32, ptr, sizeof(u32));
+        if (u32 <= INT32_MAX) {
+            out_slot[0] = (int32_t)u32;
+            out_slot[1] = JS_JIT_KIND_INT32;
+        } else {
+            *out_number = (double)u32;
+            out_slot[0] = 0;
+            out_slot[1] = JS_JIT_KIND_FLOAT64;
+        }
+        return 1;
+    case JS_CLASS_BIG_INT64_ARRAY:
+        memcpy(&i64, ptr, sizeof(i64));
+        if (i64 < (int64_t)JS_SHORT_BIG_INT_MIN ||
+            i64 > (int64_t)JS_SHORT_BIG_INT_MAX)
+            return 0;
+        memcpy(out_number, &i64, sizeof(i64));
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_BIGINT;
+        return 1;
+    case JS_CLASS_BIG_UINT64_ARRAY:
+        memcpy(&u64, ptr, sizeof(u64));
+        if (u64 > (uint64_t)JS_SHORT_BIG_INT_MAX)
+            return 0;
+        memcpy(out_number, &u64, sizeof(u64));
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_BIGINT;
+        return 1;
+    case JS_CLASS_FLOAT16_ARRAY:
+        memcpy(&u16, ptr, sizeof(u16));
+        *out_number = fromfp16(u16);
+        out_slot[0] = 0; out_slot[1] = JS_JIT_KIND_FLOAT64;
+        return 1;
+    case JS_CLASS_FLOAT32_ARRAY:
+        memcpy(&f32, ptr, sizeof(f32));
+        *out_number = (double)f32;
+        out_slot[0] = 0; out_slot[1] = JS_JIT_KIND_FLOAT64;
+        return 1;
+    case JS_CLASS_FLOAT64_ARRAY:
+        memcpy(&f64, ptr, sizeof(f64));
+        *out_number = f64;
+        out_slot[0] = 0; out_slot[1] = JS_JIT_KIND_FLOAT64;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Read an ordinary dense Array or a numeric TypedArray element in the native
+   tier. Ordinary arrays preserve the prior guarded/rooted behavior; typed-array
+   access uses the stricter fixed, attached, unshared backing-store helper above. */
+static int js_baseline_jit_get_array_element(JSObject *obj, int32_t index,
+                                              int32_t *out_slot,
+                                              double *out_number,
+                                              JSContext *ctx)
+{
+    JSValue value;
+    int tag;
+    if (!ctx || !obj || !out_slot || !out_number)
+        return 0;
+    if (obj->class_id != JS_CLASS_ARRAY)
+        return js_baseline_jit_get_typed_array_element(obj, index, out_slot, out_number);
+    if (!obj->fast_array || index < 0 ||
+        (uint32_t)index >= obj->u.array.count || !obj->u.array.u.values)
+        return 0;
+
+    value = obj->u.array.u.values[index];
+    tag = JS_VALUE_GET_TAG(value);
+    if (tag == JS_TAG_INT) {
+        out_slot[0] = JS_VALUE_GET_INT(value);
+        out_slot[1] = JS_JIT_KIND_INT32;
+        return 1;
+    }
+    if (tag == JS_TAG_BOOL) {
+        out_slot[0] = JS_VALUE_GET_BOOL(value);
+        out_slot[1] = JS_JIT_KIND_BOOL;
+        return 1;
+    }
+    if (tag == JS_TAG_FLOAT64) {
+        *out_number = JS_VALUE_GET_FLOAT64(value);
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_FLOAT64;
+        return 1;
+    }
+    if (tag == JS_TAG_OBJECT) {
+        uint64_t object_bits;
+        if (!js_baseline_jit_add_object_root(ctx, value))
+            return 0;
+        object_bits = (uint64_t)(uintptr_t)JS_VALUE_GET_OBJ(value);
+        memcpy(out_number, &object_bits, sizeof(object_bits));
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_OBJECT;
+        return 1;
+    }
+    if (tag == JS_TAG_SHORT_BIG_INT) {
+        uint64_t bigint_bits = (uint64_t)JS_VALUE_GET_SHORT_BIG_INT(value);
+        memcpy(out_number, &bigint_bits, sizeof(bigint_bits));
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_BIGINT;
+        return 1;
+    }
+    if (tag == JS_TAG_BIG_INT) {
+        uint64_t bigint_ptr_bits;
+        if (!js_baseline_jit_add_bigint_root(ctx, value))
+            return 0;
+        bigint_ptr_bits = (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(value);
+        memcpy(out_number, &bigint_ptr_bits, sizeof(bigint_ptr_bits));
+        out_slot[0] = 0;
+        out_slot[1] = JS_JIT_KIND_HEAP_BIGINT;
+        return 1;
+    }
+    return 0;
+}
+
+
+/* Native writes to arrays are restricted to an existing dense element whose
+   old value and replacement are immediate primitives. No length/count change,
+   hole filling, reference-count operation, accessor call, or allocation is
+   allowed here. A guard miss returns before mutation, so restarting the bytecode
+   in the interpreter cannot repeat an observable write. The compiler also
+   requires this to be the only native write and permits no later guard except
+   non-guarding argument reads and return. */
+static int js_baseline_jit_put_array_element(JSContext *ctx, JSObject *obj,
+                                             int32_t index,
+                                             const int32_t *native_value,
+                                             const double *native_number)
+{
+    JSValue old_value, new_value;
+    int old_tag, new_kind;
+
+    if (!ctx || !obj || !native_value || !native_number)
+        return 0;
+
+    /* TypedArray writes apply either Number conversion or BigInt modulo-2^64
+       storage, depending on the view type. The view/backing-store checks run
+       before conversion or mutation; unsupported/reference values, shared or
+       resizable/detached buffers and out-of-bounds indices deopt. */
+    if (obj->class_id != JS_CLASS_ARRAY) {
+        uint8_t *ptr;
+        uint16_t class_id;
+        uint64_t bigint_bits;
+        double number;
+        int32_t integer;
+        uint32_t u32;
+        uint16_t u16;
+        uint8_t u8;
+        float f32;
+
+        if (!js_baseline_jit_typed_array_element_ptr(obj, index, &ptr, &class_id))
+            return 0;
+        new_kind = native_value[1];
+        if (class_id == JS_CLASS_BIG_INT64_ARRAY ||
+            class_id == JS_CLASS_BIG_UINT64_ARRAY) {
+            /* JS already performed ToBigInt when the argument entered the
+               supported native ABI. Only short BigInt values can arrive here;
+               writing raw bits implements the specified modulo-2^64 storage
+               for both BigInt64Array and BigUint64Array, including negatives. */
+            if (new_kind != JS_JIT_KIND_BIGINT)
+                return 0;
+            memcpy(&bigint_bits, native_number, sizeof(bigint_bits));
+            memcpy(ptr, &bigint_bits, sizeof(bigint_bits));
+            return 1;
+        }
+        if (new_kind == JS_JIT_KIND_INT32) {
+            number = (double)native_value[0];
+        } else if (new_kind == JS_JIT_KIND_BOOL) {
+            number = native_value[0] != 0 ? 1.0 : 0.0;
+        } else if (new_kind == JS_JIT_KIND_UINT32) {
+            number = (double)(uint32_t)native_value[0];
+        } else if (new_kind == JS_JIT_KIND_FLOAT64) {
+            number = *native_number;
+        } else {
+            return 0;
+        }
+
+        switch (class_id) {
+        case JS_CLASS_UINT8C_ARRAY:
+            /* ToUint8Clamp has ties-to-even behavior; use QuickJS's own
+               conversion helper on a Number value (no JS coercion can occur). */
+            if (JS_ToUint8ClampFree(ctx, &integer, JS_NewFloat64(ctx, number)) < 0)
+                return 0;
+            u8 = (uint8_t)integer;
+            memcpy(ptr, &u8, sizeof(u8));
+            return 1;
+        case JS_CLASS_INT8_ARRAY:
+        case JS_CLASS_UINT8_ARRAY:
+            if (JS_ToInt32(ctx, &integer, JS_NewFloat64(ctx, number)) < 0)
+                return 0;
+            u8 = (uint8_t)integer;
+            memcpy(ptr, &u8, sizeof(u8));
+            return 1;
+        case JS_CLASS_INT16_ARRAY:
+        case JS_CLASS_UINT16_ARRAY:
+            if (JS_ToInt32(ctx, &integer, JS_NewFloat64(ctx, number)) < 0)
+                return 0;
+            u16 = (uint16_t)integer;
+            memcpy(ptr, &u16, sizeof(u16));
+            return 1;
+        case JS_CLASS_INT32_ARRAY:
+            if (JS_ToInt32(ctx, &integer, JS_NewFloat64(ctx, number)) < 0)
+                return 0;
+            memcpy(ptr, &integer, sizeof(integer));
+            return 1;
+        case JS_CLASS_UINT32_ARRAY:
+            if (JS_ToInt32(ctx, &integer, JS_NewFloat64(ctx, number)) < 0)
+                return 0;
+            u32 = (uint32_t)integer;
+            memcpy(ptr, &u32, sizeof(u32));
+            return 1;
+        case JS_CLASS_FLOAT16_ARRAY:
+            u16 = tofp16(number);
+            memcpy(ptr, &u16, sizeof(u16));
+            return 1;
+        case JS_CLASS_FLOAT32_ARRAY:
+            f32 = (float)number;
+            memcpy(ptr, &f32, sizeof(f32));
+            return 1;
+        case JS_CLASS_FLOAT64_ARRAY:
+            memcpy(ptr, &number, sizeof(number));
+            return 1;
+        default:
+            return 0;
+        }
+    }
+
+    if (!obj->fast_array || index < 0 ||
+        (uint32_t)index >= obj->u.array.count || !obj->u.array.u.values)
+        return 0;
+
+    old_value = obj->u.array.u.values[index];
+    old_tag = JS_VALUE_GET_TAG(old_value);
+    /* Holes, undefined, strings, BigInts, symbols and object values use QuickJS. */
+    if (old_tag != JS_TAG_INT && old_tag != JS_TAG_BOOL &&
+        old_tag != JS_TAG_FLOAT64)
+        return 0;
+
+    new_kind = native_value[1];
+    if (new_kind == JS_JIT_KIND_INT32) {
+        new_value = JS_NewInt32(ctx, native_value[0]);
+    } else if (new_kind == JS_JIT_KIND_BOOL) {
+        new_value = JS_NewBool(ctx, native_value[0] != 0);
+    } else if (new_kind == JS_JIT_KIND_FLOAT64) {
+        new_value = JS_NewFloat64(ctx, *native_number);
+    } else {
+        return 0;
+    }
+
+    /* Both values are immediate primitives, so replacing the slot cannot
+       invoke finalizers or re-enter JS. The array length and shape stay intact. */
+    obj->u.array.u.values[index] = new_value;
+    return 1;
+}
+
+/* Native writes must be narrower than reads: a failed guard must never mutate
+   state before deoptimizing because the interpreter restarts the function from
+   its entry. This helper therefore only updates an ordinary own data property
+   whose old and new values are non-reference primitives. It neither allocates
+   nor decrefs an old value, and it must be the last potentially failing native
+   operation in a compiled function. The descriptor packs atom in its high word
+   and slot in its low word; pointers target the matching native stack cells. */
+static int js_baseline_jit_put_property(JSContext *ctx, JSObject *obj,
+                                        JSShape *expected_shape,
+                                        uint64_t descriptor,
+                                        const int32_t *native_value,
+                                        const double *native_number)
+{
+    uint32_t slot = (uint32_t)descriptor;
+    JSAtom atom = (JSAtom)(descriptor >> 32);
+    JSShape *sh;
+    JSShapeProperty *prs;
+    JSValue old_value, new_value;
+    int old_tag, new_kind;
+
+    if (!ctx || !obj || obj->class_id != JS_CLASS_OBJECT || obj->is_exotic ||
+        obj->shape != expected_shape || !native_value || !native_number)
+        return 0;
+    sh = obj->shape;
+    if (slot >= (uint32_t)sh->prop_count || slot >= (uint32_t)sh->prop_size)
+        return 0;
+    prs = &get_shape_prop(sh)[slot];
+    if (prs->atom != atom ||
+        (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) !=
+            JS_PROP_WRITABLE)
+        return 0;
+
+    old_value = obj->prop[slot].u.value;
+    old_tag = JS_VALUE_GET_TAG(old_value);
+    /* Do not overwrite a reference-counted value without running its lifetime
+       logic. Those cases, including objects and strings, use the interpreter. */
+    if (old_tag != JS_TAG_INT && old_tag != JS_TAG_BOOL &&
+        old_tag != JS_TAG_FLOAT64)
+        return 0;
+
+    new_kind = native_value[1];
+    if (new_kind == JS_JIT_KIND_INT32) {
+        new_value = JS_NewInt32(ctx, native_value[0]);
+    } else if (new_kind == JS_JIT_KIND_BOOL) {
+        new_value = JS_NewBool(ctx, native_value[0] != 0);
+    } else if (new_kind == JS_JIT_KIND_FLOAT64) {
+        new_value = JS_NewFloat64(ctx, *native_number);
+    } else {
+        return 0;
+    }
+
+    /* old_value is guaranteed not to own a reference, so this direct replace
+       is equivalent to set_value() but cannot run a finalizer or re-enter JS. */
+    obj->prop[slot].u.value = new_value;
+    return 1;
+}
+
+typedef struct JSJITReloc {
+    uint32_t disp_pos;
+    int32_t target_bc;
+    uint8_t to_deopt;
+} JSJITReloc;
+
+static void *js_baseline_jit_compile(JSFunctionBytecode *b,
+                                     size_t *mapped_size,
+                                     uint8_t *required_args)
+{
+    uint8_t code[JS_BASELINE_JIT_CODE_CAP];
+    JSJITReloc relocs[1024];
+    int32_t bc_map[JS_BASELINE_JIT_MAX_BYTECODE + 1];
+    int16_t expected_depth[JS_BASELINE_JIT_MAX_BYTECODE + 1];
+    int16_t seen_depth[JS_BASELINE_JIT_MAX_BYTECODE + 1];
+    size_t pos = 0, deopt_pos, map_size;
+    int reloc_count = 0, depth = 0, peak_depth = 0;
+    int max_arg = -1, saw_return = 0, saw_native_put = 0;
+    const uint8_t *start, *pc, *end;
+    long page_size;
+    void *mem;
+    int i;
+
+    if (!b || !mapped_size || !required_args || b->read_only_bytecode ||
+        b->func_kind != JS_FUNC_NORMAL || b->var_ref_count != 0 ||
+        b->closure_var_count != 0 || b->byte_code_len <= 0 ||
+        b->byte_code_len > JS_BASELINE_JIT_MAX_BYTECODE ||
+        b->stack_size == 0 ||
+        (uint32_t)b->var_count + b->stack_size > JS_BASELINE_JIT_MAX_STACK ||
+        b->arg_count > JS_BASELINE_JIT_MAX_ARGS)
+        return NULL;
+
+    for (i = 0; i <= JS_BASELINE_JIT_MAX_BYTECODE; i++) {
+        bc_map[i] = -1;
+        expected_depth[i] = -1;
+        seen_depth[i] = -1;
+    }
+
+#define JIT_EMIT8(v) do { \
+        if (pos >= sizeof(code)) goto unsupported; \
+        code[pos++] = (uint8_t)(v); \
+    } while (0)
+#define JIT_EMIT32(v) do { \
+        uint32_t _jit_v = (uint32_t)(v); \
+        if (pos + sizeof(_jit_v) > sizeof(code)) goto unsupported; \
+        memcpy(code + pos, &_jit_v, sizeof(_jit_v)); \
+        pos += sizeof(_jit_v); \
+    } while (0)
+#define JIT_EMIT64(v) do { \
+        uint64_t _jit_v = (uint64_t)(v); \
+        if (pos + sizeof(_jit_v) > sizeof(code)) goto unsupported; \
+        memcpy(code + pos, &_jit_v, sizeof(_jit_v)); \
+        pos += sizeof(_jit_v); \
+    } while (0)
+#define JIT_ADD_RELOC(target, deopt) do { \
+        if (reloc_count >= (int)(sizeof(relocs) / sizeof(relocs[0]))) \
+            goto unsupported; \
+        relocs[reloc_count].disp_pos = (uint32_t)pos; \
+        relocs[reloc_count].target_bc = (target); \
+        relocs[reloc_count].to_deopt = (deopt); \
+        reloc_count++; \
+    } while (0)
+#define JIT_BRANCH_DEOPT(cc) do { \
+        JIT_EMIT8(0x0f); JIT_EMIT8(cc); \
+        JIT_ADD_RELOC(-1, 1); JIT_EMIT32(0); \
+    } while (0)
+#define JIT_EMIT_BIGINT_HELPER_CALL(left_slot, right_slot, op_code) do { \
+        /* Packed helper ABI: ctx, int/kind stack, numeric lanes, descriptor. \
+           Packing lhs/rhs/op into one immediate cuts three register arguments \
+           down to one and removes two moves from every helper dispatch. */ \
+        JIT_EMIT8(0x57); JIT_EMIT8(0x56); JIT_EMIT8(0x52); JIT_EMIT8(0x51); \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x50); JIT_EMIT8(0x41); JIT_EMIT8(0x51); \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x53); \
+        JIT_EMIT8(0x48); JIT_EMIT8(0x89); JIT_EMIT8(0xd6); /* rsi = stack */ \
+        JIT_EMIT8(0x4c); JIT_EMIT8(0x89); JIT_EMIT8(0xca); /* rdx = numbers */ \
+        JIT_EMIT8(0x48); JIT_EMIT8(0xbf); JIT_EMIT64((uintptr_t)b->realm); \
+        JIT_EMIT8(0xb9); JIT_EMIT32(((uint32_t)(left_slot) & 0xffu) | \
+                                    (((uint32_t)(right_slot) & 0xffu) << 8) | \
+                                    (((uint32_t)(op_code) & 0xffu) << 16) | \
+                                    (((uint32_t)(b->var_count + depth - 1) & 0xffu) << 24)); \
+        JIT_EMIT8(0x48); JIT_EMIT8(0xb8); \
+        JIT_EMIT64((uintptr_t)js_baseline_jit_bigint_binary); \
+        JIT_EMIT8(0xff); JIT_EMIT8(0xd0); \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x5b); JIT_EMIT8(0x41); JIT_EMIT8(0x59); \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x58); JIT_EMIT8(0x59); JIT_EMIT8(0x5a); \
+        JIT_EMIT8(0x5e); JIT_EMIT8(0x5f); \
+        JIT_EMIT8(0x85); JIT_EMIT8(0xc0); JIT_BRANCH_DEOPT(0x84); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(0x02); \
+        JIT_EMIT8(0x75); JIT_EMIT8(0x01); JIT_EMIT8(0xc3); \
+    } while (0)
+#define JIT_PRUNE_LOCAL_BIGINT_ROOT(slot) do { \
+        size_t _prune_skip, _prune_call_end; \
+        int32_t _prune_disp; \
+        /* Most local assignments contain primitives. Only cross into C when \
+           the overwritten local currently carries a heap-BigInt pointer. */ \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32((slot) * 8 + 4); \
+        JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT); \
+        JIT_EMIT8(0x0f); JIT_EMIT8(0x85); _prune_skip = pos; JIT_EMIT32(0); \
+        JIT_EMIT8(0x57); JIT_EMIT8(0x56); JIT_EMIT8(0x52); JIT_EMIT8(0x51); \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x50); JIT_EMIT8(0x41); JIT_EMIT8(0x51); \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x53); \
+        JIT_EMIT8(0x48); JIT_EMIT8(0x89); JIT_EMIT8(0xd6); /* rsi = stack */ \
+        JIT_EMIT8(0x4c); JIT_EMIT8(0x89); JIT_EMIT8(0xca); /* rdx = numbers */ \
+        JIT_EMIT8(0x48); JIT_EMIT8(0xbf); JIT_EMIT64((uintptr_t)b->realm); \
+        JIT_EMIT8(0xb9); JIT_EMIT32(((uint32_t)(slot) & 0xffu) | \
+                                    (((uint32_t)(b->var_count + depth) & 0xffu) << 24)); \
+        JIT_EMIT8(0x48); JIT_EMIT8(0xb8); \
+        JIT_EMIT64((uintptr_t)js_baseline_jit_prune_local_bigint_root); \
+        JIT_EMIT8(0xff); JIT_EMIT8(0xd0); \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x5b); JIT_EMIT8(0x41); JIT_EMIT8(0x59); \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x58); JIT_EMIT8(0x59); JIT_EMIT8(0x5a); \
+        JIT_EMIT8(0x5e); JIT_EMIT8(0x5f); \
+        _prune_call_end = pos; \
+        _prune_disp = (int32_t)_prune_call_end - (int32_t)(_prune_skip + 4); \
+        memcpy(code + _prune_skip, &_prune_disp, sizeof(_prune_disp)); \
+    } while (0)
+#define JIT_LOOP_FUEL() do { \
+        /* SUB dword ptr [r8],1; JZ deopt. R8 is the fifth SysV argument. */ \
+        JIT_EMIT8(0x41); JIT_EMIT8(0x83); JIT_EMIT8(0x28); JIT_EMIT8(0x01); \
+        JIT_BRANCH_DEOPT(0x84); \
+    } while (0)
+#define JIT_STORE_VALUE(slot) do { \
+        JIT_EMIT8(0x89); JIT_EMIT8(0x82); JIT_EMIT32((slot) * 8); \
+    } while (0)
+#define JIT_LOAD_VALUE(slot) do { \
+        JIT_EMIT8(0x8b); JIT_EMIT8(0x82); JIT_EMIT32((slot) * 8); \
+    } while (0)
+#define JIT_STORE_KIND_IMM(slot, kind) do { \
+        JIT_EMIT8(0xc7); JIT_EMIT8(0x82); JIT_EMIT32((slot) * 8 + 4); \
+        JIT_EMIT32(kind); \
+    } while (0)
+#define JIT_COPY_KIND(src, dst) do { \
+        size_t _copy_to_lane_f64, _copy_to_lane_obj, _copy_to_lane_bigint; \
+        size_t _copy_skip_lane, _copy_lane; \
+        /* Float64, rooted object pointers, and both BigInt representations use lane 2. */ \
+        JIT_EMIT8(0x8b); JIT_EMIT8(0x82); JIT_EMIT32((src) * 8 + 4); \
+        JIT_EMIT8(0x89); JIT_EMIT8(0x82); JIT_EMIT32((dst) * 8 + 4); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_FLOAT64); \
+        JIT_EMIT8(0x74); _copy_to_lane_f64 = pos; JIT_EMIT8(0); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_OBJECT); \
+        JIT_EMIT8(0x74); _copy_to_lane_obj = pos; JIT_EMIT8(0); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_BIGINT); \
+        JIT_EMIT8(0x74); _copy_to_lane_bigint = pos; JIT_EMIT8(0); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT); \
+        JIT_EMIT8(0x75); _copy_skip_lane = pos; JIT_EMIT8(0); \
+        _copy_lane = pos; \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x10); \
+        JIT_EMIT8(0x81); JIT_EMIT32((src) * 8); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x11); \
+        JIT_EMIT8(0x81); JIT_EMIT32((dst) * 8); \
+        code[_copy_to_lane_f64] = (uint8_t)(_copy_lane - (_copy_to_lane_f64 + 1)); \
+        code[_copy_to_lane_obj] = (uint8_t)(_copy_lane - (_copy_to_lane_obj + 1)); \
+        code[_copy_to_lane_bigint] = (uint8_t)(_copy_lane - (_copy_to_lane_bigint + 1)); \
+        code[_copy_skip_lane] = (uint8_t)(pos - (_copy_skip_lane + 1)); \
+    } while (0)
+#define JIT_PUSH_INT(value) do { \
+        JIT_EMIT8(0xb8); JIT_EMIT32(value); JIT_STORE_VALUE(b->var_count + depth); \
+        JIT_STORE_KIND_IMM(b->var_count + depth, 0); \
+        depth++; if (depth > peak_depth) peak_depth = depth; \
+    } while (0)
+#define JIT_PUSH_BOOL(value) do { \
+        JIT_EMIT8(0xb8); JIT_EMIT32(value); JIT_STORE_VALUE(b->var_count + depth); \
+        JIT_STORE_KIND_IMM(b->var_count + depth, 1); \
+        depth++; if (depth > peak_depth) peak_depth = depth; \
+    } while (0)
+#define JIT_GUARD_INT(slot) do { \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32((slot) * 8 + 4); \
+        JIT_EMIT8(0x00); JIT_BRANCH_DEOPT(0x85); \
+    } while (0)
+#define JIT_GUARD_NUM(slot) do { \
+        JIT_EMIT8(0x8b); JIT_EMIT8(0x82); JIT_EMIT32((slot) * 8 + 4); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_FLOAT64); \
+        JIT_EMIT8(0x74); JIT_EMIT8(9); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_INT32); \
+        JIT_BRANCH_DEOPT(0x85); \
+    } while (0)
+#define JIT_LOAD_NUM_XMM0(slot) do { \
+        /* Number-to-double conversion; non-number kinds deopt to QuickJS. */ \
+        JIT_EMIT8(0x8b); JIT_EMIT8(0x82); JIT_EMIT32((slot) * 8 + 4); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_FLOAT64); \
+        JIT_EMIT8(0x74); JIT_EMIT8(19); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_INT32); \
+        JIT_BRANCH_DEOPT(0x85); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x2a); JIT_EMIT8(0x82); \
+        JIT_EMIT32((slot) * 8); \
+        JIT_EMIT8(0xeb); JIT_EMIT8(9); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x10); \
+        JIT_EMIT8(0x81); JIT_EMIT32((slot) * 8); \
+    } while (0)
+#define JIT_LOAD_NUM_XMM1(slot) do { \
+        JIT_EMIT8(0x8b); JIT_EMIT8(0x82); JIT_EMIT32((slot) * 8 + 4); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_FLOAT64); \
+        JIT_EMIT8(0x74); JIT_EMIT8(19); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_INT32); \
+        JIT_BRANCH_DEOPT(0x85); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x2a); JIT_EMIT8(0x8a); \
+        JIT_EMIT32((slot) * 8); \
+        JIT_EMIT8(0xeb); JIT_EMIT8(9); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x10); \
+        JIT_EMIT8(0x89); JIT_EMIT32((slot) * 8); \
+    } while (0)
+#define JIT_STORE_NUM_XMM0(slot) do { \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x11); \
+        JIT_EMIT8(0x81); JIT_EMIT32((slot) * 8); \
+        JIT_STORE_KIND_IMM((slot), JS_JIT_KIND_FLOAT64); \
+    } while (0)
+#define JIT_ADD_FLOAT_ONE(slot, subtract) do { \
+        /* xmm0 = slot +/- 1.0; preserve IEEE-754 behavior including NaN/-0. */ \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x10); \
+        JIT_EMIT8(0x81); JIT_EMIT32((slot) * 8); \
+        JIT_EMIT8(0x48); JIT_EMIT8(0xb8); JIT_EMIT64(0x3ff0000000000000ULL); \
+        JIT_EMIT8(0x66); JIT_EMIT8(0x48); JIT_EMIT8(0x0f); JIT_EMIT8(0x6e); JIT_EMIT8(0xc8); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8((subtract) ? 0x5c : 0x58); JIT_EMIT8(0xc1); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x11); \
+        JIT_EMIT8(0x81); JIT_EMIT32((slot) * 8); \
+        JIT_STORE_KIND_IMM((slot), JS_JIT_KIND_FLOAT64); \
+    } while (0)
+#define JIT_LOAD_ARG(idx, slot) do { \
+        size_t _arg_not_float, _arg_to_done_float, _arg_not_object; \
+        size_t _arg_to_done_object, _arg_not_bigint, _arg_to_done_bigint, _arg_bigint_copy, _arg_done; \
+        JIT_EMIT8(0x8b); JIT_EMIT8(0x87); JIT_EMIT32((idx) * 16 + 8); \
+        JIT_EMIT8(0x89); JIT_EMIT8(0x82); JIT_EMIT32((slot) * 8 + 4); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_FLOAT64); \
+        JIT_EMIT8(0x75); _arg_not_float = pos; JIT_EMIT8(0); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x10); JIT_EMIT8(0x87); \
+        JIT_EMIT32((idx) * 16); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x11); \
+        JIT_EMIT8(0x81); JIT_EMIT32((slot) * 8); \
+        JIT_EMIT8(0xe9); _arg_to_done_float = pos; JIT_EMIT32(0); \
+        code[_arg_not_float] = (uint8_t)(pos - (_arg_not_float + 1)); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_OBJECT); \
+        JIT_EMIT8(0x75); _arg_not_object = pos; JIT_EMIT8(0); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x10); JIT_EMIT8(0x87); \
+        JIT_EMIT32((idx) * 16); \
+        JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x11); \
+        JIT_EMIT8(0x81); JIT_EMIT32((slot) * 8); \
+        JIT_EMIT8(0xe9); _arg_to_done_object = pos; JIT_EMIT32(0); \
+        code[_arg_not_object] = (uint8_t)(pos - (_arg_not_object + 1)); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_BIGINT); \
+        JIT_EMIT8(0x74); _arg_bigint_copy = pos; JIT_EMIT8(0); \
+        JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT); \
+        JIT_EMIT8(0x75); _arg_not_bigint = pos; JIT_EMIT8(0); \
+        { size_t _arg_copy_pos = pos; \
+        JIT_EMIT8(0x48); JIT_EMIT8(0x8b); JIT_EMIT8(0x87); JIT_EMIT32((idx) * 16); \
+        JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); JIT_EMIT32((slot) * 8); \
+        JIT_EMIT8(0xe9); _arg_to_done_bigint = pos; JIT_EMIT32(0); \
+        code[_arg_bigint_copy] = (uint8_t)(_arg_copy_pos - (_arg_bigint_copy + 1)); } \
+        code[_arg_not_bigint] = (uint8_t)(pos - (_arg_not_bigint + 1)); \
+        JIT_EMIT8(0x8b); JIT_EMIT8(0x87); JIT_EMIT32((idx) * 16); \
+        JIT_STORE_VALUE((slot)); \
+        _arg_done = pos; \
+        { int32_t _d = (int32_t)_arg_done - (int32_t)(_arg_to_done_float + 4); memcpy(code + _arg_to_done_float, &_d, sizeof(_d)); } \
+        { int32_t _d = (int32_t)_arg_done - (int32_t)(_arg_to_done_object + 4); memcpy(code + _arg_to_done_object, &_d, sizeof(_d)); } \
+        { int32_t _d = (int32_t)_arg_done - (int32_t)(_arg_to_done_bigint + 4); memcpy(code + _arg_to_done_bigint, &_d, sizeof(_d)); } \
+    } while (0)
+#define JIT_PUSH_DOUBLE(bits) do { \
+        JIT_EMIT8(0x48); JIT_EMIT8(0xb8); JIT_EMIT64(bits); \
+        JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); \
+        JIT_EMIT32((b->var_count + depth) * 8); \
+        JIT_STORE_KIND_IMM(b->var_count + depth, JS_JIT_KIND_FLOAT64); \
+        depth++; if (depth > peak_depth) peak_depth = depth; \
+    } while (0)
+#define JIT_PUSH_BIGINT(bits) do { \
+        JIT_EMIT8(0x48); JIT_EMIT8(0xb8); JIT_EMIT64(bits); \
+        JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); \
+        JIT_EMIT32((b->var_count + depth) * 8); \
+        JIT_STORE_KIND_IMM((b->var_count + depth), JS_JIT_KIND_BIGINT); \
+        depth++; if (depth > peak_depth) peak_depth = depth; \
+    } while (0)
+#define JIT_EXPECT_EDGE(target, edge_depth, current_off) do { \
+        int _t = (target); \
+        if (_t < 0 || _t >= b->byte_code_len) goto unsupported; \
+        if (expected_depth[_t] >= 0 && expected_depth[_t] != (edge_depth)) \
+            goto unsupported; \
+        expected_depth[_t] = (int16_t)(edge_depth); \
+        if (_t <= (current_off) && seen_depth[_t] >= 0 && \
+            seen_depth[_t] != (edge_depth)) goto unsupported; \
+    } while (0)
+
+    start = b->byte_code_buf;
+    pc = start;
+    end = start + b->byte_code_len;
+    while (pc < end) {
+        int opcode, idx, bc_off = (int)(pc - start), target, operand_off;
+        int32_t imm, diff;
+        opcode = *pc++;
+        /* Once a native write is emitted, only non-guarding argument reads,
+           no-ops and return may follow. Local reads can still contain an
+           uninitialized/TDZ guard; deoptimizing after the write would replay it. */
+        if (saw_native_put && opcode != OP_nop &&
+            opcode != OP_get_arg && opcode != OP_get_arg0 &&
+            opcode != OP_get_arg1 && opcode != OP_get_arg2 &&
+            opcode != OP_get_arg3 && opcode != OP_return)
+            goto unsupported;
+        if (bc_map[bc_off] != -1)
+            goto unsupported;
+        bc_map[bc_off] = (int32_t)pos;
+        if (expected_depth[bc_off] >= 0 && expected_depth[bc_off] != depth)
+            goto unsupported;
+        if (seen_depth[bc_off] >= 0)
+            goto unsupported;
+        seen_depth[bc_off] = (int16_t)depth;
+
+        switch (opcode) {
+        case OP_nop:
+            break;
+        case OP_push_i32:
+            if (end - pc < 4) goto unsupported;
+            imm = get_i32(pc); pc += 4; JIT_PUSH_INT(imm); break;
+        case OP_push_bigint_i32:
+            if (end - pc < 4) goto unsupported;
+            imm = get_i32(pc); pc += 4;
+            JIT_PUSH_BIGINT((uint64_t)(int64_t)imm);
+            break;
+        case OP_push_const: {
+            uint32_t const_idx;
+            int tag;
+            uint64_t bits;
+            double d;
+            if (end - pc < 4) goto unsupported;
+            const_idx = get_u32(pc); pc += 4;
+            if (const_idx >= (uint32_t)b->cpool_count) goto unsupported;
+            tag = JS_VALUE_GET_TAG(b->cpool[const_idx]);
+            if (tag == JS_TAG_INT) {
+                JIT_PUSH_INT(JS_VALUE_GET_INT(b->cpool[const_idx]));
+            } else if (tag == JS_TAG_BOOL) {
+                JIT_PUSH_BOOL(JS_VALUE_GET_BOOL(b->cpool[const_idx]));
+            } else if (tag == JS_TAG_FLOAT64) {
+                d = JS_VALUE_GET_FLOAT64(b->cpool[const_idx]);
+                memcpy(&bits, &d, sizeof(bits));
+                JIT_PUSH_DOUBLE(bits);
+            } else if (tag == JS_TAG_SHORT_BIG_INT) {
+                bits = (uint64_t)JS_VALUE_GET_SHORT_BIG_INT(b->cpool[const_idx]);
+                JIT_PUSH_BIGINT(bits);
+            } else {
+                goto unsupported;
+            }
+            break;
+        }
+#if SHORT_OPCODES
+        case OP_push_i8:
+            if (pc >= end) goto unsupported;
+            imm = (int8_t)*pc++; JIT_PUSH_INT(imm); break;
+        case OP_push_i16:
+            if (end - pc < 2) goto unsupported;
+            imm = get_i16(pc); pc += 2; JIT_PUSH_INT(imm); break;
+        case OP_push_minus1: JIT_PUSH_INT(-1); break;
+        case OP_push_0: JIT_PUSH_INT(0); break;
+        case OP_push_1: JIT_PUSH_INT(1); break;
+        case OP_push_2: JIT_PUSH_INT(2); break;
+        case OP_push_3: JIT_PUSH_INT(3); break;
+        case OP_push_4: JIT_PUSH_INT(4); break;
+        case OP_push_5: JIT_PUSH_INT(5); break;
+        case OP_push_6: JIT_PUSH_INT(6); break;
+        case OP_push_7: JIT_PUSH_INT(7); break;
+#endif
+        case OP_push_true: JIT_PUSH_BOOL(1); break;
+        case OP_push_false: JIT_PUSH_BOOL(0); break;
+#if SHORT_OPCODES
+        case OP_push_const8: {
+            uint32_t const_idx;
+            int tag;
+            uint64_t bits;
+            double d;
+            if (pc >= end) goto unsupported;
+            const_idx = *pc++;
+            if (const_idx >= (uint32_t)b->cpool_count) goto unsupported;
+            tag = JS_VALUE_GET_TAG(b->cpool[const_idx]);
+            if (tag == JS_TAG_INT) {
+                JIT_PUSH_INT(JS_VALUE_GET_INT(b->cpool[const_idx]));
+            } else if (tag == JS_TAG_BOOL) {
+                JIT_PUSH_BOOL(JS_VALUE_GET_BOOL(b->cpool[const_idx]));
+            } else if (tag == JS_TAG_FLOAT64) {
+                d = JS_VALUE_GET_FLOAT64(b->cpool[const_idx]);
+                memcpy(&bits, &d, sizeof(bits));
+                JIT_PUSH_DOUBLE(bits);
+            } else if (tag == JS_TAG_SHORT_BIG_INT) {
+                bits = (uint64_t)JS_VALUE_GET_SHORT_BIG_INT(b->cpool[const_idx]);
+                JIT_PUSH_BIGINT(bits);
+            } else {
+                goto unsupported;
+            }
+            break;
+        }
+#endif
+        case OP_get_arg:
+            if (end - pc < 2) goto unsupported;
+            idx = (int)get_u16(pc); pc += 2;
+            if (idx < 0 || idx >= JS_BASELINE_JIT_MAX_ARGS || idx >= b->arg_count)
+                goto unsupported;
+            JIT_LOAD_ARG(idx, b->var_count + depth);
+            depth++; if (depth > peak_depth) peak_depth = depth;
+            if (idx > max_arg) max_arg = idx;
+            break;
+#if SHORT_OPCODES
+        case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
+            idx = opcode - OP_get_arg0;
+            if (idx >= b->arg_count || idx >= JS_BASELINE_JIT_MAX_ARGS) goto unsupported;
+            JIT_LOAD_ARG(idx, b->var_count + depth);
+            depth++; if (depth > peak_depth) peak_depth = depth;
+            if (idx > max_arg) max_arg = idx;
+            break;
+#endif
+        case OP_set_loc_uninitialized:
+            if (end - pc < 2) goto unsupported;
+            idx = (int)get_u16(pc); pc += 2;
+            if (idx < 0 || idx >= b->var_count) goto unsupported;
+            /* Reset lexical TDZ state; runtime marker 2 means uninitialized. */
+            JIT_PRUNE_LOCAL_BIGINT_ROOT(idx);
+            JIT_STORE_KIND_IMM(idx, 2);
+            break;
+        case OP_get_loc:
+        case OP_get_loc_check:
+            if (end - pc < 2) goto unsupported;
+            idx = (int)get_u16(pc); pc += 2;
+            if (idx < 0 || idx >= b->var_count ||
+                (saw_native_put && idx >= b->arg_count)) goto unsupported;
+            /* Uninitialized locals must keep QuickJS's ReferenceError semantics. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(idx * 8 + 4); JIT_EMIT8(0x02);
+            JIT_BRANCH_DEOPT(0x84);
+            JIT_LOAD_VALUE(idx); JIT_STORE_VALUE(b->var_count + depth);
+            JIT_COPY_KIND(idx, b->var_count + depth);
+            depth++; if (depth > peak_depth) peak_depth = depth;
+            break;
+        case OP_put_loc:
+        case OP_set_loc:
+        case OP_put_loc_check:
+        case OP_set_loc_check:
+        case OP_put_loc_check_init:
+            if (end - pc < 2 || depth < 1) goto unsupported;
+            idx = (int)get_u16(pc); pc += 2;
+            if (idx < 0 || idx >= b->var_count) goto unsupported;
+            if (opcode == OP_put_loc_check || opcode == OP_set_loc_check) {
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(idx * 8 + 4); JIT_EMIT8(0x02);
+                JIT_BRANCH_DEOPT(0x84); /* assignment before init must throw */
+            } else if (opcode == OP_put_loc_check_init) {
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(idx * 8 + 4); JIT_EMIT8(0x02);
+                JIT_BRANCH_DEOPT(0x85); /* lexical initialization only once */
+            }
+            JIT_PRUNE_LOCAL_BIGINT_ROOT(idx);
+            JIT_LOAD_VALUE(b->var_count + depth - 1); JIT_STORE_VALUE(idx);
+            JIT_COPY_KIND(b->var_count + depth - 1, idx);
+            if (opcode == OP_put_loc || opcode == OP_put_loc_check ||
+                opcode == OP_put_loc_check_init) depth--;
+            break;
+#if SHORT_OPCODES
+        case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
+            idx = opcode - OP_get_loc0;
+            if (idx >= b->var_count || (saw_native_put && idx >= b->arg_count)) goto unsupported;
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(idx * 8 + 4); JIT_EMIT8(0x02);
+            JIT_BRANCH_DEOPT(0x84);
+            JIT_LOAD_VALUE(idx); JIT_STORE_VALUE(b->var_count + depth);
+            JIT_COPY_KIND(idx, b->var_count + depth);
+            depth++; if (depth > peak_depth) peak_depth = depth;
+            break;
+        case OP_get_loc8:
+            if (pc >= end) goto unsupported;
+            idx = *pc++;
+            if (idx >= b->var_count || (saw_native_put && idx >= b->arg_count)) goto unsupported;
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(idx * 8 + 4); JIT_EMIT8(0x02);
+            JIT_BRANCH_DEOPT(0x84);
+            JIT_LOAD_VALUE(idx); JIT_STORE_VALUE(b->var_count + depth);
+            JIT_COPY_KIND(idx, b->var_count + depth);
+            depth++; if (depth > peak_depth) peak_depth = depth;
+            break;
+        case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
+        case OP_set_loc0: case OP_set_loc1: case OP_set_loc2: case OP_set_loc3:
+            if (depth < 1) goto unsupported;
+            if (opcode <= OP_put_loc3) idx = opcode - OP_put_loc0;
+            else idx = opcode - OP_set_loc0;
+            if (idx >= b->var_count) goto unsupported;
+            JIT_PRUNE_LOCAL_BIGINT_ROOT(idx);
+            JIT_LOAD_VALUE(b->var_count + depth - 1); JIT_STORE_VALUE(idx);
+            JIT_COPY_KIND(b->var_count + depth - 1, idx);
+            if (opcode <= OP_put_loc3) depth--;
+            break;
+        case OP_put_loc8: case OP_set_loc8:
+            if (pc >= end || depth < 1) goto unsupported;
+            idx = *pc++;
+            if (idx >= b->var_count) goto unsupported;
+            JIT_PRUNE_LOCAL_BIGINT_ROOT(idx);
+            JIT_LOAD_VALUE(b->var_count + depth - 1); JIT_STORE_VALUE(idx);
+            JIT_COPY_KIND(b->var_count + depth - 1, idx);
+            if (opcode == OP_put_loc8) depth--;
+            break;
+#endif
+        case OP_put_array_el: {
+            int obj_slot, index_slot, value_slot;
+            if (saw_native_put || depth < 3)
+                goto unsupported;
+            obj_slot = b->var_count + depth - 3;
+            index_slot = b->var_count + depth - 2;
+            value_slot = b->var_count + depth - 1;
+
+            /* The receiver and index are checked in generated code. The helper
+               validates fast-array/bounds/old-value/new-value before mutation. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba);
+            JIT_EMIT32(obj_slot * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_OBJECT);
+            JIT_BRANCH_DEOPT(0x85);
+            JIT_GUARD_INT(index_slot);
+
+            /* Five-argument System V helper. Preserve all native ABI lanes and
+               align RSP; r10 remembers the native stack across argument setup. */
+            JIT_EMIT8(0x57);                         /* push rdi */
+            JIT_EMIT8(0x56);                         /* push rsi */
+            JIT_EMIT8(0x52);                         /* push rdx */
+            JIT_EMIT8(0x51);                         /* push rcx */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x50);       /* push r8 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x51);       /* push r9 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x53);       /* push r11: align stack */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0xd2); /* r10 = native stack */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xbf); JIT_EMIT64((uintptr_t)b->realm); /* rdi = ctx */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0xb1);
+            JIT_EMIT32(obj_slot * 8);               /* rsi = object pointer lane */
+            JIT_EMIT8(0x8b); JIT_EMIT8(0x92);
+            JIT_EMIT32(index_slot * 8);             /* edx = int32 index */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8d); JIT_EMIT8(0x8a);
+            JIT_EMIT32(value_slot * 8);             /* rcx = tagged value cell */
+            JIT_EMIT8(0x4d); JIT_EMIT8(0x8d); JIT_EMIT8(0x81);
+            JIT_EMIT32(value_slot * 8);             /* r8 = Float64 value lane */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xb8);
+            JIT_EMIT64((uintptr_t)js_baseline_jit_put_array_element);
+            JIT_EMIT8(0xff); JIT_EMIT8(0xd0);       /* call rax */
+            JIT_EMIT8(0x85); JIT_EMIT8(0xc0);       /* test eax,eax */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc2); /* setnz r10b */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x5b);       /* pop r11 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x59);       /* pop r9 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x58);       /* pop r8 */
+            JIT_EMIT8(0x59);                         /* pop rcx */
+            JIT_EMIT8(0x5a);                         /* pop rdx */
+            JIT_EMIT8(0x5e);                         /* pop rsi */
+            JIT_EMIT8(0x5f);                         /* pop rdi */
+            JIT_EMIT8(0x45); JIT_EMIT8(0x84); JIT_EMIT8(0xd2); /* test r10b,r10b */
+            JIT_BRANCH_DEOPT(0x84);
+
+            depth -= 3;
+            saw_native_put = 1;
+            break;
+        }
+        case OP_get_array_el: {
+            int obj_slot, index_slot, dst_slot;
+            if (depth < 2)
+                goto unsupported;
+            obj_slot = b->var_count + depth - 2;
+            index_slot = b->var_count + depth - 1;
+            dst_slot = obj_slot;
+
+            /* Only tagged object + int32 keys can enter the fast helper. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba);
+            JIT_EMIT32(obj_slot * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_OBJECT);
+            JIT_BRANCH_DEOPT(0x85);
+            JIT_GUARD_INT(index_slot);
+
+            /* The helper has five SysV arguments: array, index, tagged result
+               cell, 64-bit result cell, and realm/context. Seven saved registers
+               keep the incoming ABI lanes intact and align RSP before CALL. */
+            JIT_EMIT8(0x57);                         /* push rdi */
+            JIT_EMIT8(0x56);                         /* push rsi */
+            JIT_EMIT8(0x52);                         /* push rdx */
+            JIT_EMIT8(0x51);                         /* push rcx */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x50);       /* push r8 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x51);       /* push r9 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x53);       /* push r11 */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0xd2); /* r10 = native stack */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0xb9);
+            JIT_EMIT32(obj_slot * 8);               /* rdi = array pointer lane */
+            JIT_EMIT8(0x8b); JIT_EMIT8(0xb2);
+            JIT_EMIT32(index_slot * 8);             /* esi = int32 index */
+            JIT_EMIT8(0x48); JIT_EMIT8(0x8d); JIT_EMIT8(0x92);
+            JIT_EMIT32(dst_slot * 8);               /* rdx = tagged result cell */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8d); JIT_EMIT8(0x89);
+            JIT_EMIT32(dst_slot * 8);               /* rcx = 64-bit result lane */
+            JIT_EMIT8(0x49); JIT_EMIT8(0xb8); JIT_EMIT64((uintptr_t)b->realm); /* r8 = ctx */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xb8);
+            JIT_EMIT64((uintptr_t)js_baseline_jit_get_array_element);
+            JIT_EMIT8(0xff); JIT_EMIT8(0xd0);       /* call rax */
+            JIT_EMIT8(0x85); JIT_EMIT8(0xc0);
+            JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc2); /* setnz r10b */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x5b);       /* pop r11 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x59);       /* pop r9 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x58);       /* pop r8 */
+            JIT_EMIT8(0x59);                         /* pop rcx */
+            JIT_EMIT8(0x5a);                         /* pop rdx */
+            JIT_EMIT8(0x5e);                         /* pop rsi */
+            JIT_EMIT8(0x5f);                         /* pop rdi */
+            JIT_EMIT8(0x45); JIT_EMIT8(0x84); JIT_EMIT8(0xd2); /* test helper result */
+            JIT_BRANCH_DEOPT(0x84);
+            depth--;
+            break;
+        }
+        case OP_get_field:
+        case OP_get_field2: {
+            uint32_t atom;
+            JSRuntime *rt = b->realm->rt;
+            JSPropertyICEntry *entry;
+            uintptr_t ic_site = (uintptr_t)(start + bc_off);
+            uintptr_t expected_shape;
+            uint32_t property_slot;
+            int src_slot, dst_slot;
+            size_t ic_idx;
+
+            if (end - pc < 4 || depth < 1)
+                goto unsupported;
+            atom = get_u32(pc);
+            pc += 4;
+            ic_idx = js_property_ic_index(ic_site, atom, JS_PROPERTY_IC_GET);
+            entry = &rt->property_ic[ic_idx];
+            /* Compile only a previously observed monomorphic site. */
+            if (!entry->valid || entry->site != ic_site ||
+                entry->atom != atom || entry->kind != JS_PROPERTY_IC_GET)
+                goto unsupported;
+            expected_shape = entry->shape_id;
+            property_slot = entry->slot;
+            src_slot = b->var_count + depth - 1;
+            if (opcode == OP_get_field2) {
+                dst_slot = b->var_count + depth;
+                if (depth + 1 > b->stack_size)
+                    goto unsupported;
+            } else {
+                dst_slot = src_slot;
+            }
+
+            /* Object pointers occupy the 64-bit lane; argv keeps them rooted
+               while this non-allocating native frame is executing. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba);
+            JIT_EMIT32(src_slot * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_OBJECT);
+            JIT_BRANCH_DEOPT(0x85);
+
+            /* Save all persistent argument registers and keep call alignment. */
+            JIT_EMIT8(0x57);                         /* push rdi */
+            JIT_EMIT8(0x56);                         /* push rsi */
+            JIT_EMIT8(0x52);                         /* push rdx */
+            JIT_EMIT8(0x51);                         /* push rcx */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x50);       /* push r8 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x51);       /* push r9 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x53);       /* push r11: align stack */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0xd2); /* r10 = stack base */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0xb9);
+            JIT_EMIT32(src_slot * 8);              /* rdi = object pointer from lane */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xbe); JIT_EMIT64(expected_shape); /* rsi = shape */
+            JIT_EMIT8(0xba); JIT_EMIT32(property_slot); /* edx = property slot */
+            JIT_EMIT8(0xb9); JIT_EMIT32(atom);        /* ecx = atom */
+            JIT_EMIT8(0x4d); JIT_EMIT8(0x8d); JIT_EMIT8(0x82);
+            JIT_EMIT32(dst_slot * 8);              /* r8 = native result slot */
+            JIT_EMIT8(0x4d); JIT_EMIT8(0x8d); JIT_EMIT8(0x89);
+            JIT_EMIT32(dst_slot * 8);              /* r9 = result number lane */
+            /* The helper's seventh argument is JSContext*. Keep SysV stack
+               alignment while placing it above the return address. */
+            JIT_EMIT8(0x49); JIT_EMIT8(0xbb); JIT_EMIT64((uintptr_t)b->realm); /* r11 = context */
+            JIT_EMIT8(0x48); JIT_EMIT8(0x83); JIT_EMIT8(0xec); JIT_EMIT8(0x08); /* sub rsp,8 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x53);       /* push r11 = arg7 */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xb8);
+            JIT_EMIT64((uintptr_t)js_baseline_jit_get_property);
+            JIT_EMIT8(0xff); JIT_EMIT8(0xd0);       /* call rax */
+            JIT_EMIT8(0x48); JIT_EMIT8(0x83); JIT_EMIT8(0xc4); JIT_EMIT8(0x10); /* add rsp,16 */
+            JIT_EMIT8(0x85); JIT_EMIT8(0xc0);       /* test eax,eax: use helper result, not stale flags */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc2); /* setnz r10b */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x5b);       /* pop r11 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x59);       /* pop r9 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x58);       /* pop r8 */
+            JIT_EMIT8(0x59);                         /* pop rcx */
+            JIT_EMIT8(0x5a);                         /* pop rdx */
+            JIT_EMIT8(0x5e);                         /* pop rsi */
+            JIT_EMIT8(0x5f);                         /* pop rdi */
+            JIT_EMIT8(0x45); JIT_EMIT8(0x84); JIT_EMIT8(0xd2); /* test r10b,r10b */
+            JIT_BRANCH_DEOPT(0x84);
+
+            if (opcode == OP_get_field2) {
+                depth++;
+                if (depth > peak_depth) peak_depth = depth;
+            }
+            break;
+        }
+        case OP_put_field: {
+            uint32_t atom;
+            JSRuntime *rt = b->realm->rt;
+            JSPropertyICEntry *entry;
+            uintptr_t ic_site = (uintptr_t)(start + bc_off);
+            uintptr_t expected_shape;
+            uint32_t property_slot;
+            int obj_slot, value_slot;
+            size_t ic_idx;
+            uint64_t descriptor;
+
+            if (saw_native_put || end - pc < 4 || depth < 2)
+                goto unsupported;
+            atom = get_u32(pc);
+            pc += 4;
+            ic_idx = js_property_ic_index(ic_site, atom, JS_PROPERTY_IC_PUT);
+            entry = &rt->property_ic[ic_idx];
+            /* Compile only a warmed monomorphic writable-data-property site. */
+            if (!entry->valid || entry->site != ic_site || entry->atom != atom ||
+                entry->kind != JS_PROPERTY_IC_PUT)
+                goto unsupported;
+            expected_shape = entry->shape_id;
+            property_slot = entry->slot;
+            obj_slot = b->var_count + depth - 2;
+            value_slot = b->var_count + depth - 1;
+            descriptor = ((uint64_t)atom << 32) | property_slot;
+
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba);
+            JIT_EMIT32(obj_slot * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_OBJECT);
+            JIT_BRANCH_DEOPT(0x85);
+
+            /* Same SysV alignment/preserved-register discipline as guarded reads.
+               r10 holds the native int/kind lane during helper argument setup. */
+            JIT_EMIT8(0x57);                         /* push rdi */
+            JIT_EMIT8(0x56);                         /* push rsi */
+            JIT_EMIT8(0x52);                         /* push rdx */
+            JIT_EMIT8(0x51);                         /* push rcx */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x50);       /* push r8 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x51);       /* push r9 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x53);       /* push r11: align stack */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0xd2); /* r10 = native stack */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xbf); JIT_EMIT64((uintptr_t)b->realm); /* rdi = context */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0xb1);
+            JIT_EMIT32(obj_slot * 8);               /* rsi = object ptr in number lane */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xba); JIT_EMIT64(expected_shape); /* rdx = shape */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xb9); JIT_EMIT64(descriptor); /* rcx = atom|slot */
+            JIT_EMIT8(0x4d); JIT_EMIT8(0x8d); JIT_EMIT8(0x82);
+            JIT_EMIT32(value_slot * 8);             /* r8 = value payload/kind cell */
+            JIT_EMIT8(0x4d); JIT_EMIT8(0x8d); JIT_EMIT8(0x89);
+            JIT_EMIT32(value_slot * 8);             /* r9 = Float64 cell */
+            JIT_EMIT8(0x48); JIT_EMIT8(0xb8);
+            JIT_EMIT64((uintptr_t)js_baseline_jit_put_property);
+            JIT_EMIT8(0xff); JIT_EMIT8(0xd0);       /* call rax */
+            JIT_EMIT8(0x85); JIT_EMIT8(0xc0);
+            JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc2); /* setnz r10b */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x5b);       /* pop r11 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x59);       /* pop r9 */
+            JIT_EMIT8(0x41); JIT_EMIT8(0x58);       /* pop r8 */
+            JIT_EMIT8(0x59);                       /* pop rcx */
+            JIT_EMIT8(0x5a);                       /* pop rdx */
+            JIT_EMIT8(0x5e);                       /* pop rsi */
+            JIT_EMIT8(0x5f);                       /* pop rdi */
+            JIT_EMIT8(0x45); JIT_EMIT8(0x84); JIT_EMIT8(0xd2); /* test r10b,r10b */
+            JIT_BRANCH_DEOPT(0x84);
+
+            depth -= 2;
+            saw_native_put = 1;
+            break;
+        }
+        case OP_add: case OP_sub: case OP_mul: case OP_div: {
+            int left, right;
+            if (depth < 2) goto unsupported;
+            left = b->var_count + depth - 2; right = b->var_count + depth - 1;
+            if (opcode != OP_div) {
+                size_t to_float_left, to_float_right, to_done;
+                size_t float_pos, done_pos;
+                size_t to_not_bigint, to_bigint_done;
+                size_t to_heap_left, to_heap_right, heap_pos, heap_success, number_pos;
+                int32_t displacement;
+                /* Keep short-BigInt arithmetic directly in registers. Heap-backed
+                   BigInts use QuickJS's arbitrary-precision helper, with an owned
+                   root for the result before it enters the native stack. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_left = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_not_bigint = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_right = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_BIGINT); JIT_BRANCH_DEOPT(0x85);
+                JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0x81); JIT_EMIT32(left * 8);
+                if (opcode == OP_add) {
+                    JIT_EMIT8(0x49); JIT_EMIT8(0x03); JIT_EMIT8(0x81); JIT_EMIT32(right * 8);
+                } else if (opcode == OP_sub) {
+                    JIT_EMIT8(0x49); JIT_EMIT8(0x2b); JIT_EMIT8(0x81); JIT_EMIT32(right * 8);
+                } else {
+                    JIT_EMIT8(0x49); JIT_EMIT8(0x0f); JIT_EMIT8(0xaf); JIT_EMIT8(0x81); JIT_EMIT32(right * 8);
+                }
+                JIT_BRANCH_DEOPT(0x80); /* signed overflow: arbitrary precision fallback */
+                JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); JIT_EMIT32(left * 8);
+                JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BIGINT);
+                JIT_EMIT8(0xe9); to_bigint_done = pos; JIT_EMIT32(0);
+
+                /* Heap-backed BigInt path. Packed helper ABI: context, native
+                   stack, numeric lane, and one descriptor containing left/right
+                   slots plus opcode. Seven pushes preserve ABI alignment/state. */
+                heap_pos = pos;
+                displacement = (int32_t)heap_pos - (int32_t)(to_heap_left + 4);
+                memcpy(code + to_heap_left, &displacement, sizeof(displacement));
+                displacement = (int32_t)heap_pos - (int32_t)(to_heap_right + 4);
+                memcpy(code + to_heap_right, &displacement, sizeof(displacement));
+                JIT_EMIT8(0x57);                         /* push rdi */
+                JIT_EMIT8(0x56);                         /* push rsi */
+                JIT_EMIT8(0x52);                         /* push rdx */
+                JIT_EMIT8(0x51);                         /* push rcx */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x50);       /* push r8 */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x51);       /* push r9 */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x53);       /* push r11 */
+                JIT_EMIT8(0x48); JIT_EMIT8(0x89); JIT_EMIT8(0xd6); /* rsi = stack */
+                JIT_EMIT8(0x4c); JIT_EMIT8(0x89); JIT_EMIT8(0xca); /* rdx = numbers */
+                JIT_EMIT8(0x48); JIT_EMIT8(0xbf); JIT_EMIT64((uintptr_t)b->realm); /* rdi = ctx */
+                JIT_EMIT8(0xb9); JIT_EMIT32(((uint32_t)left & 0xffu) |
+                                             (((uint32_t)right & 0xffu) << 8) |
+                                             (((uint32_t)opcode & 0xffu) << 16) |
+                                             (((uint32_t)(b->var_count + depth - 1) & 0xffu) << 24)); /* ecx = descriptor */
+                JIT_EMIT8(0x48); JIT_EMIT8(0xb8);
+                JIT_EMIT64((uintptr_t)js_baseline_jit_bigint_binary);
+                JIT_EMIT8(0xff); JIT_EMIT8(0xd0);       /* call helper */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x5b);       /* pop r11 */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x59);       /* pop r9 */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x58);       /* pop r8 */
+                JIT_EMIT8(0x59);                         /* pop rcx */
+                JIT_EMIT8(0x5a);                         /* pop rdx */
+                JIT_EMIT8(0x5e);                         /* pop rsi */
+                JIT_EMIT8(0x5f);                         /* pop rdi */
+                JIT_EMIT8(0x85); JIT_EMIT8(0xc0);       /* test eax,eax */
+                JIT_BRANCH_DEOPT(0x84);                 /* status 0: guard miss */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(0x02); /* exception status */
+                JIT_EMIT8(0x75); JIT_EMIT8(0x01);      /* success -> jump over ret */
+                JIT_EMIT8(0xc3);                         /* return status 2 to dispatcher */
+                JIT_EMIT8(0xe9); heap_success = pos; JIT_EMIT32(0);
+                number_pos = pos;
+                displacement = (int32_t)number_pos - (int32_t)(to_not_bigint + 4);
+                memcpy(code + to_not_bigint, &displacement, sizeof(displacement));
+                /* Keep the established checked int32 path; route other Numbers
+                   through SSE2 so fractional values and IEEE-754 edge cases work. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4); JIT_EMIT8(JS_JIT_KIND_INT32);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_float_left = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4); JIT_EMIT8(JS_JIT_KIND_INT32);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_float_right = pos; JIT_EMIT32(0);
+                JIT_LOAD_VALUE(left);
+                if (opcode == OP_mul) {
+                    /* 0 * negative values can produce observable -0 in JS. */
+                    JIT_EMIT8(0x85); JIT_EMIT8(0xc0); JIT_BRANCH_DEOPT(0x84);
+                    JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8); JIT_EMIT8(0x00);
+                    JIT_BRANCH_DEOPT(0x84);
+                    JIT_EMIT8(0x0f); JIT_EMIT8(0xaf); JIT_EMIT8(0x82); JIT_EMIT32(right * 8);
+                } else {
+                    JIT_EMIT8(opcode == OP_add ? 0x03 : 0x2b); JIT_EMIT8(0x82); JIT_EMIT32(right * 8);
+                }
+                JIT_BRANCH_DEOPT(0x80); /* preserve JS number overflow semantics */
+                JIT_STORE_VALUE(left); JIT_STORE_KIND_IMM(left, JS_JIT_KIND_INT32);
+                depth--;
+                JIT_EMIT8(0xe9); to_done = pos; JIT_EMIT32(0);
+                float_pos = pos;
+                displacement = (int32_t)float_pos - (int32_t)(to_float_left + 4);
+                memcpy(code + to_float_left, &displacement, sizeof(displacement));
+                displacement = (int32_t)float_pos - (int32_t)(to_float_right + 4);
+                memcpy(code + to_float_right, &displacement, sizeof(displacement));
+                JIT_LOAD_NUM_XMM0(left); JIT_LOAD_NUM_XMM1(right);
+                if (opcode == OP_add) {
+                    JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x58); JIT_EMIT8(0xc1); /* addsd xmm0,xmm1 */
+                } else if (opcode == OP_sub) {
+                    JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x5c); JIT_EMIT8(0xc1); /* subsd xmm0,xmm1 */
+                } else {
+                    JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x59); JIT_EMIT8(0xc1); /* mulsd xmm0,xmm1 */
+                }
+                JIT_STORE_NUM_XMM0(left);
+                done_pos = pos;
+                displacement = (int32_t)done_pos - (int32_t)(to_done + 4);
+                memcpy(code + to_done, &displacement, sizeof(displacement));
+                displacement = (int32_t)pos - (int32_t)(to_bigint_done + 4);
+                memcpy(code + to_bigint_done, &displacement, sizeof(displacement));
+                displacement = (int32_t)pos - (int32_t)(heap_success + 4);
+                memcpy(code + heap_success, &displacement, sizeof(displacement));
+            } else {
+                size_t to_number_div, to_div_done, min_case_safe, div_pos;
+                size_t to_heap_left, to_heap_right, to_normal, heap_pos, heap_done;
+                size_t normal_pos, final_pos;
+                int32_t displacement;
+                /* Heap-backed BigInt division uses QuickJS's exact divrem helper.
+                   Dispatch before any operation can mutate the native result slot. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_left = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_right = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0xe9); to_normal = pos; JIT_EMIT32(0);
+                heap_pos = pos;
+                displacement = (int32_t)heap_pos - (int32_t)(to_heap_left + 4);
+                memcpy(code + to_heap_left, &displacement, sizeof(displacement));
+                displacement = (int32_t)heap_pos - (int32_t)(to_heap_right + 4);
+                memcpy(code + to_heap_right, &displacement, sizeof(displacement));
+                JIT_EMIT_BIGINT_HELPER_CALL(left, right, opcode);
+                JIT_EMIT8(0xe9); heap_done = pos; JIT_EMIT32(0);
+                normal_pos = pos;
+                displacement = (int32_t)normal_pos - (int32_t)(to_normal + 4);
+                memcpy(code + to_normal, &displacement, sizeof(displacement));
+                /* Short-BigInt signed division is exact except divisor zero and
+                   INT64_MIN / -1. Those cases deopt before mutation so QuickJS
+                   can throw or construct an arbitrary-precision result. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_number_div = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_BIGINT); JIT_BRANCH_DEOPT(0x85);
+                /* divisor == 0 -> interpreter throws the spec TypeError */
+                JIT_EMIT8(0x49); JIT_EMIT8(0x83); JIT_EMIT8(0xb9);
+                JIT_EMIT32(right * 8); JIT_EMIT8(0x00);
+                JIT_BRANCH_DEOPT(0x84);
+                JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0x81); JIT_EMIT32(left * 8); /* rax=lhs */
+                JIT_EMIT8(0x49); JIT_EMIT8(0xba); JIT_EMIT64(UINT64_C(0x8000000000000000)); /* r10=INT64_MIN */
+                JIT_EMIT8(0x4c); JIT_EMIT8(0x39); JIT_EMIT8(0xd0); /* cmp rax,r10 */
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); min_case_safe = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x49); JIT_EMIT8(0x83); JIT_EMIT8(0xb9);
+                JIT_EMIT32(right * 8); JIT_EMIT8(0xff); /* cmp rhs,-1 */
+                JIT_BRANCH_DEOPT(0x84);
+                div_pos = pos;
+                displacement = (int32_t)div_pos - (int32_t)(min_case_safe + 4);
+                memcpy(code + min_case_safe, &displacement, sizeof(displacement));
+                JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0xd3); /* r11 = native int-stack base (idiv clobbers rdx) */
+                JIT_EMIT8(0x48); JIT_EMIT8(0x99); /* cqo */
+                JIT_EMIT8(0x49); JIT_EMIT8(0xf7); JIT_EMIT8(0xb9); JIT_EMIT32(right * 8); /* idiv qword [r9+rhs] */
+                JIT_EMIT8(0x4c); JIT_EMIT8(0x89); JIT_EMIT8(0xda); /* restore rdx = native int-stack base */
+                JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); JIT_EMIT32(left * 8); /* result=rax */
+                JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BIGINT);
+                JIT_EMIT8(0xe9); to_div_done = pos; JIT_EMIT32(0);
+                div_pos = pos;
+                displacement = (int32_t)div_pos - (int32_t)(to_number_div + 4);
+                memcpy(code + to_number_div, &displacement, sizeof(displacement));
+                JIT_LOAD_NUM_XMM0(left); JIT_LOAD_NUM_XMM1(right);
+                JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x5e); JIT_EMIT8(0xc1); /* divsd xmm0,xmm1 */
+                JIT_STORE_NUM_XMM0(left);
+                div_pos = pos;
+                displacement = (int32_t)div_pos - (int32_t)(to_div_done + 4);
+                memcpy(code + to_div_done, &displacement, sizeof(displacement));
+                depth--;
+                final_pos = pos;
+                displacement = (int32_t)final_pos - (int32_t)(heap_done + 4);
+                memcpy(code + heap_done, &displacement, sizeof(displacement));
+            }
+            break;
+        }
+        case OP_mod: {
+            int left, right;
+            size_t min_case_safe;
+            size_t to_heap_left, to_heap_right, to_normal, heap_pos, heap_done;
+            size_t normal_pos, final_pos;
+            int32_t displacement;
+            if (depth < 2) goto unsupported;
+            left = b->var_count + depth - 2;
+            right = b->var_count + depth - 1;
+            /* Heap-backed modulo uses the exact QuickJS divrem helper. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_left = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_right = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0xe9); to_normal = pos; JIT_EMIT32(0);
+            heap_pos = pos;
+            displacement = (int32_t)heap_pos - (int32_t)(to_heap_left + 4);
+            memcpy(code + to_heap_left, &displacement, sizeof(displacement));
+            displacement = (int32_t)heap_pos - (int32_t)(to_heap_right + 4);
+            memcpy(code + to_heap_right, &displacement, sizeof(displacement));
+            JIT_EMIT_BIGINT_HELPER_CALL(left, right, opcode);
+            JIT_EMIT8(0xe9); heap_done = pos; JIT_EMIT32(0);
+            normal_pos = pos;
+            displacement = (int32_t)normal_pos - (int32_t)(to_normal + 4);
+            memcpy(code + to_normal, &displacement, sizeof(displacement));
+            /* Number remainder, mixed kinds and zero division keep QuickJS's path. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT); JIT_BRANCH_DEOPT(0x85);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT); JIT_BRANCH_DEOPT(0x85);
+            JIT_EMIT8(0x49); JIT_EMIT8(0x83); JIT_EMIT8(0xb9);
+            JIT_EMIT32(right * 8); JIT_EMIT8(0x00); /* divisor zero */
+            JIT_BRANCH_DEOPT(0x84);
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0x81); JIT_EMIT32(left * 8);
+            JIT_EMIT8(0x49); JIT_EMIT8(0xba); JIT_EMIT64(UINT64_C(0x8000000000000000));
+            JIT_EMIT8(0x4c); JIT_EMIT8(0x39); JIT_EMIT8(0xd0);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x85); min_case_safe = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x49); JIT_EMIT8(0x83); JIT_EMIT8(0xb9);
+            JIT_EMIT32(right * 8); JIT_EMIT8(0xff);
+            JIT_BRANCH_DEOPT(0x84); /* INT64_MIN % -1 falls back (IDIV faults) */
+            displacement = (int32_t)pos - (int32_t)(min_case_safe + 4);
+            memcpy(code + min_case_safe, &displacement, sizeof(displacement));
+            JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0xd3); /* preserve native stack base */
+            JIT_EMIT8(0x48); JIT_EMIT8(0x99); /* cqo */
+            JIT_EMIT8(0x49); JIT_EMIT8(0xf7); JIT_EMIT8(0xb9); JIT_EMIT32(right * 8); /* idiv */
+            JIT_EMIT8(0x48); JIT_EMIT8(0x89); JIT_EMIT8(0xd0); /* mov rax,rdx remainder */
+            JIT_EMIT8(0x4c); JIT_EMIT8(0x89); JIT_EMIT8(0xda); /* restore rdx */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); JIT_EMIT32(left * 8);
+            JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BIGINT);
+            depth--;
+            final_pos = pos;
+            displacement = (int32_t)final_pos - (int32_t)(heap_done + 4);
+            memcpy(code + heap_done, &displacement, sizeof(displacement));
+            break;
+        }
+        case OP_and: case OP_or: case OP_xor:
+        case OP_shl: case OP_sar: case OP_shr: {
+            int left, right;
+            size_t to_bits_done = 0;
+            size_t to_heap_left = 0, to_heap_right = 0, to_non_heap = 0;
+            size_t heap_pos = 0, heap_done = 0, non_heap_pos = 0;
+            if (depth < 2) goto unsupported;
+            left = b->var_count + depth - 2;
+            right = b->var_count + depth - 1;
+            if (opcode == OP_and || opcode == OP_or || opcode == OP_xor) {
+                size_t to_number_bits, bigint_bits_pos;
+                int32_t displacement;
+                /* Heap-backed bitwise operations use QuickJS's exact infinite-
+                   two's-complement implementation. Other kinds use the existing
+                   guarded short-BigInt or Number paths below. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_left = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_right = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0xe9); to_non_heap = pos; JIT_EMIT32(0);
+                heap_pos = pos;
+                displacement = (int32_t)heap_pos - (int32_t)(to_heap_left + 4);
+                memcpy(code + to_heap_left, &displacement, sizeof(displacement));
+                displacement = (int32_t)heap_pos - (int32_t)(to_heap_right + 4);
+                memcpy(code + to_heap_right, &displacement, sizeof(displacement));
+                JIT_EMIT_BIGINT_HELPER_CALL(left, right, opcode);
+                JIT_EMIT8(0xe9); heap_done = pos; JIT_EMIT32(0);
+                non_heap_pos = pos;
+                displacement = (int32_t)non_heap_pos - (int32_t)(to_non_heap + 4);
+                memcpy(code + to_non_heap, &displacement, sizeof(displacement));
+                /* Infinite two's-complement BigInt & | ^ preserve exact results. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_number_bits = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_BIGINT); JIT_BRANCH_DEOPT(0x85);
+                JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0x81); JIT_EMIT32(left * 8);
+                if (opcode == OP_and) {
+                    JIT_EMIT8(0x49); JIT_EMIT8(0x23); JIT_EMIT8(0x81); JIT_EMIT32(right * 8);
+                } else if (opcode == OP_or) {
+                    JIT_EMIT8(0x49); JIT_EMIT8(0x0b); JIT_EMIT8(0x81); JIT_EMIT32(right * 8);
+                } else {
+                    JIT_EMIT8(0x49); JIT_EMIT8(0x33); JIT_EMIT8(0x81); JIT_EMIT32(right * 8);
+                }
+                JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); JIT_EMIT32(left * 8);
+                JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BIGINT);
+                JIT_EMIT8(0xe9); to_bits_done = pos; JIT_EMIT32(0);
+                bigint_bits_pos = pos;
+                displacement = (int32_t)bigint_bits_pos - (int32_t)(to_number_bits + 4);
+                memcpy(code + to_number_bits, &displacement, sizeof(displacement));
+            }
+            /* Existing Number/ToInt32 implementation below. */
+            JIT_GUARD_INT(left);
+                JIT_GUARD_INT(right);
+                JIT_LOAD_VALUE(left);
+                if (opcode == OP_and) {
+                /* AND EAX, dword ptr [RDX + right*8] */
+                JIT_EMIT8(0x23); JIT_EMIT8(0x82); JIT_EMIT32(right * 8);
+            } else if (opcode == OP_or) {
+                /* OR EAX, dword ptr [RDX + right*8] */
+                JIT_EMIT8(0x0b); JIT_EMIT8(0x82); JIT_EMIT32(right * 8);
+            } else if (opcode == OP_xor) {
+                /* XOR EAX, dword ptr [RDX + right*8] */
+                JIT_EMIT8(0x33); JIT_EMIT8(0x82); JIT_EMIT32(right * 8);
+            } else {
+                JIT_GUARD_INT(left);
+                JIT_GUARD_INT(right);
+                JIT_LOAD_VALUE(left);
+                /* RCX is the result-kind pointer in the native ABI. Preserve
+                   it in R9 while using CL as x86's variable shift count. */
+                JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0xc9); /* mov r9,rcx */
+                JIT_EMIT8(0x8b); JIT_EMIT8(0x8a); JIT_EMIT32(right * 8); /* ecx=count */
+                if (opcode == OP_shl) {
+                    JIT_EMIT8(0xd3); JIT_EMIT8(0xe0); /* shl eax,cl */
+                } else if (opcode == OP_sar) {
+                    JIT_EMIT8(0xd3); JIT_EMIT8(0xf8); /* sar eax,cl */
+                } else {
+                    JIT_EMIT8(0xd3); JIT_EMIT8(0xe8); /* shr eax,cl */
+                }
+                JIT_EMIT8(0x4c); JIT_EMIT8(0x89); JIT_EMIT8(0xc9); /* mov rcx,r9 */
+            }
+            JIT_STORE_VALUE(left);
+            if (opcode == OP_shr) {
+                /* >>> produces a positive Number in [2^31, 2^32-1] when
+                   the raw result has its sign bit set. Mark kind 3 so a
+                   direct return is materialized as uint32 -> double. Any
+                   subsequent int32-only operation will safely deopt. */
+                JIT_STORE_KIND_IMM(left, 0);
+                JIT_EMIT8(0x85); JIT_EMIT8(0xc0); /* test eax,eax */
+                JIT_EMIT8(0x79); JIT_EMIT8(0x0a); /* jns over 10-byte store */
+                JIT_STORE_KIND_IMM(left, 3);
+            } else {
+                JIT_STORE_KIND_IMM(left, 0);
+            }
+            depth--;
+            if (opcode == OP_and || opcode == OP_or || opcode == OP_xor) {
+                size_t done_bits_pos = pos;
+                int32_t displacement = (int32_t)done_bits_pos - (int32_t)(to_bits_done + 4);
+                memcpy(code + to_bits_done, &displacement, sizeof(displacement));
+                displacement = (int32_t)done_bits_pos - (int32_t)(heap_done + 4);
+                memcpy(code + heap_done, &displacement, sizeof(displacement));
+            }
+            break;
+        }
+        case OP_not: {
+            int top;
+            size_t to_number_not, to_not_done, bigint_not_pos;
+            int32_t displacement;
+            if (depth < 1) goto unsupported;
+            top = b->var_count + depth - 1;
+            /* BigInt bitwise NOT is infinite two's-complement; within a signed
+               64-bit input it is exactly the 64-bit complement. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_number_not = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0x81); JIT_EMIT32(top * 8);
+            JIT_EMIT8(0x48); JIT_EMIT8(0xf7); JIT_EMIT8(0xd0); /* not rax */
+            JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); JIT_EMIT32(top * 8);
+            JIT_STORE_KIND_IMM(top, JS_JIT_KIND_BIGINT);
+            JIT_EMIT8(0xe9); to_not_done = pos; JIT_EMIT32(0);
+            bigint_not_pos = pos;
+            displacement = (int32_t)bigint_not_pos - (int32_t)(to_number_not + 4);
+            memcpy(code + to_number_not, &displacement, sizeof(displacement));
+            JIT_GUARD_INT(top);
+            JIT_LOAD_VALUE(top);
+            JIT_EMIT8(0xf7); JIT_EMIT8(0xd0); /* not eax: ToInt32(~x) */
+            JIT_STORE_VALUE(top);
+            JIT_STORE_KIND_IMM(top, 0);
+            displacement = (int32_t)pos - (int32_t)(to_not_done + 4);
+            memcpy(code + to_not_done, &displacement, sizeof(displacement));
+            break;
+        }
+        case OP_lt: case OP_lte: case OP_gt: case OP_gte: {
+            int left, right, int_cc, fp_cc;
+            size_t to_float_left, to_float_right, to_done, float_pos, done_pos;
+            size_t to_numeric_bigint, to_bigint_done, bigint_pos;
+            size_t to_heap_left, to_heap_right, to_normal, heap_pos, heap_done;
+            size_t normal_pos, final_pos;
+            int32_t displacement;
+            if (depth < 2) goto unsupported;
+            left = b->var_count + depth - 2; right = b->var_count + depth - 1;
+            /* Heap BigInts require the arbitrary-precision comparator; route before
+               the 64-bit short-BigInt and Number branches. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_left = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_right = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0xe9); to_normal = pos; JIT_EMIT32(0);
+            heap_pos = pos;
+            displacement = (int32_t)heap_pos - (int32_t)(to_heap_left + 4);
+            memcpy(code + to_heap_left, &displacement, sizeof(displacement));
+            displacement = (int32_t)heap_pos - (int32_t)(to_heap_right + 4);
+            memcpy(code + to_heap_right, &displacement, sizeof(displacement));
+            JIT_EMIT_BIGINT_HELPER_CALL(left, right, opcode);
+            JIT_EMIT8(0xe9); heap_done = pos; JIT_EMIT32(0);
+            normal_pos = pos;
+            displacement = (int32_t)normal_pos - (int32_t)(to_normal + 4);
+            memcpy(code + to_normal, &displacement, sizeof(displacement));
+            /* Signed short-BigInt comparisons are exact in the 64-bit lane.
+               Mixed BigInt/Number comparisons use QuickJS's full rules. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_numeric_bigint = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT); JIT_BRANCH_DEOPT(0x85);
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0x81); JIT_EMIT32(left * 8);
+            JIT_EMIT8(0x49); JIT_EMIT8(0x3b); JIT_EMIT8(0x81); JIT_EMIT32(right * 8);
+            int_cc = opcode == OP_lt ? 0x9c : opcode == OP_lte ? 0x9e :
+                     opcode == OP_gt ? 0x9f : 0x9d;
+            JIT_EMIT8(0x0f); JIT_EMIT8(int_cc); JIT_EMIT8(0xc0);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+            JIT_STORE_VALUE(left); JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BOOL);
+            JIT_EMIT8(0xe9); to_bigint_done = pos; JIT_EMIT32(0);
+            bigint_pos = pos;
+            displacement = (int32_t)bigint_pos - (int32_t)(to_numeric_bigint + 4);
+            memcpy(code + to_numeric_bigint, &displacement, sizeof(displacement));
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4); JIT_EMIT8(JS_JIT_KIND_INT32);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_float_left = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4); JIT_EMIT8(JS_JIT_KIND_INT32);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_float_right = pos; JIT_EMIT32(0);
+            JIT_LOAD_VALUE(left); JIT_EMIT8(0x3b); JIT_EMIT8(0x82); JIT_EMIT32(right * 8);
+            int_cc = opcode == OP_lt ? 0x9c : opcode == OP_lte ? 0x9e :
+                     opcode == OP_gt ? 0x9f : 0x9d;
+            JIT_EMIT8(0x0f); JIT_EMIT8(int_cc); JIT_EMIT8(0xc0);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+            JIT_STORE_VALUE(left); JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BOOL);
+            depth--;
+            JIT_EMIT8(0xe9); to_done = pos; JIT_EMIT32(0);
+            float_pos = pos;
+            displacement = (int32_t)float_pos - (int32_t)(to_float_left + 4);
+            memcpy(code + to_float_left, &displacement, sizeof(displacement));
+            displacement = (int32_t)float_pos - (int32_t)(to_float_right + 4);
+            memcpy(code + to_float_right, &displacement, sizeof(displacement));
+            JIT_LOAD_NUM_XMM0(left); JIT_LOAD_NUM_XMM1(right);
+            JIT_EMIT8(0x66); JIT_EMIT8(0x0f); JIT_EMIT8(0x2e); JIT_EMIT8(0xc1); /* ucomisd xmm0,xmm1 */
+            fp_cc = opcode == OP_lt ? 0x92 : opcode == OP_lte ? 0x96 :
+                    opcode == OP_gt ? 0x97 : 0x93;
+            JIT_EMIT8(0x0f); JIT_EMIT8(fp_cc); JIT_EMIT8(0xc0); /* setcc al */
+            if (opcode == OP_lt || opcode == OP_lte) {
+                /* UCOMISD also reports CF=1 for NaN; JS relational operators
+                   must be false for unordered operands. setnp r10b; and al,r10b. */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x9b); JIT_EMIT8(0xc2);
+                JIT_EMIT8(0x44); JIT_EMIT8(0x20); JIT_EMIT8(0xd0);
+            }
+            JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+            JIT_STORE_VALUE(left); JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BOOL);
+            done_pos = pos;
+            displacement = (int32_t)done_pos - (int32_t)(to_done + 4);
+            memcpy(code + to_done, &displacement, sizeof(displacement));
+            displacement = (int32_t)pos - (int32_t)(to_bigint_done + 4);
+            memcpy(code + to_bigint_done, &displacement, sizeof(displacement));
+            final_pos = pos;
+            displacement = (int32_t)final_pos - (int32_t)(heap_done + 4);
+            memcpy(code + heap_done, &displacement, sizeof(displacement));
+            break;
+        }
+        case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq: {
+            int left, right, setcc;
+            size_t to_float_left, to_float_right, to_done, float_pos, done_pos;
+            size_t to_numeric_bigint, to_bigint_done, bigint_pos;
+            size_t to_heap_left, to_heap_right, to_normal, heap_pos, heap_done;
+            size_t normal_pos, final_pos;
+            int32_t displacement;
+            if (depth < 2) goto unsupported;
+            left = b->var_count + depth - 2;
+            right = b->var_count + depth - 1;
+            /* Heap-backed equality uses full arbitrary-precision limb compare;
+               same-pointer identity is not sufficient for separately allocated values. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_left = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_right = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0xe9); to_normal = pos; JIT_EMIT32(0);
+            heap_pos = pos;
+            displacement = (int32_t)heap_pos - (int32_t)(to_heap_left + 4);
+            memcpy(code + to_heap_left, &displacement, sizeof(displacement));
+            displacement = (int32_t)heap_pos - (int32_t)(to_heap_right + 4);
+            memcpy(code + to_heap_right, &displacement, sizeof(displacement));
+            JIT_EMIT_BIGINT_HELPER_CALL(left, right, opcode);
+            JIT_EMIT8(0xe9); heap_done = pos; JIT_EMIT32(0);
+            normal_pos = pos;
+            displacement = (int32_t)normal_pos - (int32_t)(to_normal + 4);
+            memcpy(code + to_normal, &displacement, sizeof(displacement));
+            /* Equality of two short BigInts compares the complete signed
+               64-bit payload. Heap-backed cases are handled above. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT); JIT_BRANCH_DEOPT(0x84);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT); JIT_BRANCH_DEOPT(0x84);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_numeric_bigint = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT); JIT_BRANCH_DEOPT(0x85);
+            JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0x81); JIT_EMIT32(left * 8);
+            JIT_EMIT8(0x49); JIT_EMIT8(0x3b); JIT_EMIT8(0x81); JIT_EMIT32(right * 8);
+            setcc = (opcode == OP_eq || opcode == OP_strict_eq) ? 0x94 : 0x95;
+            JIT_EMIT8(0x0f); JIT_EMIT8(setcc); JIT_EMIT8(0xc0);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+            JIT_STORE_VALUE(left); JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BOOL);
+            JIT_EMIT8(0xe9); to_bigint_done = pos; JIT_EMIT32(0);
+            bigint_pos = pos;
+            displacement = (int32_t)bigint_pos - (int32_t)(to_numeric_bigint + 4);
+            memcpy(code + to_numeric_bigint, &displacement, sizeof(displacement));
+            /* If either operand is Float64, compare both as Numbers. The numeric
+               loader accepts int32/Float64, so 0===-0 and int/double equivalents
+               can stay native. Booleans/objects and coercive cases still deopt. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_float_left = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(right * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_float_right = pos; JIT_EMIT32(0);
+            /* Neither operand is Float64: only identical primitive kinds can
+               use this direct payload comparison without JS coercion. */
+            JIT_EMIT8(0x8b); JIT_EMIT8(0x82); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(0x3b); JIT_EMIT8(0x82); JIT_EMIT32(right * 8 + 4);
+            JIT_BRANCH_DEOPT(0x85);
+            /* The int32 lane does not contain an object identity. Never compare
+               the low pointer word as if it were a primitive payload. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(left * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_OBJECT); JIT_BRANCH_DEOPT(0x84);
+            JIT_LOAD_VALUE(left); JIT_EMIT8(0x3b); JIT_EMIT8(0x82); JIT_EMIT32(right * 8);
+            setcc = (opcode == OP_eq || opcode == OP_strict_eq) ? 0x94 : 0x95;
+            JIT_EMIT8(0x0f); JIT_EMIT8(setcc); JIT_EMIT8(0xc0);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+            JIT_STORE_VALUE(left); JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BOOL);
+            JIT_EMIT8(0xe9); to_done = pos; JIT_EMIT32(0);
+            float_pos = pos;
+            displacement = (int32_t)float_pos - (int32_t)(to_float_left + 4);
+            memcpy(code + to_float_left, &displacement, sizeof(displacement));
+            displacement = (int32_t)float_pos - (int32_t)(to_float_right + 4);
+            memcpy(code + to_float_right, &displacement, sizeof(displacement));
+            JIT_LOAD_NUM_XMM0(left); JIT_LOAD_NUM_XMM1(right);
+            JIT_EMIT8(0x66); JIT_EMIT8(0x0f); JIT_EMIT8(0x2e); JIT_EMIT8(0xc1); /* ucomisd */
+            if (opcode == OP_eq || opcode == OP_strict_eq) {
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x94); JIT_EMIT8(0xc0); /* sete al */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x9b); JIT_EMIT8(0xc2); /* setnp r10b */
+                JIT_EMIT8(0x44); JIT_EMIT8(0x20); JIT_EMIT8(0xd0); /* and al,r10b */
+            } else {
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc0); /* setne al */
+                JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x9a); JIT_EMIT8(0xc2); /* setp r10b */
+                JIT_EMIT8(0x44); JIT_EMIT8(0x08); JIT_EMIT8(0xd0); /* or al,r10b */
+            }
+            JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+            JIT_STORE_VALUE(left); JIT_STORE_KIND_IMM(left, JS_JIT_KIND_BOOL);
+            done_pos = pos;
+            displacement = (int32_t)done_pos - (int32_t)(to_done + 4);
+            memcpy(code + to_done, &displacement, sizeof(displacement));
+            displacement = (int32_t)pos - (int32_t)(to_bigint_done + 4);
+            memcpy(code + to_bigint_done, &displacement, sizeof(displacement));
+            depth--;
+            final_pos = pos;
+            displacement = (int32_t)final_pos - (int32_t)(heap_done + 4);
+            memcpy(code + heap_done, &displacement, sizeof(displacement));
+            break;
+        }
+        case OP_lnot: {
+            int top;
+            if (depth < 1) goto unsupported;
+            top = b->var_count + depth - 1;
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_FLOAT64); JIT_BRANCH_DEOPT(0x84);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_OBJECT); JIT_BRANCH_DEOPT(0x84);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT); JIT_BRANCH_DEOPT(0x84);
+            JIT_LOAD_VALUE(top); JIT_EMIT8(0x85); JIT_EMIT8(0xc0); /* test eax,eax */
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x94); JIT_EMIT8(0xc0);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+            JIT_STORE_VALUE(top); JIT_STORE_KIND_IMM(top, 1);
+            break;
+        }
+        case OP_neg: case OP_plus: case OP_inc: case OP_dec: {
+            int top;
+            if (depth < 1) goto unsupported;
+            top = b->var_count + depth - 1;
+            if (opcode == OP_neg) {
+                size_t to_int, to_done, int_pos, done_pos;
+                size_t to_number_neg, to_bigint_neg_done, bigint_neg_pos;
+                int32_t displacement;
+                /* Negating INT64_MIN leaves the short-BigInt range, so it must
+                   deopt before touching the lane and let QuickJS allocate the
+                   exact arbitrary-precision result. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_BIGINT);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_number_neg = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x49); JIT_EMIT8(0x8b); JIT_EMIT8(0x81); JIT_EMIT32(top * 8);
+                JIT_EMIT8(0x49); JIT_EMIT8(0xba); JIT_EMIT64(UINT64_C(0x8000000000000000));
+                JIT_EMIT8(0x4c); JIT_EMIT8(0x39); JIT_EMIT8(0xd0);
+                JIT_BRANCH_DEOPT(0x84);
+                JIT_EMIT8(0x48); JIT_EMIT8(0xf7); JIT_EMIT8(0xd8); /* neg rax */
+                JIT_EMIT8(0x49); JIT_EMIT8(0x89); JIT_EMIT8(0x81); JIT_EMIT32(top * 8);
+                JIT_STORE_KIND_IMM(top, JS_JIT_KIND_BIGINT);
+                JIT_EMIT8(0xe9); to_bigint_neg_done = pos; JIT_EMIT32(0);
+                bigint_neg_pos = pos;
+                displacement = (int32_t)bigint_neg_pos - (int32_t)(to_number_neg + 4);
+                memcpy(code + to_number_neg, &displacement, sizeof(displacement));
+                /* Negating a Float64 toggles only its sign bit. This preserves
+                   -0, infinities, and NaN payloads exactly. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_int = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0x41); JIT_EMIT8(0x81); JIT_EMIT8(0xb1);
+                JIT_EMIT32(top * 8 + 4); JIT_EMIT32(0x80000000u); /* xor sign bit */
+                JIT_EMIT8(0xe9); to_done = pos; JIT_EMIT32(0);
+                int_pos = pos;
+                displacement = (int32_t)int_pos - (int32_t)(to_int + 4);
+                memcpy(code + to_int, &displacement, sizeof(displacement));
+                JIT_GUARD_INT(top);
+                JIT_LOAD_VALUE(top);
+                /* int32 negation of zero must deopt to preserve JavaScript -0. */
+                JIT_EMIT8(0x85); JIT_EMIT8(0xc0); JIT_BRANCH_DEOPT(0x84);
+                JIT_EMIT8(0xf7); JIT_EMIT8(0xd8);
+                JIT_BRANCH_DEOPT(0x80);
+                JIT_STORE_VALUE(top); JIT_STORE_KIND_IMM(top, JS_JIT_KIND_INT32);
+                done_pos = pos;
+                displacement = (int32_t)done_pos - (int32_t)(to_done + 4);
+                memcpy(code + to_done, &displacement, sizeof(displacement));
+                displacement = (int32_t)pos - (int32_t)(to_bigint_neg_done + 4);
+                memcpy(code + to_bigint_neg_done, &displacement, sizeof(displacement));
+            } else {
+                if (opcode == OP_plus) {
+                    JIT_GUARD_NUM(top);
+                    break; /* numeric unary plus is identity */
+                } else {
+                    size_t to_int, to_done, int_pos, done_pos;
+                    int32_t displacement;
+                    JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+                    JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+                    JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_int = pos; JIT_EMIT32(0);
+                    JIT_ADD_FLOAT_ONE(top, opcode == OP_dec);
+                    JIT_EMIT8(0xe9); to_done = pos; JIT_EMIT32(0);
+                    int_pos = pos;
+                    displacement = (int32_t)int_pos - (int32_t)(to_int + 4);
+                    memcpy(code + to_int, &displacement, sizeof(displacement));
+                    JIT_GUARD_INT(top);
+                    JIT_LOAD_VALUE(top);
+                    if (opcode == OP_inc) {
+                        JIT_EMIT8(0x83); JIT_EMIT8(0xc0); JIT_EMIT8(0x01);
+                    } else {
+                        JIT_EMIT8(0x83); JIT_EMIT8(0xe8); JIT_EMIT8(0x01);
+                    }
+                    JIT_BRANCH_DEOPT(0x80); /* preserve JS number semantics on overflow */
+                    JIT_STORE_VALUE(top); JIT_STORE_KIND_IMM(top, JS_JIT_KIND_INT32);
+                    done_pos = pos;
+                    displacement = (int32_t)done_pos - (int32_t)(to_done + 4);
+                    memcpy(code + to_done, &displacement, sizeof(displacement));
+                }
+            }
+            break;
+        }
+        case OP_post_inc: case OP_post_dec: {
+            int top, next;
+            size_t to_int, to_done, int_pos, done_pos;
+            int32_t displacement;
+            if (depth < 1) goto unsupported;
+            top = b->var_count + depth - 1;
+            next = b->var_count + depth;
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_int = pos; JIT_EMIT32(0);
+            JIT_LOAD_VALUE(top); JIT_STORE_VALUE(next);
+            JIT_COPY_KIND(top, next);
+            JIT_ADD_FLOAT_ONE(next, opcode == OP_post_dec);
+            JIT_EMIT8(0xe9); to_done = pos; JIT_EMIT32(0);
+            int_pos = pos;
+            displacement = (int32_t)int_pos - (int32_t)(to_int + 4);
+            memcpy(code + to_int, &displacement, sizeof(displacement));
+            JIT_GUARD_INT(top);
+            JIT_LOAD_VALUE(top); JIT_STORE_VALUE(next);
+            JIT_STORE_KIND_IMM(next, 0);
+            JIT_LOAD_VALUE(next);
+            if (opcode == OP_post_inc) {
+                JIT_EMIT8(0x83); JIT_EMIT8(0xc0); JIT_EMIT8(0x01);
+            } else {
+                JIT_EMIT8(0x83); JIT_EMIT8(0xe8); JIT_EMIT8(0x01);
+            }
+            JIT_BRANCH_DEOPT(0x80);
+            JIT_STORE_VALUE(next); JIT_STORE_KIND_IMM(next, 0);
+            done_pos = pos;
+            displacement = (int32_t)done_pos - (int32_t)(to_done + 4);
+            memcpy(code + to_done, &displacement, sizeof(displacement));
+            depth++; if (depth > peak_depth) peak_depth = depth;
+            break;
+        }
+        case OP_drop:
+            if (depth < 1) goto unsupported;
+            depth--; break;
+        case OP_dup:
+            if (depth < 1) goto unsupported;
+            JIT_LOAD_VALUE(b->var_count + depth - 1);
+            JIT_STORE_VALUE(b->var_count + depth);
+            JIT_COPY_KIND(b->var_count + depth - 1, b->var_count + depth);
+            depth++; if (depth > peak_depth) peak_depth = depth;
+            break;
+        case OP_inc_loc: case OP_dec_loc: {
+            int loc;
+            size_t to_int, to_done, int_pos, done_pos;
+            int32_t displacement;
+            if (pc >= end) goto unsupported;
+            loc = *pc++;
+            if (loc >= b->var_count) goto unsupported;
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(loc * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_int = pos; JIT_EMIT32(0);
+            JIT_ADD_FLOAT_ONE(loc, opcode == OP_dec_loc);
+            JIT_EMIT8(0xe9); to_done = pos; JIT_EMIT32(0);
+            int_pos = pos;
+            displacement = (int32_t)int_pos - (int32_t)(to_int + 4);
+            memcpy(code + to_int, &displacement, sizeof(displacement));
+            JIT_GUARD_INT(loc); JIT_LOAD_VALUE(loc);
+            if (opcode == OP_inc_loc) {
+                JIT_EMIT8(0x83); JIT_EMIT8(0xc0); JIT_EMIT8(0x01);
+            } else {
+                JIT_EMIT8(0x83); JIT_EMIT8(0xe8); JIT_EMIT8(0x01);
+            }
+            JIT_BRANCH_DEOPT(0x80);
+            JIT_STORE_VALUE(loc); JIT_STORE_KIND_IMM(loc, 0);
+            done_pos = pos;
+            displacement = (int32_t)done_pos - (int32_t)(to_done + 4);
+            memcpy(code + to_done, &displacement, sizeof(displacement));
+            break;
+        }
+        case OP_add_loc: {
+            int loc, top;
+            size_t to_heap_loc, to_short_loc, to_heap_top, to_short_top;
+            size_t to_numeric, heap_pos;
+            size_t to_done;
+            int32_t displacement;
+            if (pc >= end || depth < 1) goto unsupported;
+            loc = *pc++; top = b->var_count + depth - 1;
+            if (loc >= b->var_count) goto unsupported;
+
+            /* OP_add_loc is emitted for accumulator updates such as
+               `sum = sum + a`. Route BigInt kinds through the exact helper so
+               long-running accumulators can stay native and recycle roots. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(loc * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_loc = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(loc * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_short_loc = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_top = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(top * 8 + 4);
+            JIT_EMIT8(JS_JIT_KIND_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_short_top = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0xe9); to_numeric = pos; JIT_EMIT32(0);
+
+            heap_pos = pos;
+            displacement = (int32_t)heap_pos - (int32_t)(to_heap_loc + 4);
+            memcpy(code + to_heap_loc, &displacement, sizeof(displacement));
+            displacement = (int32_t)heap_pos - (int32_t)(to_heap_top + 4);
+            memcpy(code + to_heap_top, &displacement, sizeof(displacement));
+            displacement = (int32_t)heap_pos - (int32_t)(to_short_loc + 4);
+            memcpy(code + to_short_loc, &displacement, sizeof(displacement));
+            displacement = (int32_t)heap_pos - (int32_t)(to_short_top + 4);
+            memcpy(code + to_short_top, &displacement, sizeof(displacement));
+            JIT_EMIT_BIGINT_HELPER_CALL(loc, top, OP_add);
+            JIT_EMIT8(0xe9); to_done = pos; JIT_EMIT32(0);
+
+            size_t numeric_pos = pos;
+            displacement = (int32_t)numeric_pos - (int32_t)(to_numeric + 4);
+            memcpy(code + to_numeric, &displacement, sizeof(displacement));
+            JIT_GUARD_INT(loc); JIT_GUARD_INT(top); JIT_LOAD_VALUE(loc);
+            JIT_EMIT8(0x03); JIT_EMIT8(0x82); JIT_EMIT32(top * 8);
+            JIT_BRANCH_DEOPT(0x80);
+            JIT_STORE_VALUE(loc); JIT_STORE_KIND_IMM(loc, JS_JIT_KIND_INT32);
+            displacement = (int32_t)pos - (int32_t)(to_done + 4);
+            memcpy(code + to_done, &displacement, sizeof(displacement));
+            depth--;
+            break;
+        }
+        case OP_if_false: case OP_if_true: {
+            int cond;
+            if (end - pc < 4 || depth < 1) goto unsupported;
+            operand_off = (int)(pc - start); diff = (int32_t)get_u32(pc); pc += 4;
+            target = operand_off + diff;
+            depth--; cond = b->var_count + depth;
+            {
+                size_t to_non_float, to_condition_done, non_float_pos;
+                int32_t branch_disp;
+                /* ToBoolean(Number): +0, -0 and NaN are false; all other
+                   doubles, including infinities, are true. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(cond * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_non_float = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x10);
+                JIT_EMIT8(0x81); JIT_EMIT32(cond * 8);
+                JIT_EMIT8(0x66); JIT_EMIT8(0x0f); JIT_EMIT8(0x57); JIT_EMIT8(0xc9); /* xorpd xmm1,xmm1 */
+                JIT_EMIT8(0x66); JIT_EMIT8(0x0f); JIT_EMIT8(0x2e); JIT_EMIT8(0xc1); /* ucomisd */
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc0); /* setne al; NaN/zero => false */
+                JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+                JIT_EMIT8(0xe9); to_condition_done = pos; JIT_EMIT32(0);
+                non_float_pos = pos;
+                branch_disp = (int32_t)non_float_pos - (int32_t)(to_non_float + 4);
+                memcpy(code + to_non_float, &branch_disp, sizeof(branch_disp));
+                /* Ordinary int32/bool/uint32 conditions can test their low word.
+                   Object truthiness is true, but defer it to QuickJS for now;
+                   a raw pointer must never be mistaken for an integer payload. */
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(cond * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_UNINITIALIZED); JIT_BRANCH_DEOPT(0x84);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(cond * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_OBJECT); JIT_BRANCH_DEOPT(0x84);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(cond * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT); JIT_BRANCH_DEOPT(0x84);
+                JIT_LOAD_VALUE(cond);
+                JIT_EMIT8(0x85); JIT_EMIT8(0xc0); /* test eax,eax */
+                /* Convert ZF to a canonical 0/1 in EAX for the shared branch below. */
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc0); /* setne al */
+                JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+                branch_disp = (int32_t)pos - (int32_t)(to_condition_done + 4);
+                memcpy(code + to_condition_done, &branch_disp, sizeof(branch_disp));
+                JIT_EMIT8(0x85); JIT_EMIT8(0xc0);
+            }
+            if (target <= bc_off) JIT_LOOP_FUEL();
+            JIT_EMIT8(0x0f); JIT_EMIT8((opcode == OP_if_false || opcode == OP_if_false8) ? 0x84 : 0x85);
+            JIT_EXPECT_EDGE(target, depth, bc_off);
+            JIT_ADD_RELOC(target, 0); JIT_EMIT32(0);
+            break;
+        }
+        case OP_goto: {
+            if (end - pc < 4) goto unsupported;
+            operand_off = (int)(pc - start); diff = (int32_t)get_u32(pc); pc += 4;
+            target = operand_off + diff;
+            JIT_EXPECT_EDGE(target, depth, bc_off);
+            if (target <= bc_off) JIT_LOOP_FUEL();
+            JIT_EMIT8(0xe9); JIT_ADD_RELOC(target, 0); JIT_EMIT32(0);
+            break;
+        }
+#if SHORT_OPCODES
+        case OP_if_false8: case OP_if_true8: {
+            int cond;
+            if (pc >= end || depth < 1) goto unsupported;
+            operand_off = (int)(pc - start); diff = (int8_t)*pc++;
+            target = operand_off + diff;
+            depth--; cond = b->var_count + depth;
+            {
+                size_t to_non_float, to_condition_done, non_float_pos;
+                int32_t branch_disp;
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(cond * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x85); to_non_float = pos; JIT_EMIT32(0);
+                JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x10);
+                JIT_EMIT8(0x81); JIT_EMIT32(cond * 8);
+                JIT_EMIT8(0x66); JIT_EMIT8(0x0f); JIT_EMIT8(0x57); JIT_EMIT8(0xc9);
+                JIT_EMIT8(0x66); JIT_EMIT8(0x0f); JIT_EMIT8(0x2e); JIT_EMIT8(0xc1);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc0);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+                JIT_EMIT8(0xe9); to_condition_done = pos; JIT_EMIT32(0);
+                non_float_pos = pos;
+                branch_disp = (int32_t)non_float_pos - (int32_t)(to_non_float + 4);
+                memcpy(code + to_non_float, &branch_disp, sizeof(branch_disp));
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(cond * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_UNINITIALIZED); JIT_BRANCH_DEOPT(0x84);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(cond * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_OBJECT); JIT_BRANCH_DEOPT(0x84);
+                JIT_EMIT8(0x83); JIT_EMIT8(0xba); JIT_EMIT32(cond * 8 + 4);
+                JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT); JIT_BRANCH_DEOPT(0x84);
+                JIT_LOAD_VALUE(cond); JIT_EMIT8(0x85); JIT_EMIT8(0xc0);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0x95); JIT_EMIT8(0xc0);
+                JIT_EMIT8(0x0f); JIT_EMIT8(0xb6); JIT_EMIT8(0xc0);
+                branch_disp = (int32_t)pos - (int32_t)(to_condition_done + 4);
+                memcpy(code + to_condition_done, &branch_disp, sizeof(branch_disp));
+                JIT_EMIT8(0x85); JIT_EMIT8(0xc0);
+            }
+            if (target <= bc_off) JIT_LOOP_FUEL();
+            JIT_EMIT8(0x0f); JIT_EMIT8(opcode == OP_if_false8 ? 0x84 : 0x85);
+            JIT_EXPECT_EDGE(target, depth, bc_off);
+            JIT_ADD_RELOC(target, 0); JIT_EMIT32(0);
+            break;
+        }
+        case OP_goto8: {
+            if (pc >= end) goto unsupported;
+            operand_off = (int)(pc - start); diff = (int8_t)*pc++;
+            target = operand_off + diff;
+            JIT_EXPECT_EDGE(target, depth, bc_off);
+            if (target <= bc_off) JIT_LOOP_FUEL();
+            JIT_EMIT8(0xe9); JIT_ADD_RELOC(target, 0); JIT_EMIT32(0);
+            break;
+        }
+        case OP_goto16: {
+            if (end - pc < 2) goto unsupported;
+            operand_off = (int)(pc - start); diff = (int16_t)get_u16(pc); pc += 2;
+            target = operand_off + diff;
+            JIT_EXPECT_EDGE(target, depth, bc_off);
+            if (target <= bc_off) JIT_LOOP_FUEL();
+            JIT_EMIT8(0xe9); JIT_ADD_RELOC(target, 0); JIT_EMIT32(0);
+            break;
+        }
+#endif
+        case OP_return: {
+            int top;
+            size_t to_f64_payload, to_object_payload, to_bigint_payload;
+            size_t to_heap_bigint_payload, payload_pos;
+            int32_t displacement;
+            if (depth != 1) goto unsupported;
+            top = b->var_count;
+            JIT_EMIT8(0x8b); JIT_EMIT8(0x82); JIT_EMIT32(top * 8 + 4);
+            JIT_EMIT8(0x89); JIT_EMIT8(0x01); /* [rcx] = result kind */
+            /* Float64 and borrowed object pointers both live in the parallel
+               64-bit lane. Other supported result kinds use the int32 lane. */
+            JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_FLOAT64);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_f64_payload = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_OBJECT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_object_payload = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_bigint_payload = pos; JIT_EMIT32(0);
+            JIT_EMIT8(0x83); JIT_EMIT8(0xf8); JIT_EMIT8(JS_JIT_KIND_HEAP_BIGINT);
+            JIT_EMIT8(0x0f); JIT_EMIT8(0x84); to_heap_bigint_payload = pos; JIT_EMIT32(0);
+            JIT_LOAD_VALUE(top);
+            JIT_EMIT8(0x89); JIT_EMIT8(0x06); /* [rsi] = int payload */
+            JIT_EMIT8(0xb8); JIT_EMIT32(1); JIT_EMIT8(0xc3);
+            payload_pos = pos;
+            JIT_EMIT8(0xf2); JIT_EMIT8(0x41); JIT_EMIT8(0x0f); JIT_EMIT8(0x10);
+            JIT_EMIT8(0x81); JIT_EMIT32(top * 8); /* load 64-bit payload */
+            JIT_EMIT8(0xf2); JIT_EMIT8(0x0f); JIT_EMIT8(0x11); JIT_EMIT8(0x06); /* [rsi]=xmm0 */
+            JIT_EMIT8(0xb8); JIT_EMIT32(1); JIT_EMIT8(0xc3);
+            displacement = (int32_t)payload_pos - (int32_t)(to_f64_payload + 4);
+            memcpy(code + to_f64_payload, &displacement, sizeof(displacement));
+            displacement = (int32_t)payload_pos - (int32_t)(to_object_payload + 4);
+            memcpy(code + to_object_payload, &displacement, sizeof(displacement));
+            displacement = (int32_t)payload_pos - (int32_t)(to_bigint_payload + 4);
+            memcpy(code + to_bigint_payload, &displacement, sizeof(displacement));
+            displacement = (int32_t)payload_pos - (int32_t)(to_heap_bigint_payload + 4);
+            memcpy(code + to_heap_bigint_payload, &displacement, sizeof(displacement));
+            depth--; saw_return = 1; break;
+        }
+        default:
+            goto unsupported;
+        }
+        if (depth < 0 || peak_depth > b->stack_size)
+            goto unsupported;
+    }
+    if (!saw_return || pc != end)
+        goto unsupported;
+    bc_map[b->byte_code_len] = (int32_t)pos;
+
+    /* Resolve conditional, unconditional and deoptimization branches. */
+    deopt_pos = pos;
+    JIT_EMIT8(0x31); JIT_EMIT8(0xc0); /* xor eax,eax: deopt */
+    JIT_EMIT8(0xc3);
+    for (i = 0; i < reloc_count; i++) {
+        int32_t target_pos;
+        int32_t displacement;
+        if (relocs[i].to_deopt) {
+            target_pos = (int32_t)deopt_pos;
+        } else {
+            int t = relocs[i].target_bc;
+            if (t < 0 || t >= b->byte_code_len || bc_map[t] < 0)
+                goto unsupported;
+            target_pos = bc_map[t];
+        }
+        displacement = target_pos - (int32_t)(relocs[i].disp_pos + 4);
+        memcpy(code + relocs[i].disp_pos, &displacement, sizeof(displacement));
+    }
+
+    page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    map_size = ((pos + (size_t)page_size - 1) / (size_t)page_size) * (size_t)page_size;
+    mem = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) return NULL;
+    memcpy(mem, code, pos);
+    __builtin___clear_cache((char *)mem, (char *)mem + pos);
+    if (mprotect(mem, map_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(mem, map_size); return NULL;
+    }
+    *mapped_size = map_size;
+    *required_args = (uint8_t)(max_arg + 1);
+#undef JIT_EMIT8
+#undef JIT_EMIT32
+#undef JIT_EMIT64
+#undef JIT_ADD_RELOC
+#undef JIT_BRANCH_DEOPT
+#undef JIT_EMIT_BIGINT_HELPER_CALL
+#undef JIT_PRUNE_LOCAL_BIGINT_ROOT
+#undef JIT_LOOP_FUEL
+#undef JIT_STORE_VALUE
+#undef JIT_LOAD_VALUE
+#undef JIT_STORE_KIND_IMM
+#undef JIT_COPY_KIND
+#undef JIT_PUSH_INT
+#undef JIT_PUSH_BOOL
+#undef JIT_GUARD_INT
+#undef JIT_GUARD_NUM
+#undef JIT_LOAD_NUM_XMM0
+#undef JIT_LOAD_NUM_XMM1
+#undef JIT_STORE_NUM_XMM0
+#undef JIT_ADD_FLOAT_ONE
+#undef JIT_LOAD_ARG
+#undef JIT_PUSH_DOUBLE
+#undef JIT_EXPECT_EDGE
+    return mem;
+
+unsupported:
+#undef JIT_EMIT8
+#undef JIT_EMIT32
+#undef JIT_EMIT64
+#undef JIT_ADD_RELOC
+#undef JIT_BRANCH_DEOPT
+#undef JIT_EMIT_BIGINT_HELPER_CALL
+#undef JIT_PRUNE_LOCAL_BIGINT_ROOT
+#undef JIT_LOOP_FUEL
+#undef JIT_STORE_VALUE
+#undef JIT_LOAD_VALUE
+#undef JIT_STORE_KIND_IMM
+#undef JIT_COPY_KIND
+#undef JIT_PUSH_INT
+#undef JIT_PUSH_BOOL
+#undef JIT_GUARD_INT
+#undef JIT_GUARD_NUM
+#undef JIT_LOAD_NUM_XMM0
+#undef JIT_LOAD_NUM_XMM1
+#undef JIT_STORE_NUM_XMM0
+#undef JIT_ADD_FLOAT_ONE
+#undef JIT_LOAD_ARG
+#undef JIT_PUSH_DOUBLE
+#undef JIT_EXPECT_EDGE
+    return NULL;
+}
+
+/* Build an optional specialized plan for straight-line BigInt expressions with
+   at least two binary operations. The normal native baseline remains installed
+   for Number arguments; the plan is selected only when all used arguments are
+   short/heap BigInts. The plan is pre-decoded once and executed in one helper
+   dispatch, avoiding a native-to-C transition for every arithmetic opcode. */
+static void *js_baseline_jit_compile_bigint_plan(JSFunctionBytecode *b,
+                                                  size_t *mapped_size,
+                                                  uint8_t *required_args,
+                                                  uint32_t *arg_mask_out,
+                                                  void **plan_out,
+                                                  size_t *plan_size_out)
+{
+    JSJITBigIntPlanInsn temp[JS_BASELINE_JIT_MAX_BYTECODE];
+    const uint8_t *pc, *end;
+    uint32_t arg_mask = 0;
+    int count = 0, depth = 0, peak_depth = 0, binary_count = 0;
+    int max_arg = -1, saw_return = 0, comparison_result_pending = 0;
+    size_t code_len = 0, map_size;
+    long page_size;
+    uint8_t code[64];
+    void *mem;
+    JSJITBigIntPlan *plan = NULL;
+    size_t plan_size, plan_map_size;
+#define PLAN_REJECT() do { return NULL; } while (0)
+
+    if (!b || !mapped_size || !required_args || !arg_mask_out || !plan_out ||
+        !plan_size_out || b->read_only_bytecode || b->func_kind != JS_FUNC_NORMAL ||
+        b->var_ref_count != 0 || b->closure_var_count != 0 || b->var_count != 0 ||
+        b->byte_code_len <= 0 || b->byte_code_len > JS_BASELINE_JIT_MAX_BYTECODE ||
+        b->arg_count == 0 || b->arg_count > JS_BASELINE_JIT_MAX_ARGS ||
+        b->stack_size == 0 || b->stack_size > JS_BASELINE_JIT_MAX_STACK)
+        PLAN_REJECT();
+
+    pc = b->byte_code_buf;
+    end = pc + b->byte_code_len;
+    while (pc < end) {
+        int opcode = *pc++;
+        JSJITBigIntPlanInsn insn;
+        memset(&insn, 0, sizeof(insn));
+        if (comparison_result_pending && opcode != OP_return && opcode != OP_nop)
+            PLAN_REJECT();
+        switch (opcode) {
+        case OP_nop:
+            continue;
+        case OP_get_arg: {
+            int idx;
+            if (end - pc < 2) PLAN_REJECT();
+            idx = (int)get_u16(pc); pc += 2;
+            if (idx < 0 || idx >= b->arg_count || idx >= JS_BASELINE_JIT_MAX_ARGS)
+                PLAN_REJECT();
+            insn.kind = JS_JIT_PLAN_PUSH_ARG;
+            insn.operand = (uint8_t)idx;
+            arg_mask |= (UINT32_C(1) << idx);
+            if (idx > max_arg) max_arg = idx;
+            depth++;
+            break;
+        }
+#if SHORT_OPCODES
+        case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3: {
+            int idx = opcode - OP_get_arg0;
+            if (idx >= b->arg_count || idx >= JS_BASELINE_JIT_MAX_ARGS)
+                PLAN_REJECT();
+            insn.kind = JS_JIT_PLAN_PUSH_ARG;
+            insn.operand = (uint8_t)idx;
+            arg_mask |= (UINT32_C(1) << idx);
+            if (idx > max_arg) max_arg = idx;
+            depth++;
+            break;
+        }
+#endif
+        case OP_push_bigint_i32: {
+            int32_t imm;
+            if (end - pc < 4) PLAN_REJECT();
+            imm = get_i32(pc); pc += 4;
+            insn.kind = JS_JIT_PLAN_PUSH_BIGINT;
+            insn.immediate = imm;
+            depth++;
+            break;
+        }
+        case OP_push_const: {
+            uint32_t idx;
+            if (end - pc < 4) PLAN_REJECT();
+            idx = get_u32(pc); pc += 4;
+            if (idx >= (uint32_t)b->cpool_count ||
+                JS_VALUE_GET_TAG(b->cpool[idx]) != JS_TAG_SHORT_BIG_INT)
+                PLAN_REJECT();
+            insn.kind = JS_JIT_PLAN_PUSH_BIGINT;
+            insn.immediate = JS_VALUE_GET_SHORT_BIG_INT(b->cpool[idx]);
+            depth++;
+            break;
+        }
+#if SHORT_OPCODES
+        case OP_push_const8: {
+            uint32_t idx;
+            if (pc >= end) PLAN_REJECT();
+            idx = *pc++;
+            if (idx >= (uint32_t)b->cpool_count ||
+                JS_VALUE_GET_TAG(b->cpool[idx]) != JS_TAG_SHORT_BIG_INT)
+                PLAN_REJECT();
+            insn.kind = JS_JIT_PLAN_PUSH_BIGINT;
+            insn.immediate = JS_VALUE_GET_SHORT_BIG_INT(b->cpool[idx]);
+            depth++;
+            break;
+        }
+#endif
+        case OP_dup:
+            if (depth < 1) PLAN_REJECT();
+            insn.kind = JS_JIT_PLAN_DUP;
+            depth++;
+            break;
+        case OP_drop:
+            if (depth < 1) PLAN_REJECT();
+            insn.kind = JS_JIT_PLAN_DROP;
+            depth--;
+            break;
+        case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod:
+        case OP_and: case OP_or: case OP_xor:
+        case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq:
+        case OP_lt: case OP_lte: case OP_gt: case OP_gte: {
+            BOOL is_comparison = (opcode == OP_eq || opcode == OP_neq ||
+                                  opcode == OP_strict_eq || opcode == OP_strict_neq ||
+                                  opcode == OP_lt || opcode == OP_lte ||
+                                  opcode == OP_gt || opcode == OP_gte);
+            if (depth < 2) PLAN_REJECT();
+            insn.kind = JS_JIT_PLAN_BINARY;
+            insn.opcode = (uint16_t)opcode;
+            binary_count++;
+            depth--;
+            /* Comparisons produce Boolean, so their result may only be returned.
+               This makes the plan's stack types statically known and removes the
+               per-call preflight pass. */
+            if (is_comparison) {
+                if (depth != 1) PLAN_REJECT();
+                comparison_result_pending = 1;
+            }
+            break;
+        }
+        case OP_return:
+            if (depth != 1 || pc != end)
+                PLAN_REJECT();
+            insn.kind = JS_JIT_PLAN_RETURN;
+            saw_return = 1;
+            break;
+        default:
+            PLAN_REJECT();
+        }
+        if (count >= JS_BASELINE_JIT_MAX_BYTECODE || depth < 0 ||
+            depth > JS_BASELINE_JIT_MAX_STACK)
+            PLAN_REJECT();
+        if (depth > peak_depth) peak_depth = depth;
+        temp[count++] = insn;
+        if (saw_return && pc != end)
+            PLAN_REJECT();
+    }
+    if (!saw_return || binary_count < 2 || max_arg < 0 || count == 0)
+        PLAN_REJECT();
+
+    plan_size = sizeof(*plan) + (size_t)count * sizeof(plan->insns[0]);
+    page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    plan_map_size = ((plan_size + (size_t)page_size - 1) / (size_t)page_size) * (size_t)page_size;
+    plan = mmap(NULL, plan_map_size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (plan == MAP_FAILED)
+        PLAN_REJECT();
+    memset(plan, 0, plan_size);
+    plan->instruction_count = (uint32_t)count;
+    plan->arg_mask = arg_mask;
+    plan->required_args = (uint8_t)(max_arg + 1);
+    plan->peak_depth = (uint8_t)peak_depth;
+    plan->result_kind = comparison_result_pending ? JS_JIT_KIND_BOOL : JS_JIT_KIND_BIGINT;
+    plan->binary_count = (uint16_t)binary_count;
+    memcpy(plan->insns, temp, (size_t)count * sizeof(temp[0]));
+
+    /* SysV entry has RSP%16==8. One push aligns it before the helper call. */
+#define PLAN_EMIT8(v) do { code[code_len++] = (uint8_t)(v); } while (0)
+#define PLAN_EMIT64(v) do { uint64_t _v = (uint64_t)(uintptr_t)(v); memcpy(code + code_len, &_v, 8); code_len += 8; } while (0)
+    PLAN_EMIT8(0x50);                                      /* push rax */
+    PLAN_EMIT8(0x48); PLAN_EMIT8(0x89); PLAN_EMIT8(0xca); /* rdx = result_kind (rcx) */
+    PLAN_EMIT8(0x48); PLAN_EMIT8(0xb9); PLAN_EMIT64(b->realm); /* rcx = ctx */
+    PLAN_EMIT8(0x49); PLAN_EMIT8(0xb8); PLAN_EMIT64(plan); /* r8 = plan */
+    PLAN_EMIT8(0x48); PLAN_EMIT8(0xb8); PLAN_EMIT64(js_baseline_jit_execute_bigint_plan);
+    PLAN_EMIT8(0xff); PLAN_EMIT8(0xd0);                   /* call rax */
+    PLAN_EMIT8(0x48); PLAN_EMIT8(0x83); PLAN_EMIT8(0xc4); PLAN_EMIT8(0x08); /* add rsp,8 */
+    PLAN_EMIT8(0xc3);                                     /* ret */
+#undef PLAN_EMIT8
+#undef PLAN_EMIT64
+
+    page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    map_size = ((code_len + (size_t)page_size - 1) / (size_t)page_size) * (size_t)page_size;
+    mem = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        munmap(plan, plan_map_size);
+        PLAN_REJECT();
+    }
+    memcpy(mem, code, code_len);
+    __builtin___clear_cache((char *)mem, (char *)mem + code_len);
+    if (mprotect(mem, map_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(mem, map_size);
+        munmap(plan, plan_map_size);
+        PLAN_REJECT();
+    }
+    if (mprotect(plan, plan_map_size, PROT_READ) != 0) {
+        munmap(mem, map_size);
+        munmap(plan, plan_map_size);
+        PLAN_REJECT();
+    }
+    *mapped_size = map_size;
+    *required_args = plan->required_args;
+    *arg_mask_out = plan->arg_mask;
+    *plan_out = plan;
+    *plan_size_out = plan_map_size;
+#undef PLAN_REJECT
+    return mem;
+}
+
+static void js_baseline_jit_free(JSFunctionBytecode *b)
+{
+    if (!b)
+        return;
+    if (b->jit_code) {
+        if (b->jit_code_size)
+            munmap(b->jit_code, b->jit_code_size);
+        b->jit_code = NULL;
+        b->jit_code_size = 0;
+    }
+    if (b->jit_bigint_plan_code) {
+        if (b->jit_bigint_plan_code_size)
+            munmap(b->jit_bigint_plan_code, b->jit_bigint_plan_code_size);
+        b->jit_bigint_plan_code = NULL;
+        b->jit_bigint_plan_code_size = 0;
+    }
+    if (b->jit_bigint_plan && b->jit_bigint_plan_size)
+        munmap(b->jit_bigint_plan, b->jit_bigint_plan_size);
+    b->jit_bigint_plan = NULL;
+    b->jit_bigint_plan_size = 0;
+    b->jit_bigint_plan_arg_mask = 0;
+    b->jit_bigint_plan_required_args = 0;
+}
+#else
+static void *js_baseline_jit_compile(JSFunctionBytecode *b,
+                                     size_t *mapped_size,
+                                     uint8_t *required_args)
+{
+    (void)b; (void)mapped_size; (void)required_args;
+    return NULL;
+}
+static void js_baseline_jit_free(JSFunctionBytecode *b)
+{
+    (void)b;
+}
+#endif
+
+void JS_GetJITStats(JSRuntime *rt, JSJITStats *stats)
+{
+    if (!stats)
+        return;
+    memset(stats, 0, sizeof(*stats));
+    if (!rt)
+        return;
+    stats->compiled_functions = rt->jit_compiled_functions;
+    stats->executed_functions = rt->jit_executed_functions;
+    stats->deoptimizations = rt->jit_deoptimizations;
+    stats->object_roots_created = rt->jit_object_roots_created;
+    stats->object_roots_released = rt->jit_object_roots_released;
+    stats->bigint_roots_created = rt->jit_bigint_roots_created;
+    stats->bigint_roots_released = rt->jit_bigint_roots_released;
+    stats->bigint_plans_compiled = rt->jit_bigint_plans_compiled;
+    stats->bigint_plan_executions = rt->jit_bigint_plan_executions;
+    stats->bigint_plan_dispatches = rt->jit_bigint_plan_dispatches;
+}
+
+void JS_ResetJITStats(JSRuntime *rt)
+{
+    if (!rt)
+        return;
+    rt->jit_compiled_functions = 0;
+    rt->jit_executed_functions = 0;
+    rt->jit_deoptimizations = 0;
+    rt->jit_object_roots_created = 0;
+    rt->jit_object_roots_released = 0;
+    rt->jit_bigint_roots_created = 0;
+    rt->jit_bigint_roots_released = 0;
+    rt->jit_bigint_plans_compiled = 0;
+    rt->jit_bigint_plan_executions = 0;
+    rt->jit_bigint_plan_dispatches = 0;
+}
+
+void JS_SetJITEnabled(JSRuntime *rt, int enabled)
+{
+    if (rt)
+        rt->jit_enabled = !!enabled;
+}
+
+
+void JS_GetPropertyICStats(JSRuntime *rt, JSPropertyICStats *stats)
+{
+    if (!stats)
+        return;
+    memset(stats, 0, sizeof(*stats));
+    if (!rt)
+        return;
+    stats->get_hits = rt->property_ic_get_hits;
+    stats->get_misses = rt->property_ic_get_misses;
+    stats->put_hits = rt->property_ic_put_hits;
+    stats->put_misses = rt->property_ic_put_misses;
+}
+
+void JS_ResetPropertyICStats(JSRuntime *rt)
+{
+    if (!rt)
+        return;
+    rt->property_ic_get_hits = 0;
+    rt->property_ic_get_misses = 0;
+    rt->property_ic_put_hits = 0;
+    rt->property_ic_put_misses = 0;
+}
+
 #ifdef OPCODE_ASM_LABEL
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-label"
 #endif
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+int JS_GetCurrentStackDepth(JSContext *ctx)
+{
+    int depth = 0;
+    JSStackFrame *sf;
+    if (!ctx || !ctx->rt)
+        return 0;
+    for (sf = ctx->rt->current_stack_frame; sf; sf = sf->prev_frame) {
+        if (JS_GetFunctionBytecode(sf->cur_func))
+            depth++;
+    }
+    return depth;
+}
+
+size_t JS_GetCurrentStackTrace(JSContext *ctx, char *buf, size_t buf_size,
+                               int max_frames)
+{
+    JSStackFrame *sf;
+    size_t used = 0;
+    int frames = 0;
+    if (!buf || !buf_size)
+        return 0;
+    buf[0] = '\0';
+    if (!ctx || max_frames <= 0)
+        return 0;
+    for (sf = ctx->rt->current_stack_frame; sf && frames < max_frames; sf = sf->prev_frame) {
+        JSFunctionBytecode *b = JS_GetFunctionBytecode(sf->cur_func);
+        const char *name = NULL, *filename = NULL;
+        int line = 0, col = 0;
+        if (!b)
+            continue;
+        name = get_prop_string(ctx, sf->cur_func, JS_ATOM_name);
+        if (b->debug.filename != JS_ATOM_NULL)
+            filename = JS_AtomToCString(ctx, b->debug.filename);
+        if (b->has_debug && b->debug.pc2line_buf && sf->cur_pc &&
+            sf->cur_pc >= b->byte_code_buf &&
+            sf->cur_pc <= b->byte_code_buf + b->byte_code_len) {
+            ptrdiff_t off = sf->cur_pc - b->byte_code_buf;
+            line = find_line_num(ctx, b, off > 0 ? (int)(off - 1) : 0, &col);
+        }
+        int n = snprintf(buf + used, buf_size - used, "  at %s (%s:%d:%d)\n",
+                         name && name[0] ? name : "<anonymous>",
+                         filename ? filename : "<unknown>", line, col);
+        if (name) JS_FreeCString(ctx, name);
+        if (filename) JS_FreeCString(ctx, filename);
+        frames++;
+        if (n < 0 || (size_t)n >= buf_size - used) {
+            used = buf_size - 1;
+            buf[used] = '\0';
+            break;
+        }
+        used += (size_t)n;
+    }
+    return used;
+}
+
+static JSStackFrame *js_debug_active_frame(JSContext *ctx)
+{
+    JSStackFrame *sf;
+    if (!ctx || !ctx->rt)
+        return NULL;
+    for (sf = ctx->rt->current_stack_frame; sf; sf = sf->prev_frame) {
+        if (sf->cur_sp && JS_GetFunctionBytecode(sf->cur_func))
+            return sf;
+    }
+    return NULL;
+}
+
+static int js_debug_format_value(JSContext *ctx, JSValueConst val,
+                                 char *buf, size_t cap)
+{
+    int tag;
+    const char *placeholder = NULL;
+    if (!buf || !cap)
+        return JS_DEBUG_VALUE_OTHER;
+    buf[0] = '\0';
+    if (JS_IsUndefined(val)) { snprintf(buf, cap, "undefined"); return JS_DEBUG_VALUE_UNDEFINED; }
+    if (JS_IsNull(val)) { snprintf(buf, cap, "null"); return JS_DEBUG_VALUE_NULL; }
+    if (JS_IsBool(val)) { snprintf(buf, cap, "%s", JS_ToBool(ctx, val) ? "true" : "false"); return JS_DEBUG_VALUE_BOOLEAN; }
+    if (JS_IsNumber(val)) {
+        const char *str = JS_ToCString(ctx, val);
+        if (str) { snprintf(buf, cap, "%s", str); JS_FreeCString(ctx, str); }
+        else snprintf(buf, cap, "<number>");
+        return JS_DEBUG_VALUE_NUMBER;
+    }
+    if (JS_IsString(val)) {
+        const char *str = JS_ToCString(ctx, val);
+        if (!str) { snprintf(buf, cap, "<string>"); return JS_DEBUG_VALUE_STRING; }
+        size_t j = 0;
+        for (size_t i = 0; str[i] && j + 1 < cap; i++) {
+            unsigned char c = (unsigned char)str[i];
+            if (c == '\n' || c == '\r' || c == '\t') {
+                if (j + 2 >= cap) break;
+                buf[j++] = '\\'; buf[j++] = c == '\n' ? 'n' : c == '\r' ? 'r' : 't';
+            } else if (c < 0x20 || c == 0x7f) {
+                if (j + 4 >= cap) break;
+                int n = snprintf(buf + j, cap - j, "\\x%02x", c);
+                if (n < 0) break;
+                j += (size_t)n;
+            } else buf[j++] = (char)c;
+        }
+        buf[j] = '\0';
+        JS_FreeCString(ctx, str);
+        return JS_DEBUG_VALUE_STRING;
+    }
+    tag = JS_VALUE_GET_TAG(val);
+    if (tag == JS_TAG_UNINITIALIZED) { snprintf(buf, cap, "<uninitialized>"); return JS_DEBUG_VALUE_UNINITIALIZED; }
+    if (JS_IsBigInt(ctx, val)) {
+        const char *str = JS_ToCString(ctx, val);
+        if (str) { snprintf(buf, cap, "%s", str); JS_FreeCString(ctx, str); }
+        else snprintf(buf, cap, "<bigint>");
+        return JS_DEBUG_VALUE_BIGINT;
+    }
+    if (tag == JS_TAG_SYMBOL) { placeholder = "<symbol>"; }
+    else if (JS_IsFunction(ctx, val)) { placeholder = "<function>"; }
+    else if (JS_IsObject(val)) { placeholder = "<object>"; }
+    else placeholder = "<value>";
+    snprintf(buf, cap, "%s", placeholder);
+    if (tag == JS_TAG_SYMBOL) return JS_DEBUG_VALUE_SYMBOL;
+    if (JS_IsFunction(ctx, val)) return JS_DEBUG_VALUE_FUNCTION;
+    if (JS_IsObject(val)) return JS_DEBUG_VALUE_OBJECT;
+    return JS_DEBUG_VALUE_OTHER;
+}
+
+int JS_GetCurrentLocalValue(JSContext *ctx, const char *name,
+                            char *value_buf, size_t value_buf_size,
+                            int *value_type)
+{
+    JSStackFrame *sf = js_debug_active_frame(ctx);
+    JSFunctionBytecode *b;
+    JSObject *func;
+    int i;
+    if (value_type) *value_type = JS_DEBUG_VALUE_NOT_FOUND;
+    if (value_buf && value_buf_size) value_buf[0] = '\0';
+    if (!sf || !name || !*name)
+        return 0;
+    func = JS_VALUE_GET_OBJ(sf->cur_func);
+    b = func->u.func.function_bytecode;
+    /* Locals are searched before arguments, and in reverse declaration order,
+       approximating lexical shadowing without executing any JS in the hook. */
+    for (i = (int)b->var_count - 1; i >= 0; i--) {
+        JSBytecodeVarDef *vd = &b->vardefs[b->arg_count + i];
+        const char *vn;
+        if (vd->var_name == JS_ATOM_NULL) continue;
+        vn = JS_AtomToCString(ctx, vd->var_name);
+        int match = vn && strcmp(vn, name) == 0;
+        if (vn) JS_FreeCString(ctx, vn);
+        if (match) {
+            int type = js_debug_format_value(ctx, sf->var_buf[i], value_buf, value_buf_size);
+            if (value_type) *value_type = type;
+            return 1;
+        }
+    }
+    for (i = (int)b->arg_count - 1; i >= 0; i--) {
+        JSBytecodeVarDef *vd = &b->vardefs[i];
+        const char *vn;
+        if (vd->var_name == JS_ATOM_NULL) continue;
+        vn = JS_AtomToCString(ctx, vd->var_name);
+        int match = vn && strcmp(vn, name) == 0;
+        if (vn) JS_FreeCString(ctx, vn);
+        if (match) {
+            JSValue val = (i < sf->arg_count && sf->arg_buf) ? sf->arg_buf[i] : JS_UNDEFINED;
+            int type = js_debug_format_value(ctx, val, value_buf, value_buf_size);
+            if (value_type) *value_type = type;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+size_t JS_GetCurrentLocals(JSContext *ctx, char *buf, size_t buf_size,
+                           int max_variables)
+{
+    JSStackFrame *sf = js_debug_active_frame(ctx);
+    JSFunctionBytecode *b;
+    JSObject *func;
+    size_t used = 0;
+    int emitted = 0;
+    if (!buf || !buf_size) return 0;
+    buf[0] = '\0';
+    if (!sf || max_variables <= 0) return 0;
+    func = JS_VALUE_GET_OBJ(sf->cur_func);
+    b = func->u.func.function_bytecode;
+    for (int group = 0; group < 2 && emitted < max_variables; group++) {
+        int n = group == 0 ? b->arg_count : b->var_count;
+        for (int i = 0; i < n && emitted < max_variables; i++) {
+            JSBytecodeVarDef *vd = group == 0 ? &b->vardefs[i] : &b->vardefs[b->arg_count + i];
+            const char *name;
+            char value[256];
+            int type;
+            JSValue val;
+            if (vd->var_name == JS_ATOM_NULL) continue;
+            name = JS_AtomToCString(ctx, vd->var_name);
+            if (!name) continue;
+            val = group == 0 ? ((i < sf->arg_count && sf->arg_buf) ? sf->arg_buf[i] : JS_UNDEFINED) : sf->var_buf[i];
+            type = js_debug_format_value(ctx, val, value, sizeof(value));
+            int written = snprintf(buf + used, buf_size - used, "%s%s %s = %s\n",
+                                   group == 0 ? "arg " : "local ", name,
+                                   type == JS_DEBUG_VALUE_NUMBER ? "number" :
+                                   type == JS_DEBUG_VALUE_BOOLEAN ? "boolean" :
+                                   type == JS_DEBUG_VALUE_STRING ? "string" :
+                                   type == JS_DEBUG_VALUE_BIGINT ? "bigint" :
+                                   type == JS_DEBUG_VALUE_OBJECT ? "object" :
+                                   type == JS_DEBUG_VALUE_FUNCTION ? "function" :
+                                   type == JS_DEBUG_VALUE_UNDEFINED ? "undefined" :
+                                   type == JS_DEBUG_VALUE_NULL ? "null" :
+                                   type == JS_DEBUG_VALUE_UNINITIALIZED ? "uninitialized" : "value",
+                                   value);
+            JS_FreeCString(ctx, name);
+            if (written < 0 || (size_t)written >= buf_size - used) { used = buf_size - 1; buf[used] = '\0'; return used; }
+            used += (size_t)written; emitted++;
+        }
+    }
+    return used;
+}
+
+static void js_trace_source_line(JSContext *ctx, JSFunctionBytecode *b,
+                                 JSStackFrame *sf, const uint8_t *pc, JSValue *sp)
+{
+    JSRuntime *rt = ctx->rt;
+    if (!rt->execution_trace_hook || !b->has_debug || !b->debug.pc2line_buf ||
+        pc < b->byte_code_buf || pc >= b->byte_code_buf + b->byte_code_len)
+        return;
+    uint32_t trace_pc = (uint32_t)(pc - b->byte_code_buf);
+    int trace_col = 0;
+    int trace_line = find_line_num(ctx, b, trace_pc, &trace_col);
+    int previous_pc = sf->debug_last_pc;
+    sf->debug_last_pc = (int)trace_pc;
+    /* Report line changes and backward branches (loops can repeat a line). */
+    if (trace_line <= 0 ||
+        (trace_line == sf->debug_last_line && (int)trace_pc > previous_pc))
+        return;
+    sf->debug_last_line = trace_line;
+    const char *trace_file = NULL, *trace_func = NULL;
+    if (b->debug.filename != JS_ATOM_NULL)
+        trace_file = JS_AtomToCString(ctx, b->debug.filename);
+    if (b->func_name != JS_ATOM_NULL)
+        trace_func = JS_AtomToCString(ctx, b->func_name);
+    /* Publish the live operand-stack position only while inside the hook. This
+       enables bounded local inspection and keeps the collector aware of roots
+       if the hook formats primitive values while the interpreter is paused. */
+    sf->cur_pc = pc;
+    sf->cur_sp = sp;
+    rt->execution_trace_hook(ctx,
+        trace_file ? trace_file : "<anonymous>",
+        trace_func ? trace_func : "<script>",
+        trace_line, trace_col, rt->execution_trace_opaque);
+    sf->cur_sp = NULL;
+    if (trace_func) JS_FreeCString(ctx, trace_func);
+    if (trace_file) JS_FreeCString(ctx, trace_file);
+}
+
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValue *argv, int flags)
@@ -17759,7 +21516,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     size_t alloca_size;
 
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      switch (opcode = *pc++)
+#define SWITCH(pc)      switch ((js_trace_source_line(ctx, b, sf, (pc), sp), opcode = *pc++))
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -17774,7 +21531,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      goto *dispatch_table[opcode = *pc++];
+#define SWITCH(pc)      js_trace_source_line(ctx, b, sf, (pc), sp); goto *dispatch_table[opcode = *pc++];
 #ifdef OPCODE_ASM_LABEL
 #define CASE(op)        case_ ## op: asm volatile("label_" #op ":\n.globl label_" #op); dummy_case_ ## op
 #else
@@ -17825,6 +21582,188 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     }
     b = p->u.func.function_bytecode;
 
+#if defined(__linux__) && defined(__x86_64__) && !defined(__SANITIZE_ADDRESS__)
+    if (rt->jit_enabled && !rt->execution_trace_hook &&
+        !(flags & (JS_CALL_FLAG_CONSTRUCTOR | JS_CALL_FLAG_GENERATOR)) &&
+        b->func_kind == JS_FUNC_NORMAL && !b->read_only_bytecode &&
+        b->var_ref_count == 0 && b->closure_var_count == 0) {
+        if (!b->jit_code && !b->jit_compile_attempted) {
+            if (b->jit_call_count < JS_BASELINE_JIT_THRESHOLD)
+                b->jit_call_count++;
+            if (b->jit_call_count >= JS_BASELINE_JIT_THRESHOLD) {
+                size_t mapped_size = 0;
+                uint8_t required_args = 0;
+                b->jit_compile_attempted = 1;
+                b->jit_code = js_baseline_jit_compile(b, &mapped_size,
+                                                       &required_args);
+                if (b->jit_code) {
+                    size_t plan_mapped_size = 0, plan_data_size = 0;
+                    uint8_t plan_required_args = 0;
+                    uint32_t plan_arg_mask = 0;
+                    b->jit_code_size = mapped_size;
+                    b->jit_required_args = required_args;
+                    rt->jit_compiled_functions++;
+                    b->jit_bigint_plan_code = js_baseline_jit_compile_bigint_plan(
+                        b, &plan_mapped_size, &plan_required_args, &plan_arg_mask,
+                        &b->jit_bigint_plan, &plan_data_size);
+                    if (b->jit_bigint_plan_code) {
+                        b->jit_bigint_plan_code_size = plan_mapped_size;
+                        b->jit_bigint_plan_size = plan_data_size;
+                        b->jit_bigint_plan_required_args = plan_required_args;
+                        b->jit_bigint_plan_arg_mask = plan_arg_mask;
+                        rt->jit_bigint_plans_compiled++;
+                    }
+                }
+            }
+        }
+        if (b->jit_code) {
+            int jit_ok = (argc >= b->jit_required_args);
+            int root_frame_active = 0;
+            JSJITNativeValue native_args[JS_BASELINE_JIT_MAX_ARGS];
+            int32_t native_stack[JS_BASELINE_JIT_MAX_STACK * 2];
+            double native_numbers[JS_BASELINE_JIT_MAX_STACK];
+            JSJITNativePayload native_result;
+            JSJITRootFrame root_frame;
+            JSJITRootFrame *previous_root_frame = NULL;
+            int32_t native_result_kind = 0;
+            int32_t native_fuel = 1024;
+            int native_ok;
+            int j;
+            if (jit_ok) {
+                /* Attach the root frame before marshaling arguments because
+                   heap-backed BigInt args must be retained just like BigInts
+                   loaded from object/Array slots later in the native frame. */
+                root_frame.count = 0;
+                root_frame.ctx = b->realm;
+                previous_root_frame = rt->current_jit_root_frame;
+                root_frame.prev = previous_root_frame;
+                rt->current_jit_root_frame = &root_frame;
+                root_frame_active = 1;
+                for (j = 0; j < b->jit_required_args; j++) {
+                    int tag = JS_VALUE_GET_TAG(argv[j]);
+                    native_args[j].reserved = 0;
+                    if (tag == JS_TAG_INT) {
+                        native_args[j].payload.i32 = JS_VALUE_GET_INT(argv[j]);
+                        native_args[j].kind = JS_JIT_KIND_INT32;
+                    } else if (tag == JS_TAG_BOOL) {
+                        native_args[j].payload.i32 = JS_VALUE_GET_BOOL(argv[j]);
+                        native_args[j].kind = JS_JIT_KIND_BOOL;
+                    } else if (tag == JS_TAG_FLOAT64) {
+                        native_args[j].payload.f64 = JS_VALUE_GET_FLOAT64(argv[j]);
+                        native_args[j].kind = JS_JIT_KIND_FLOAT64;
+                    } else if (tag == JS_TAG_OBJECT) {
+                        native_args[j].payload.u64 = (uintptr_t)JS_VALUE_GET_OBJ(argv[j]);
+                        native_args[j].kind = JS_JIT_KIND_OBJECT;
+                    } else if (tag == JS_TAG_SHORT_BIG_INT) {
+                        native_args[j].payload.u64 = (uint64_t)JS_VALUE_GET_SHORT_BIG_INT(argv[j]);
+                        native_args[j].kind = JS_JIT_KIND_BIGINT;
+                    } else if (tag == JS_TAG_BIG_INT) {
+                        uint64_t ptr_bits;
+                        /* argv remains owned by the caller for the entire
+                           JS_CallInternal invocation. Native JIT code neither
+                           mutates argv nor calls arbitrary JS, so this existing
+                           reference keeps heap-BigInt arguments alive; only
+                           newly allocated results need a frame-owned root. */
+                        ptr_bits = (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(argv[j]);
+                        native_args[j].payload.u64 = ptr_bits;
+                        native_args[j].kind = JS_JIT_KIND_HEAP_BIGINT;
+                    } else {
+                        jit_ok = 0;
+                        break;
+                    }
+                }
+            }
+            if (jit_ok) {
+                JSBaselineJITFunction jit_fn = (JSBaselineJITFunction)b->jit_code;
+                /* Use a pre-decoded fused BigInt plan only when every argument
+                   actually referenced by that plan is a BigInt. Number-typed
+                   calls retain the ordinary native baseline path. */
+                if (b->jit_bigint_plan_code &&
+                    argc >= b->jit_bigint_plan_required_args) {
+                    uint32_t mask = b->jit_bigint_plan_arg_mask;
+                    int plan_eligible = 1;
+                    for (j = 0; j < JS_BASELINE_JIT_MAX_ARGS; j++) {
+                        if (mask & (UINT32_C(1) << j)) {
+                            int kind = native_args[j].kind;
+                            if (kind != JS_JIT_KIND_BIGINT &&
+                                kind != JS_JIT_KIND_HEAP_BIGINT) {
+                                plan_eligible = 0;
+                                break;
+                            }
+                        }
+                    }
+                    if (plan_eligible)
+                        jit_fn = (JSBaselineJITFunction)b->jit_bigint_plan_code;
+                }
+                /* Temporary stack/lane cells are written before use by the
+                   verified bytecode lowering; only locals need explicit TDZ
+                   kinds. Avoid clearing fixed-size 512-byte lanes per call. */
+                for (j = 0; j < b->var_count; j++)
+                    native_stack[j * 2 + 1] = JS_JIT_KIND_UNINITIALIZED;
+                native_ok = jit_fn(native_args, &native_result, native_stack,
+                                   &native_result_kind, &native_fuel, native_numbers);
+                /* Detach before materializing a result. The roots remain alive
+                   until object/BigInt results gain their own returned reference. */
+                rt->current_jit_root_frame = previous_root_frame;
+                root_frame_active = 0;
+                if (native_ok == 2) {
+                    /* A helper has already installed a QuickJS exception. Do not
+                       re-run the function in the interpreter, which could repeat
+                       earlier observable writes. */
+                    js_baseline_jit_release_roots(&root_frame);
+                    return JS_EXCEPTION;
+                }
+                if (native_ok &&
+                    (native_result_kind == 0 || native_result_kind == 1 ||
+                     native_result_kind == 3 || native_result_kind == JS_JIT_KIND_FLOAT64 ||
+                     native_result_kind == JS_JIT_KIND_OBJECT ||
+                     native_result_kind == JS_JIT_KIND_BIGINT ||
+                     native_result_kind == JS_JIT_KIND_HEAP_BIGINT)) {
+                    JSValue result_value;
+                    rt->jit_executed_functions++;
+                    if (native_result_kind == JS_JIT_KIND_OBJECT) {
+                        JSValue object_value = JS_MKPTR(JS_TAG_OBJECT,
+                            (void *)(uintptr_t)native_result.u64);
+                        result_value = JS_DupValue(b->realm, object_value);
+                    } else if (native_result_kind == JS_JIT_KIND_HEAP_BIGINT) {
+                        JSValue bigint_value = JS_MKPTR(JS_TAG_BIG_INT,
+                            (void *)(uintptr_t)native_result.u64);
+                        /* Arithmetic results already own a root in this frame.
+                           Transfer that reference to the caller when possible;
+                           argument/property aliases without a frame root still
+                           take the ordinary duplicate-reference path. */
+                        if (!js_baseline_jit_take_bigint_root(&root_frame,
+                                native_result.u64, &result_value))
+                            result_value = JS_DupValue(b->realm, bigint_value);
+                    } else if (native_result_kind == 1) {
+                        result_value = JS_NewBool(b->realm, native_result.i32 != 0);
+                    } else if (native_result_kind == 3) {
+                        result_value = JS_NewFloat64(b->realm, (double)(uint32_t)native_result.i32);
+                    } else if (native_result_kind == JS_JIT_KIND_FLOAT64) {
+                        result_value = JS_NewFloat64(b->realm, native_result.f64);
+                    } else if (native_result_kind == JS_JIT_KIND_BIGINT) {
+                        result_value = JS_NewBigInt64(b->realm, (int64_t)native_result.u64);
+                    } else {
+                        result_value = JS_NewInt32(b->realm, native_result.i32);
+                    }
+                    js_baseline_jit_release_roots(&root_frame);
+                    return result_value;
+                }
+                js_baseline_jit_release_roots(&root_frame);
+                rt->jit_deoptimizations++;
+            } else {
+                if (root_frame_active) {
+                    rt->current_jit_root_frame = previous_root_frame;
+                    js_baseline_jit_release_roots(&root_frame);
+                }
+                /* Type/arity/root-capacity guard miss: let QuickJS preserve
+                   full semantics; no native operation has run yet. */
+                rt->jit_deoptimizations++;
+            }
+        }
+    }
+#endif
+
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
     } else {
@@ -17838,6 +21777,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         return JS_ThrowStackOverflow(caller_ctx);
 
     sf->js_mode = b->js_mode;
+    sf->debug_last_line = -1;
+    sf->debug_last_pc = -1;
     arg_buf = argv;
     sf->arg_count = argc;
     sf->cur_func = (JSValue)func_obj;
@@ -17871,6 +21812,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     ctx = b->realm; /* set the current realm */
 
  restart:
+    sf->debug_last_line = -1;
+    sf->debug_last_pc = -1;
     for(;;) {
         int call_argc;
         JSValue *call_argv;
@@ -19108,9 +23051,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {                                                           \
                 JSValue val, obj;                                       \
                 JSAtom atom;                                            \
-                JSObject *p;                                            \
+                JSObject *p, *receiver;                                 \
                 JSProperty *pr;                                         \
                 JSShapeProperty *prs;                                   \
+                uintptr_t ic_site = (uintptr_t)(pc - 1);                \
                                                                         \
                 if (is_length) {                                        \
                     atom = JS_ATOM_length;                              \
@@ -19122,12 +23066,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];                                           \
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {   \
                     p = JS_VALUE_GET_OBJ(obj);                          \
+                    receiver = p;                                       \
                     for(;;) {                                           \
+                        if (!is_length && p == receiver && !p->is_exotic && \
+                            js_property_ic_lookup(rt, ic_site, p, atom,  \
+                                JS_PROPERTY_IC_GET, &pr, &prs)) {       \
+                            val = JS_DupValue(ctx, pr->u.value);        \
+                            break;                                      \
+                        }                                               \
                         prs = find_own_property(&pr, p, atom);          \
                         if (prs) {                                      \
                             /* found */                                 \
                             if (unlikely(prs->flags & JS_PROP_TMASK))   \
                                     goto name ## _slow_path;            \
+                            if (!is_length && p == receiver && !p->is_exotic) \
+                                js_property_ic_update(rt, ic_site, p, atom, \
+                                    JS_PROPERTY_IC_GET, prs);            \
                             val = JS_DupValue(ctx, pr->u.value);        \
                             break;                                      \
                         }                                               \
@@ -19182,6 +23136,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSObject *p;
                 JSProperty *pr;
                 JSShapeProperty *prs;
+                uintptr_t ic_site = (uintptr_t)(pc - 1);
 
                 atom = get_u32(pc);
                 pc += 4;
@@ -19189,15 +23144,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-2];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
-                    prs = find_own_property(&pr, p, atom);
-                    if (!prs)
-                        goto put_field_slow_path;
-                    if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
-                                              JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
-                        /* fast path */
+                    if (!p->is_exotic &&
+                        js_property_ic_lookup(rt, ic_site, p, atom,
+                            JS_PROPERTY_IC_PUT, &pr, &prs)) {
                         set_value(ctx, &pr->u.value, sp[-1]);
                     } else {
-                        goto put_field_slow_path;
+                        prs = find_own_property(&pr, p, atom);
+                        if (!prs)
+                            goto put_field_slow_path;
+                        if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                                  JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+                            if (!p->is_exotic)
+                                js_property_ic_update(rt, ic_site, p, atom,
+                                    JS_PROPERTY_IC_PUT, prs);
+                            set_value(ctx, &pr->u.value, sp[-1]);
+                        } else {
+                            goto put_field_slow_path;
+                        }
                     }
                     JS_FreeValue(ctx, obj);
                     sp -= 2;
@@ -36284,6 +40247,8 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 {
     int i;
 
+    js_baseline_jit_free(b);
+
 #if 0
     {
         char buf[ATOM_GET_STR_BUF_SIZE];
@@ -37500,9 +41465,11 @@ typedef enum BCTagEnum {
     BC_TAG_DATE,
     BC_TAG_OBJECT_VALUE,
     BC_TAG_OBJECT_REFERENCE,
+    BC_TAG_MAP,
+    BC_TAG_SET,
 } BCTagEnum;
 
-#define BC_VERSION 5
+#define BC_VERSION 6
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -37545,6 +41512,8 @@ static const char * const bc_tag_str[] = {
     "Date",
     "ObjectValue",
     "ObjectReference",
+    "Map",
+    "Set",
 };
 #endif
 
@@ -38097,6 +42066,36 @@ static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
     return 0;
 }
 
+/* Map helpers are implemented below the object reader; the serializer needs them
+   when reconstructing Map/Set records directly, without invoking user-overridable methods. */
+static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s, JSValueConst key);
+static JSMapRecord *set_add_record(JSContext *ctx, JSMapState *s, JSValueConst key);
+
+static int JS_WriteMap(BCWriterState *s, JSValueConst obj, BOOL is_set)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    JSMapState *ms = p->u.opaque;
+    struct list_head *el;
+    uint32_t count = 0;
+    if (!ms || ms->is_weak) {
+        JS_ThrowTypeError(s->ctx, "weak collections cannot be cloned");
+        return -1;
+    }
+    list_for_each(el, &ms->records) {
+        JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+        if (!mr->empty) count++;
+    }
+    bc_put_u8(s, is_set ? BC_TAG_SET : BC_TAG_MAP);
+    bc_put_leb128(s, count);
+    list_for_each(el, &ms->records) {
+        JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+        if (mr->empty) continue;
+        if (JS_WriteObjectRec(s, mr->key)) return -1;
+        if (!is_set && JS_WriteObjectRec(s, mr->value)) return -1;
+    }
+    return 0;
+}
+
 static int JS_WriteArrayBuffer(BCWriterState *s, JSValueConst obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
@@ -38233,6 +42232,12 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
             case JS_CLASS_DATE:
                 bc_put_u8(s, BC_TAG_DATE);
                 ret = JS_WriteObjectRec(s, p->u.object_data);
+                break;
+            case JS_CLASS_MAP:
+                ret = JS_WriteMap(s, obj, FALSE);
+                break;
+            case JS_CLASS_SET:
+                ret = JS_WriteMap(s, obj, TRUE);
                 break;
             case JS_CLASS_NUMBER:
             case JS_CLASS_STRING:
@@ -39309,6 +43314,56 @@ static JSValue JS_ReadObjectValue(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+static JSValue JS_ReadMap(BCReaderState *s, BOOL is_set)
+{
+    JSContext *ctx = s->ctx;
+    JSValue obj = JS_UNDEFINED, key = JS_UNDEFINED, value = JS_UNDEFINED;
+    JSMapState *ms = NULL;
+    uint32_t count = 0, i;
+    if (bc_get_leb128(s, &count)) return JS_EXCEPTION;
+    if (count > 1000000) return JS_ThrowRangeError(ctx, "cloned Map/Set contains too many entries");
+    obj = JS_NewObjectClass(ctx, is_set ? JS_CLASS_SET : JS_CLASS_MAP);
+    if (JS_IsException(obj)) return obj;
+    ms = js_mallocz(ctx, sizeof(*ms));
+    if (!ms) goto fail;
+    init_list_head(&ms->records);
+    ms->is_weak = FALSE;
+    ms->hash_bits = 1;
+    ms->hash_size = 1U << ms->hash_bits;
+    ms->hash_table = js_mallocz(ctx, sizeof(ms->hash_table[0]) * ms->hash_size);
+    if (!ms->hash_table) goto fail;
+    ms->record_count_threshold = 4;
+    JS_SetOpaque(obj, ms);
+    ms = NULL; /* owned by the object finalizer from here */
+    if (BC_add_object_ref(s, obj)) goto fail;
+    for (i = 0; i < count; i++) {
+        key = JS_ReadObjectRec(s);
+        if (JS_IsException(key)) goto fail;
+        if (is_set) {
+            JSMapRecord *mr = set_add_record(ctx, JS_VALUE_GET_OBJ(obj)->u.opaque, key);
+            if (!mr) goto fail;
+        } else {
+            value = JS_ReadObjectRec(s);
+            if (JS_IsException(value)) goto fail;
+            JSMapRecord *mr = map_add_record(ctx, JS_VALUE_GET_OBJ(obj)->u.opaque, key);
+            if (!mr) goto fail;
+            mr->value = JS_DupValue(ctx, value);
+        }
+        JS_FreeValue(ctx, key); key = JS_UNDEFINED;
+        JS_FreeValue(ctx, value); value = JS_UNDEFINED;
+    }
+    return obj;
+ fail:
+    JS_FreeValue(ctx, key);
+    JS_FreeValue(ctx, value);
+    if (ms) {
+        js_free(ctx, ms->hash_table);
+        js_free(ctx, ms);
+    }
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
 static JSValue JS_ReadObjectRec(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -39397,6 +43452,12 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
         break;
     case BC_TAG_BIG_INT:
         obj = JS_ReadBigInt(s);
+        break;
+    case BC_TAG_MAP:
+        obj = JS_ReadMap(s, FALSE);
+        break;
+    case BC_TAG_SET:
+        obj = JS_ReadMap(s, TRUE);
         break;
     case BC_TAG_OBJECT_REFERENCE:
         {

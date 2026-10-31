@@ -5,6 +5,11 @@
 #include "ntls.h"
 #include "ninflate.h"
 #include "psl.h"
+#include "idna.h"
+#include "web_security.h"
+#ifdef MLBROWSER_HAVE_CURL
+#include <curl/curl.h>
+#endif
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netdb.h>
@@ -44,6 +49,19 @@ static int str_adds(Str* s, const char* c) { return str_add(s, c, strlen(c)); }
 /* ══════════════ URL ══════════════ */
 typedef struct { int https; char host[256]; int port; char origin[300]; char pq[8192]; } Url;   /* pq — путь+запрос в исходном виде, всегда с '/' в начале */
 
+static int parse_port(const char *s, int *port) {
+    if (!s || !*s || !port) return 0;
+    unsigned long value = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        if (*p < '0' || *p > '9') return 0;
+        value = value * 10 + (unsigned long)(*p - '0');
+        if (value > 65535) return 0;
+    }
+    if (value == 0) return 0;
+    *port = (int)value;
+    return 1;
+}
+
 static int parse_url(const char* s, Url* u) {
     memset(u, 0, sizeof *u);
     if (!strncasecmp(s, "https://", 8)) { u->https = 1; s += 8; } else if (!strncasecmp(s, "http://", 7)) s += 7; else return 0;
@@ -52,12 +70,30 @@ static int parse_url(const char* s, Url* u) {
     char auth[300]; memcpy(auth, a, alen); auth[alen] = 0;
     char* at = strrchr(auth, '@'); char* hp = at ? at + 1 : auth;                  /* user:pass@ отбрасываем */
     char host[256]; int port = u->https ? 443 : 80;
-    if (*hp == '[') { char* e = strchr(hp, ']'); if (!e) return 0; size_t hl = (size_t)(e - hp - 1); if (!hl || hl > 80) return 0; memcpy(host, hp + 1, hl); host[hl] = 0; if (e[1] == ':') port = atoi(e + 2); }
-    else { char* c = strchr(hp, ':'); size_t hl = c ? (size_t)(c - hp) : strlen(hp); if (!hl || hl > 253) return 0; memcpy(host, hp, hl); host[hl] = 0; if (c) port = atoi(c + 1); }
+    int bracketed_host = 0;
+    if (*hp == '[') {
+        bracketed_host = 1;
+        char* e = strchr(hp, ']');
+        if (!e) return 0;
+        size_t hl = (size_t)(e - hp - 1);
+        if (!hl || hl > 80) return 0;
+        memcpy(host, hp + 1, hl); host[hl] = 0;
+        struct in6_addr ipv6_addr;
+        if (inet_pton(AF_INET6, host, &ipv6_addr) != 1) return 0;
+        if (e[1] == ':') { if (!parse_port(e + 2, &port)) return 0; }
+        else if (e[1] != 0) return 0; /* Не игнорируем мусор после IPv6-литерала. */
+    } else {
+        char* c = strchr(hp, ':');
+        size_t hl = c ? (size_t)(c - hp) : strlen(hp);
+        if (!hl || hl > 253) return 0;
+        memcpy(host, hp, hl); host[hl] = 0;
+        if (c && !parse_port(c + 1, &port)) return 0;
+    }
     if (port <= 0 || port > 65535) return 0;
     for (char* p = host; *p; p++) { if ((unsigned char)*p <= 32 || *p == '/') return 0; *p = (char)tolower((unsigned char)*p); }
+    if (!bracketed_host) { char ascii[256]; if (!nidna_to_ascii(host, ascii, sizeof ascii)) return 0; snprintf(host, sizeof host, "%s", ascii); }
     snprintf(u->host, sizeof u->host, "%s", host); u->port = port;
-    int v6 = strchr(host, ':') != NULL; int def = u->https ? port == 443 : port == 80;
+    int v6 = bracketed_host; int def = u->https ? port == 443 : port == 80;
     if (def) snprintf(u->origin, sizeof u->origin, "%s://%s%s%s", u->https ? "https" : "http", v6 ? "[" : "", host, v6 ? "]" : "");
     else snprintf(u->origin, sizeof u->origin, "%s://%s%s%s:%d", u->https ? "https" : "http", v6 ? "[" : "", host, v6 ? "]" : "", port);
     const char* h = strchr(s, '#'); size_t pl = h ? (size_t)(h - s) : strlen(s);
@@ -68,48 +104,132 @@ static int parse_url(const char* s, Url* u) {
     return 1;
 }
 /* цель запроса: байты вне печатного ASCII и пробелы кодируем, уже закодированное (%XX) не трогаем */
-static void encode_target(const char* pq, char* out, size_t cap) {
+static int encode_target(const char* pq, char* out, size_t cap) {
+    if (!pq || !out || cap == 0) return 0;
     size_t o = 0;
-    for (const unsigned char* p = (const unsigned char*)pq; *p && o + 4 < cap; p++) {
-        if (*p <= 32 || *p >= 127 || *p == '"' || *p == '<' || *p == '>' || *p == '\\' || *p == '^' || *p == '`' || *p == '{' || *p == '|' || *p == '}') o += (size_t)snprintf(out + o, cap - o, "%%%02X", *p);
-        else out[o++] = (char)*p;
+    for (const unsigned char* p = (const unsigned char*)pq; *p; p++) {
+        int encode = *p <= 32 || *p >= 127 || *p == '"' || *p == '<' || *p == '>' ||
+                     *p == '\\' || *p == '^' || *p == '`' || *p == '{' || *p == '|' || *p == '}';
+        size_t need = encode ? 3u : 1u;
+        if (need > cap - o - 1) { out[0] = 0; return 0; }
+        if (encode) {
+            static const char hex[] = "0123456789ABCDEF";
+            out[o++] = '%'; out[o++] = hex[*p >> 4]; out[o++] = hex[*p & 15];
+        } else out[o++] = (char)*p;
     }
     out[o] = 0;
+    return 1;
 }
+
 /* удаление сегментов «.» и «..» в части пути (до '?') */
-static void remove_dots(char* pq) {
-    char* q = strchr(pq, '?'); char tail[8192]; tail[0] = 0; if (q) { snprintf(tail, sizeof tail, "%s", q); *q = 0; }
-    char* segs[512]; int ns = 0; char* save = NULL; char* tmp = strdup(pq); if (!tmp) return;
-    int trailing = pq[0] && pq[strlen(pq) - 1] == '/';
-    for (char* t = strtok_r(tmp, "/", &save); t && ns < 512; t = strtok_r(NULL, "/", &save)) {
+static int remove_dots(char* pq) {
+    if (!pq) return 0;
+    char tail[8192] = "";
+    char* q = strchr(pq, '?');
+    if (q) {
+        size_t tn = strlen(q);
+        if (tn >= sizeof tail) return 0;
+        memcpy(tail, q, tn + 1);
+        *q = 0;
+    }
+    char* tmp = strdup(pq);
+    if (!tmp) return 0;
+    char* segs[512];
+    int ns = 0;
+    char* save = NULL;
+    size_t plen = strlen(pq);
+    int trailing = plen && pq[plen - 1] == '/';
+    for (char* t = strtok_r(tmp, "/", &save); t; t = strtok_r(NULL, "/", &save)) {
         if (!strcmp(t, ".")) { trailing = 1; continue; }
         if (!strcmp(t, "..")) { if (ns) ns--; trailing = 1; continue; }
-        segs[ns++] = t; trailing = 0;
+        if (ns >= (int)(sizeof segs / sizeof segs[0])) { free(tmp); return 0; }
+        segs[ns++] = t;
+        trailing = 0;
     }
-    char out[8192]; size_t o = 0; out[o++] = '/';
-    for (int i = 0; i < ns && o < sizeof out - 300; i++) { size_t l = strlen(segs[i]); memcpy(out + o, segs[i], l); o += l; if (i + 1 < ns) out[o++] = '/'; }
-    if (trailing && ns && o < sizeof out - 2) out[o++] = '/';
-    out[o] = 0; snprintf(pq, 8192, "%s%s", out, tail); free(tmp);
+    char out[8192];
+    size_t o = 0;
+    out[o++] = '/';
+    for (int i = 0; i < ns; i++) {
+        size_t l = strlen(segs[i]);
+        size_t need = l + (i + 1 < ns ? 1u : 0u);
+        if (need > sizeof out - o - 1) { free(tmp); return 0; }
+        memcpy(out + o, segs[i], l); o += l;
+        if (i + 1 < ns) out[o++] = '/';
+    }
+    if (trailing && ns) {
+        if (o + 1 >= sizeof out) { free(tmp); return 0; }
+        out[o++] = '/';
+    }
+    if (strlen(tail) > sizeof out - o - 1) { free(tmp); return 0; }
+    memcpy(out + o, tail, strlen(tail) + 1);
+    memcpy(pq, out, o + strlen(tail) + 1);
+    free(tmp);
+    return 1;
 }
-/* Location относительно текущего URL → абсолютный */
+
+/* Location относительно текущего URL → абсолютный. Любое усечение считается ошибкой:
+   иначе редирект мог бы незаметно уйти на другой, усечённый URL. */
+static int url_append(char *dst, size_t cap, size_t *used, const char *src, size_t n) {
+    if (!dst || !used || !src || *used >= cap || n > cap - *used - 1) return 0;
+    memcpy(dst + *used, src, n);
+    *used += n;
+    dst[*used] = 0;
+    return 1;
+}
 static int resolve_location(const Url* base, const char* loc, char* out, size_t cap) {
+    if (!base || !loc || !out || cap == 0) return 0;
+    out[0] = 0;
     while (*loc == ' ') loc++;
-    if (!strncasecmp(loc, "http://", 7) || !strncasecmp(loc, "https://", 8)) { snprintf(out, cap, "%s", loc); return 1; }
-    if (loc[0] == '/' && loc[1] == '/') { snprintf(out, cap, "%s:%s", base->https ? "https" : "http", loc); return 1; }
-    char pq[8192];
-    const char* h = strchr(loc, '#'); size_t ll = h ? (size_t)(h - loc) : strlen(loc);
+    if (!strncasecmp(loc, "http://", 7) || !strncasecmp(loc, "https://", 8)) {
+        size_t n = strlen(loc);
+        if (n >= cap) return 0;
+        memcpy(out, loc, n + 1);
+        return 1;
+    }
+    if (loc[0] == '/' && loc[1] == '/') {
+        const char *scheme = base->https ? "https:" : "http:";
+        size_t used = 0;
+        out[0] = 0;
+        return url_append(out, cap, &used, scheme, strlen(scheme)) &&
+               url_append(out, cap, &used, loc, strlen(loc));
+    }
+    char pq[8192] = {0};
+    const char* h = strchr(loc, '#');
+    size_t ll = h ? (size_t)(h - loc) : strlen(loc);
     if (ll > 7000) return 0;
-    char l[8192]; memcpy(l, loc, ll); l[ll] = 0;
-    if (l[0] == '/') snprintf(pq, sizeof pq, "%s", l);
-    else if (l[0] == '?') { char path[8192]; snprintf(path, sizeof path, "%s", base->pq); char* q = strchr(path, '?'); if (q) *q = 0; snprintf(pq, sizeof pq, "%s%s", path, l); }
-    else if (!l[0]) snprintf(pq, sizeof pq, "%s", base->pq);
-    else { char dir[8192]; snprintf(dir, sizeof dir, "%s", base->pq); char* q = strchr(dir, '?'); if (q) *q = 0; char* sl = strrchr(dir, '/'); if (sl) sl[1] = 0; snprintf(pq, sizeof pq, "%s%s", dir, l); }
-    remove_dots(pq);
-    snprintf(out, cap, "%s%s", base->origin, pq); return 1;
+    char l[7001];
+    memcpy(l, loc, ll);
+    l[ll] = 0;
+    size_t used = 0;
+    if (l[0] == '/') {
+        if (!url_append(pq, sizeof pq, &used, l, strlen(l))) return 0;
+    } else if (l[0] == '?') {
+        char path[8192];
+        size_t n = strnlen(base->pq, sizeof path - 1);
+        memcpy(path, base->pq, n); path[n] = 0;
+        char* q = strchr(path, '?'); if (q) *q = 0;
+        if (!url_append(pq, sizeof pq, &used, path, strlen(path)) ||
+            !url_append(pq, sizeof pq, &used, l, strlen(l))) return 0;
+    } else if (!l[0]) {
+        if (!url_append(pq, sizeof pq, &used, base->pq, strnlen(base->pq, sizeof pq - 1))) return 0;
+    } else {
+        char dir[8192];
+        size_t n = strnlen(base->pq, sizeof dir - 1);
+        memcpy(dir, base->pq, n); dir[n] = 0;
+        char* q = strchr(dir, '?'); if (q) *q = 0;
+        char* sl = strrchr(dir, '/'); if (sl) sl[1] = 0;
+        if (!url_append(pq, sizeof pq, &used, dir, strlen(dir)) ||
+            !url_append(pq, sizeof pq, &used, l, strlen(l))) return 0;
+    }
+    if (!remove_dots(pq)) return 0;
+    size_t origin_len = strlen(base->origin), pq_len = strlen(pq), out_used = 0;
+    out[0] = 0;
+    return url_append(out, cap, &out_used, base->origin, origin_len) &&
+           url_append(out, cap, &out_used, pq, pq_len);
 }
 
 /* ══════════════ cookie jar (RFC 6265) ══════════════ */
-typedef struct { char *name, *value, *domain, *path; long long expiry; int secure, host_only, dirty, seq; } Cookie;   /* expiry 0 = сессионная */
+typedef struct { char *name, *value, *domain, *path; long long expiry; int secure, host_only, dirty, seq, same_site; } Cookie;   /* expiry 0 = сессионная */
 struct NJar { Cookie* c; int n, cap, seq; };
 
 NJar* njar_new(void) { return calloc(1, sizeof(NJar)); }
@@ -132,13 +252,13 @@ static Cookie* jar_find(NJar* j, const char* name, const char* dom, const char* 
     for (int i = 0; i < j->n; i++) { Cookie* c = &j->c[i]; if (c->host_only == host_only && !strcmp(c->name, name) && !strcasecmp(c->domain, dom) && !strcmp(c->path, path)) return c; }
     return NULL;
 }
-static void jar_put(NJar* j, const char* name, const char* value, const char* dom, const char* path, long long expiry, int secure, int host_only, int dirty) {
+static void jar_put(NJar* j, const char* name, const char* value, const char* dom, const char* path, long long expiry, int secure, int host_only, int dirty, int same_site) {
     Cookie* c = jar_find(j, name, dom, path, host_only);
-    if (c) { free(c->value); c->value = strdup(value); c->expiry = expiry; c->secure = secure; c->dirty |= dirty; c->seq = j->seq++; return; }
+    if (c) { free(c->value); c->value = strdup(value); c->expiry = expiry; c->secure = secure; c->same_site = same_site; c->dirty |= dirty; c->seq = j->seq++; return; }
     if (j->n >= 4000) return;
     if (j->n == j->cap) { int nc = j->cap ? j->cap * 2 : 32; Cookie* nv = realloc(j->c, (size_t)nc * sizeof(Cookie)); if (!nv) return; j->c = nv; j->cap = nc; }
     c = &j->c[j->n++]; c->name = strdup(name); c->value = strdup(value); c->domain = strdup(dom); c->path = strdup(path);
-    c->expiry = expiry; c->secure = secure; c->host_only = host_only; c->dirty = dirty; c->seq = j->seq++;
+    c->expiry = expiry; c->secure = secure; c->host_only = host_only; c->dirty = dirty; c->seq = j->seq++; c->same_site = same_site;
 }
 void njar_load_netscape(NJar* j, const char* path) {
     FILE* f = fopen(path, "r"); if (!f) return;
@@ -146,15 +266,15 @@ void njar_load_netscape(NJar* j, const char* path) {
     while (fgets(line, sizeof line, f)) {
         size_t l = strlen(line); while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
         if (!l || line[0] == '#') continue;
-        char* fld[7]; int nf = 0; char* p = line;
-        while (nf < 7) { fld[nf++] = p; char* t = strchr(p, '\t'); if (!t) break; *t = 0; p = t + 1; }
+        char* fld[8]; int nf = 0; char* p = line;
+        while (nf < 8) { fld[nf++] = p; char* t = strchr(p, '\t'); if (!t) break; *t = 0; p = t + 1; }
         if (nf < 6) continue;
         const char* dom = fld[0]; const char* cpath = fld[2]; int secure = !strcmp(fld[3], "TRUE"); long long exp = atoll(fld[4]);
-        const char* name = fld[5]; const char* value = nf >= 7 ? fld[6] : "";
+        const char* name = fld[5]; const char* value = nf >= 7 ? fld[6] : ""; int same_site = nf >= 8 ? atoi(fld[7]) : 2; if (same_site < 1 || same_site > 3) same_site = 2;
         if (exp > 0 && exp < (long long)now) continue;
         int host_only = dom[0] != '.'; if (dom[0] == '.') dom++;
         if (!*dom || !*name) continue;
-        jar_put(j, name, value, dom, cpath[0] ? cpath : "/", exp, secure, host_only, 0);
+        jar_put(j, name, value, dom, cpath[0] ? cpath : "/", exp, secure, host_only, 0, same_site);
     }
     fclose(f);
 }
@@ -164,7 +284,7 @@ int njar_save_changed(NJar* j, const char* path) {
         Cookie* c = &j->c[i]; if (!c->dirty) continue;
         if (strpbrk(c->name, "\t\r\n") || strpbrk(c->value, "\t\r\n") || strlen(c->value) > 1000 || strlen(c->name) > 250) continue;   /* формат БД не вместит */
         if (!f) { f = fopen(path, "w"); if (!f) return 0; fputs("# Netscape HTTP Cookie File\n", f); }
-        fprintf(f, "%s%s\tTRUE\t%s\t%s\t%lld\t%s\t%s\n", c->host_only ? "" : ".", c->domain, c->path, c->secure ? "TRUE" : "FALSE", c->expiry, c->name, c->value); n++;
+        fprintf(f, "%s%s\tTRUE\t%s\t%s\t%lld\t%s\t%s\t%d\n", c->host_only ? "" : ".", c->domain, c->path, c->secure ? "TRUE" : "FALSE", c->expiry, c->name, c->value, c->same_site); n++;
     }
     if (f) fclose(f);
     return n;
@@ -181,11 +301,21 @@ static long long parse_http_date(const char* s) {
 }
 static char* trim(char* s) { while (isspace((unsigned char)*s)) s++; char* e = s + strlen(s); while (e > s && isspace((unsigned char)e[-1])) *--e = 0; return s; }
 
-static void default_path(const char* req_path_query, char* out, size_t cap) {
-    char p[8192]; snprintf(p, sizeof p, "%s", req_path_query); char* q = strchr(p, '?'); if (q) *q = 0;
-    char* sl = strrchr(p, '/'); if (!sl || sl == p) { snprintf(out, cap, "/"); return; }
-    *sl = 0; snprintf(out, cap, "%s", p);
+static int default_path(const char* req_path_query, char* out, size_t cap) {
+    if (!req_path_query || !out || cap < 2) return 0;
+    size_t input_len = strnlen(req_path_query, 8192);
+    if (input_len >= 8192) return 0;
+    char p[8192]; memcpy(p, req_path_query, input_len + 1);
+    char* q = strchr(p, '?'); if (q) *q = 0;
+    char* sl = strrchr(p, '/');
+    if (!sl || sl == p) { out[0] = '/'; out[1] = 0; return 1; }
+    *sl = 0;
+    size_t n = strlen(p);
+    if (n >= cap) return 0;
+    memcpy(out, p, n + 1);
+    return 1;
 }
+
 static void jar_set_cookie(NJar* j, const Url* u, const char* hdr) {
     if (strlen(hdr) > 4300) return;
     char buf[4400]; snprintf(buf, sizeof buf, "%s", hdr);
@@ -194,41 +324,65 @@ static void jar_set_cookie(NJar* j, const Url* u, const char* hdr) {
     *eq = 0; char* name = trim(first); char* value = trim(eq + 1);
     if (!*name || strlen(name) + strlen(value) > 4096) return;
     char domain[256]; snprintf(domain, sizeof domain, "%s", u->host); int host_only = 1;
-    char path[1024]; default_path(u->pq, path, sizeof path);
-    long long expiry = 0; int have_maxage = 0, secure = 0, domain_attr = 0, path_attr = 0; long long maxage = 0; time_t now = time(NULL);
+    char path[1024]; if (!default_path(u->pq, path, sizeof path)) return;
+    long long expiry = 0; int have_maxage = 0, secure = 0, domain_attr = 0, path_attr = 0, same_site = 2; long long maxage = 0; time_t now = time(NULL);
     for (char* a = strtok_r(NULL, ";", &save); a; a = strtok_r(NULL, ";", &save)) {
         char* av = strchr(a, '='); char* an = a; if (av) { *av = 0; av++; av = trim(av); } an = trim(an);
         if (!strcasecmp(an, "domain") && av) {
             while (*av == '.') av++;
             if (!*av) continue;
-            char d[256]; snprintf(d, sizeof d, "%s", av); for (char* p = d; *p; p++) *p = (char)tolower((unsigned char)*p);
+            char d[256]; if (!nidna_to_ascii(av, d, sizeof d)) return;
             if (is_ip_host(u->host)) { if (strcmp(d, u->host)) return; }
             else {
                 if (!domain_match(u->host, d)) return;                              /* чужой домен */
                 if (psl_is_public_suffix(d)) { if (strcasecmp(u->host, d)) return; else continue; }   /* Domain=com / co.uk / github.io: хост ≠ суффикс — отвергаем, хост = суффикс — как host-only */
             }
             snprintf(domain, sizeof domain, "%s", d); host_only = 0; domain_attr = 1;
-        } else if (!strcasecmp(an, "path") && av) { if (av[0] == '/') { snprintf(path, sizeof path, "%s", av); path_attr = 1; } }
+        } else if (!strcasecmp(an, "path") && av) {
+            if (av[0] == '/') {
+                size_t path_len = strlen(av);
+                if (path_len >= sizeof path) return; /* Не превращаем длинный Path в более короткий путь. */
+                memcpy(path, av, path_len + 1); path_attr = 1;
+            }
+        }
         else if (!strcasecmp(an, "max-age") && av) { char* e; long long v = strtoll(av, &e, 10); if (e != av && !*e) { have_maxage = 1; maxage = v; } }
         else if (!strcasecmp(an, "expires") && av) { long long t = parse_http_date(av); if (t >= 0) expiry = t; else expiry = 0; }
         else if (!strcasecmp(an, "secure")) secure = 1;
+        else if (!strcasecmp(an, "samesite") && av) {
+            if (!strcasecmp(av, "strict")) same_site = 1;
+            else if (!strcasecmp(av, "lax")) same_site = 2;
+            else if (!strcasecmp(av, "none")) same_site = 3;
+        }
     }
     if (secure && !u->https) return;                                   /* Secure-куки с незащищённого origin не принимаем */
+    if (same_site == 3 && !secure) return; /* SameSite=None требует Secure */
     if (!strncasecmp(name, "__Secure-", 9) && !(secure && u->https)) return;
     if (!strncasecmp(name, "__Host-", 7) && !(secure && u->https && !domain_attr && path_attr && !strcmp(path, "/"))) return;
     int deleted = 0;
     if (have_maxage) { if (maxage <= 0) deleted = 1; else expiry = (long long)now + maxage; }
     else if (expiry > 0 && expiry <= (long long)now) deleted = 1;
-    if (deleted) { Cookie* c = jar_find(j, name, domain, path, host_only); if (c) { free(c->value); c->value = strdup(""); c->expiry = 1; c->dirty = 1; } else jar_put(j, name, "", domain, path, 1, secure, host_only, 1); return; }
-    jar_put(j, name, value, domain, path, expiry, secure, host_only, 1);
+    if (deleted) { Cookie* c = jar_find(j, name, domain, path, host_only); if (c) { free(c->value); c->value = strdup(""); c->expiry = 1; c->dirty = 1; } else jar_put(j, name, "", domain, path, 1, secure, host_only, 1, same_site); return; }
+    jar_put(j, name, value, domain, path, expiry, secure, host_only, 1, same_site);
 }
 static int cookie_cmp(const void* a, const void* b) {
     const Cookie* x = *(Cookie* const*)a; const Cookie* y = *(Cookie* const*)b;
     size_t lx = strlen(x->path), ly = strlen(y->path); if (lx != ly) return lx < ly ? 1 : -1; return x->seq - y->seq;
 }
+static int cookie_site_same(const Url *request, const char *site_url) {
+    if (!site_url || !*site_url) return 0; /* неизвестный инициатор не считается same-site */
+    Url site; if (!parse_url(site_url, &site)) return 0;
+    if (request->https != site.https) return 0; /* schemeful SameSite */
+    if (is_ip_host(request->host) || is_ip_host(site.host) || !strcasecmp(request->host, "localhost") || !strcasecmp(site.host, "localhost"))
+        return !strcasecmp(request->host, site.host);
+    char rd[256], sd[256];
+    if (psl_registrable_domain(request->host, rd, sizeof rd) && psl_registrable_domain(site.host, sd, sizeof sd)) return !strcasecmp(rd, sd);
+    return !strcasecmp(request->host, site.host);
+}
 /* значение заголовка Cookie для запроса; пустая строка — подходящих нет */
-static void jar_header(NJar* j, const Url* u, char* out, size_t cap) {
+static void jar_header(NJar* j, const Url* u, const char* site_url, int top_level, const char* method, char* out, size_t cap) {
     out[0] = 0; if (!j) return;
+    int same_site = cookie_site_same(u, site_url);
+    int safe_method = !method || !strcasecmp(method, "GET") || !strcasecmp(method, "HEAD");
     Cookie* sel[256]; int ns = 0; time_t now = time(NULL); char path[8192]; snprintf(path, sizeof path, "%s", u->pq); char* q = strchr(path, '?'); if (q) *q = 0;
     for (int i = 0; i < j->n && ns < 256; i++) {
         Cookie* c = &j->c[i];
@@ -236,11 +390,19 @@ static void jar_header(NJar* j, const Url* u, char* out, size_t cap) {
         if (c->secure && !u->https) continue;
         if (c->host_only ? strcasecmp(c->domain, u->host) : !domain_match(u->host, c->domain)) continue;
         if (!path_match(path, c->path)) continue;
+        if (c->same_site == 1 && !same_site) continue; /* Strict */
+        if (c->same_site == 2 && !same_site && !(top_level && safe_method)) continue; /* Lax */
         sel[ns++] = c;
     }
     qsort(sel, (size_t)ns, sizeof sel[0], cookie_cmp);
     size_t o = 0;
-    for (int i = 0; i < ns; i++) { int w = snprintf(out + o, cap - o, "%s%s=%s", o ? "; " : "", sel[i]->name, sel[i]->value); if (w < 0 || (size_t)w >= cap - o) break; o += (size_t)w; }
+    for (int i = 0; i < ns; i++) {
+        char item[4352];
+        int w = snprintf(item, sizeof item, "%s%s=%s", o ? "; " : "", sel[i]->name, sel[i]->value);
+        if (w < 0 || (size_t)w >= sizeof item || (size_t)w >= cap - o) break;
+        memcpy(out + o, item, (size_t)w + 1);
+        o += (size_t)w;
+    }
 }
 
 /* ══════════════ соединения и пул ══════════════ */
@@ -295,7 +457,7 @@ static Conn* conn_open(const Url* u, int64_t deadline, char* err, size_t ecap) {
     struct addrinfo hints, *res = NULL; memset(&hints, 0, sizeof hints); hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
     char port[8]; snprintf(port, sizeof port, "%d", u->port);
     int gai = getaddrinfo(u->host, port, &hints, &res);
-    if (gai != 0 || !res) { snprintf(err, ecap, "DNS: %s (%s)", gai ? gai_strerror(gai) : "нет адресов", u->host); return NULL; }
+    if (gai != 0 || !res) { snprintf(err, ecap, "DNS: %.60s (%.100s)", gai ? gai_strerror(gai) : "нет адресов", u->host); return NULL; }
     int fd = -1; int lasterr = 0;
     for (struct addrinfo* a = res; a; a = a->ai_next) {
         int left = remaining_ms(deadline); if (left <= 0) { lasterr = ETIMEDOUT; break; }
@@ -312,7 +474,7 @@ static Conn* conn_open(const Url* u, int64_t deadline, char* err, size_t ecap) {
         lasterr = errno; close(fd); fd = -1;
     }
     freeaddrinfo(res);
-    if (fd < 0) { snprintf(err, ecap, "соединение с %s:%d не установлено: %s", u->host, u->port, strerror(lasterr ? lasterr : ECONNREFUSED)); return NULL; }
+    if (fd < 0) { snprintf(err, ecap, "соединение с %.80s:%d не установлено: %.45s", u->host, u->port, strerror(lasterr ? lasterr : ECONNREFUSED)); return NULL; }
     int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
     Conn* c = calloc(1, sizeof *c); if (!c) { close(fd); set_err(err, ecap, "нет памяти"); return NULL; }
     c->fd = fd; c->https = u->https; c->port = u->port; c->pid = getpid(); snprintf(c->host, sizeof c->host, "%s", u->host);
@@ -382,6 +544,26 @@ static int hdr_get(const char* block, const char* name, char* out, size_t cap) {
     }
     return 0;
 }
+/* Variant for security-sensitive values: -1 means the value did not fit. */
+static int hdr_get_checked(const char* block, const char* name, char* out, size_t cap) {
+    if (!block || !name || !out || cap == 0) return -1;
+    size_t nl = strlen(name);
+    for (const char* p = block; *p;) {
+        const char* e = strchr(p, '\n'); size_t ll = e ? (size_t)(e - p) : strlen(p);
+        if (ll > nl && !strncasecmp(p, name, nl) && p[nl] == ':') {
+            const char* v = p + nl + 1;
+            while (v < p + ll && (*v == ' ' || *v == '\t')) v++;
+            size_t vl = (size_t)(p + ll - v);
+            while (vl && (v[vl - 1] == '\r' || v[vl - 1] == ' ' || v[vl - 1] == '\t')) vl--;
+            if (vl >= cap) { out[0] = 0; return -1; }
+            memcpy(out, v, vl); out[vl] = 0; return 1;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    out[0] = 0;
+    return 0;
+}
 static int has_token(const char* v, const char* tok) {            /* список через запятую, без учёта регистра */
     size_t tl = strlen(tok);
     for (const char* p = v; *p;) {
@@ -407,12 +589,12 @@ typedef struct { int status; int http11; char* head; Str body; int keepalive; si
 static void raw_free(RawResp* r) { free(r->head); free(r->body.p); memset(r, 0, sizeof *r); }
 
 /* Тело ответа. sink != NULL — пишем в файл. 1 — ok, 0 — ошибка (err заполнен) */
-static int read_body(Conn* c, RawResp* r, const char* method, FILE* sink, size_t max_body, int64_t deadline, char* err, size_t ecap) {
+static int read_body(Conn* c, RawResp* r, const char* method, FILE* sink, int discard, size_t max_body, int64_t deadline, char* err, size_t ecap) {
     char v[256]; int no_body = !strcasecmp(method, "HEAD") || r->status == 204 || r->status == 304 || (r->status >= 100 && r->status < 200);
     if (no_body) return 1;
     unsigned char tmp[16384];
     #define EMIT(ptr, len) do { if ((len) > 0) { if (r->sunk + r->body.n + (len) > max_body) { set_err(err, ecap, "ответ больше допустимого размера"); return 0; } \
-        if (sink) { if (fwrite((ptr), 1, (len), sink) != (size_t)(len)) { set_err(err, ecap, "ошибка записи в файл"); return 0; } r->sunk += (len); } \
+        if (sink || discard) { if (sink && !discard && fwrite((ptr), 1, (len), sink) != (size_t)(len)) { set_err(err, ecap, "ошибка записи в файл"); return 0; } r->sunk += (len); } \
         else if (!str_add(&r->body, (ptr), (len))) { set_err(err, ecap, "нет памяти"); return 0; } } } while (0)
     if (hdr_get(r->head, "Transfer-Encoding", v, sizeof v) && has_token(v, "chunked")) {
         for (;;) {
@@ -452,24 +634,224 @@ static int read_body(Conn* c, RawResp* r, const char* method, FILE* sink, size_t
 }
 
 /* один запрос по уже разобранному URL. retry_stale: при обрыве на переиспользованном соединении до первого байта ответа — повтор на новом */
-static int do_request(const NHttpReq* rq, const Url* u, const char* method, const char* extra, const unsigned char* body, size_t blen,
-                      int64_t deadline, RawResp* r, char* err, size_t ecap) {
+#ifdef MLBROWSER_HAVE_CURL
+/* libcurl transport. It negotiates ALPN (HTTP/2), HTTP/3 where the linked libcurl has QUIC,
+   supports environment/configured proxies and performs gzip/deflate/Brotli decoding. Redirects,
+   CORS, cookies and the browser cache remain owned by the surrounding MLBrowser code. */
+typedef struct {
+    RawResp *resp;
+    Str head;
+    size_t max_body;
+    const char *method;
+    const NHttpReq *rq;
+    char response_url[NHTTP_URL_MAX];
+    FILE *sink;
+    int discard_body;
+    int callback_error;
+    int headers_called;
+    char error[200];
+} CurlCtx;
+static int curl_ready;
+static int curl_init_once(void) {
+    if (curl_ready) return 1;
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 0;
+    curl_ready = 1;
+    return 1;
+}
+static size_t curl_header_write(char *ptr, size_t size, size_t nmemb, void *opaque) {
+    CurlCtx *c = (CurlCtx*)opaque; size_t n = size * nmemb;
+    if (!n) return 0;
+    if (n > MAX_HEAD || c->head.n > MAX_HEAD - n) {
+        c->callback_error = 1; set_err(c->error, sizeof c->error, "заголовки ответа слишком велики"); return 0;
+    }
+    if (n >= 5 && !strncasecmp(ptr, "HTTP/", 5)) {
+        free(c->head.p); memset(&c->head, 0, sizeof c->head);
+        char line[128]; size_t cp = n < sizeof line - 1 ? n : sizeof line - 1;
+        memcpy(line, ptr, cp); line[cp] = 0; const char *sp = strchr(line, ' ');
+        c->resp->status = sp ? atoi(sp + 1) : 0;
+    }
+    if (!str_add(&c->head, ptr, n)) {
+        c->callback_error = 1; set_err(c->error, sizeof c->error, "нет памяти для заголовков ответа"); return 0;
+    }
+    if ((n == 2 && ptr[0] == '\r' && ptr[1] == '\n') || (n == 1 && ptr[0] == '\n')) {
+        int st = c->resp->status;
+        c->discard_body = c->sink && (st == 301 || st == 302 || st == 303 || st == 307 || st == 308);
+        /* Preserve nhttp's streaming contract: deliver the final response headers before body
+           bytes, and let ncors reject the response before exposing it to JavaScript. */
+        if (c->rq && c->rq->headers_cb && st >= 200 &&
+            (!(st == 301 || st == 302 || st == 303 || st == 307 || st == 308) || c->rq->max_redirects < 0)) {
+            if (!c->rq->headers_cb(c->head.p ? c->head.p : "", c->response_url,
+                                   c->rq->headers_user, c->error, sizeof c->error)) {
+                c->callback_error = 1;
+                if (!c->error[0]) set_err(c->error, sizeof c->error, "заголовки отклонены сетевой политикой");
+                return 0;
+            }
+            c->headers_called = 1;
+        }
+    }
+    return n;
+}
+static size_t curl_body_write(char *ptr, size_t size, size_t nmemb, void *opaque) {
+    CurlCtx *c = (CurlCtx*)opaque; size_t n = size * nmemb; RawResp *r = c->resp;
+    if (!n) return 0;
+    if (c->discard_body || !strcasecmp(c->method, "HEAD") || r->status == 204 || r->status == 304 || (r->status >= 100 && r->status < 200)) return n;
+    size_t have = r->sunk + r->body.n;
+    if (n > c->max_body || have > c->max_body - n) {
+        c->callback_error = 1; set_err(c->error, sizeof c->error, "ответ больше допустимого размера"); return 0;
+    }
+    if (c->sink) {
+        if (fwrite(ptr, 1, n, c->sink) != n) {
+            c->callback_error = 1; set_err(c->error, sizeof c->error, "ошибка записи в файл"); return 0;
+        }
+        r->sunk += n;
+    } else if (!str_add(&r->body, ptr, n)) {
+        c->callback_error = 1; set_err(c->error, sizeof c->error, "нет памяти для тела ответа"); return 0;
+    }
+    return n;
+}
+static int curl_header_exists(const char *headers, const char *name) {
+    char value[8]; return headers && hdr_get(headers, name, value, sizeof value);
+}
+static struct curl_slist *curl_add_header(struct curl_slist *list, const char *line) {
+    if (!line || !*line || strpbrk(line, "\r\n")) return list;
+    return curl_slist_append(list, line);
+}
+static int do_request_curl(const NHttpReq* rq, const Url* u, const char* method, const char* extra,
+                           const unsigned char* body, size_t blen, int64_t deadline, RawResp* r,
+                           char* err, size_t ecap) {
+    if (!curl_init_once()) { set_err(err, ecap, "не удалось инициализировать libcurl"); return 0; }
+    CURL *easy = curl_easy_init(); if (!easy) { set_err(err, ecap, "не удалось создать HTTP-сеанс"); return 0; }
+    CURLcode cc = CURLE_OK; struct curl_slist *headers = NULL; char line[1024]; char url[NHTTP_URL_MAX];
+    int64_t left = deadline - now_ms(); if (left < 1) left = 1;
+    if (snprintf(url, sizeof url, "%s%s", u->origin, u->pq) >= (int)sizeof url) {
+        set_err(err, ecap, "URL слишком длинный"); curl_easy_cleanup(easy); return 0;
+    }
+    int user_ae = curl_header_exists(extra, "Accept-Encoding");
+    int user_range = curl_header_exists(extra, "Range");
+    if (!curl_header_exists(extra, "User-Agent")) {
+        snprintf(line, sizeof line, "User-Agent: %s", rq->user_agent ? rq->user_agent : DEF_UA);
+        headers = curl_add_header(headers, line);
+    }
+    if (!curl_header_exists(extra, "Accept")) headers = curl_add_header(headers, "Accept: */*");
+    if (!curl_header_exists(extra, "Accept-Language")) headers = curl_add_header(headers, "Accept-Language: en-US,en;q=0.9");
+    if (!curl_header_exists(extra, "Connection")) headers = curl_add_header(headers, "Connection: keep-alive");
+    if (rq->jar && !curl_header_exists(extra, "Cookie")) {
+        char ck[8192]; jar_header(rq->jar, u, rq->site_for_cookies, rq->is_top_level_navigation, method, ck, sizeof ck);
+        if (ck[0]) { snprintf(line, sizeof line, "Cookie: %s", ck); headers = curl_add_header(headers, line); }
+    }
+    if (extra) {
+        char *dup = strdup(extra), *save = NULL;
+        if (!dup) { set_err(err, ecap, "нет памяти для заголовков запроса"); goto fail; }
+        for (char *ln = strtok_r(dup, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+            size_t n = strlen(ln); while (n && ln[n-1] == '\r') ln[--n] = 0;
+            if (!n || !strchr(ln, ':') || strpbrk(ln, "\r\n")) continue;
+            if (!strncasecmp(ln, "Host:", 5) || !strncasecmp(ln, "Content-Length:", 15) || !strncasecmp(ln, "Transfer-Encoding:", 18)) continue;
+            struct curl_slist *nl = curl_slist_append(headers, ln);
+            if (!nl) { free(dup); set_err(err, ecap, "нет памяти для заголовков запроса"); goto fail; }
+            headers = nl;
+        }
+        free(dup);
+    }
+    CurlCtx ctx; memset(&ctx, 0, sizeof ctx); ctx.resp = r; ctx.max_body = rq->max_body ? rq->max_body : ((size_t)256 << 20); ctx.method = method; ctx.rq = rq; ctx.sink = rq->sink;
+    snprintf(ctx.response_url, sizeof ctx.response_url, "%s", url);
+    curl_easy_setopt(easy, CURLOPT_URL, url);
+    curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, method);
+    if (!strcasecmp(method, "HEAD")) curl_easy_setopt(easy, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, curl_header_write);
+    curl_easy_setopt(easy, CURLOPT_HEADERDATA, &ctx);
+    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_body_write);
+    curl_easy_setopt(easy, CURLOPT_WRITEDATA, &ctx);
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 0L); /* redirects must pass through our HSTS/cookie policy */
+    curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 0L);
+#if LIBCURL_VERSION_NUM >= 0x073600
+    curl_easy_setopt(easy, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
+#endif
+    curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, left < CONNECT_MS ? (long)left : CONNECT_MS);
+    curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, left > LONG_MAX ? LONG_MAX : (long)left);
+    curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(easy, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(easy, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(easy, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(easy, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+    /* libcurl verifies certificates/hostnames by default; do not weaken TLS verification. */
+    if (body && blen) {
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDS, (const char*)body);
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)blen);
+    } else if (!strcasecmp(method, "POST") || !strcasecmp(method, "PUT") || !strcasecmp(method, "PATCH")) {
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDS, ""); curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, 0L);
+    }
+    int auto_decode = !user_ae;
+    if (!user_ae) {
+        const curl_version_info_data *vi = curl_version_info(CURLVERSION_NOW);
+        const char *enc = "gzip, deflate";
+        /* Byte ranges address the selected representation. Request identity coding so
+           decompression cannot shift offsets or turn a partial compressed stream invalid. */
+        if (rq->sink || user_range) enc = "identity";
+        else if (vi && (vi->features & CURL_VERSION_BROTLI)) enc = "gzip, deflate, br";
+#ifdef CURL_VERSION_ZSTD
+        if (!rq->sink && !user_range && vi && (vi->features & CURL_VERSION_ZSTD)) enc = (vi->features & CURL_VERSION_BROTLI) ? "gzip, deflate, br, zstd" : "gzip, deflate, zstd";
+#endif
+        curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, enc);
+    } else auto_decode = 0;
+    /* Explicit app override wins over the process environment; without it libcurl honors
+       HTTP_PROXY/HTTPS_PROXY/ALL_PROXY and NO_PROXY in the usual way. */
+    const char *proxy = getenv("MLBROWSER_PROXY"), *noproxy = getenv("MLBROWSER_NOPROXY");
+    if (proxy) curl_easy_setopt(easy, CURLOPT_PROXY, proxy);
+    if (noproxy) curl_easy_setopt(easy, CURLOPT_NOPROXY, noproxy);
+    const curl_version_info_data *vi = curl_version_info(CURLVERSION_NOW);
+#if LIBCURL_VERSION_NUM >= 0x074200
+    if (u->https && vi && (vi->features & CURL_VERSION_HTTP3)) curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_3);
+    else
+#endif
+    if (u->https && vi && (vi->features & CURL_VERSION_HTTP2)) curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    else curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+    cc = curl_easy_perform(easy);
+    if (cc != CURLE_OK) {
+        if (ctx.callback_error) set_err(err, ecap, ctx.error);
+        else snprintf(err, ecap, "libcurl: %s", curl_easy_strerror(cc));
+        goto fail;
+    }
+    { long status = 0; curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status); if (status > 0) r->status = (int)status; }
+    r->head = ctx.head.p; ctx.head.p = NULL;
+    if (!r->head) r->head = strdup("");
+    /* The write callback receives decoded bytes when CURLOPT_ACCEPT_ENCODING is active.
+       Remove stale metadata so callers and the disk cache don't try to decode a second time. */
+    if (auto_decode && r->head) {
+        char ce[128] = ""; if (hdr_get(r->head, "Content-Encoding", ce, sizeof ce) && strcasecmp(ce, "identity")) {
+            const char *drop[] = {"Content-Encoding", "Content-Length", "Transfer-Encoding", NULL}; hdr_strip(r->head, drop);
+        } else { const char *drop[] = {"Transfer-Encoding", NULL}; hdr_strip(r->head, drop); }
+    } else if (r->head) { const char *drop[] = {"Transfer-Encoding", NULL}; hdr_strip(r->head, drop); }
+    free(ctx.head.p); curl_slist_free_all(headers); curl_easy_cleanup(easy); return 1;
+fail:
+    free(ctx.head.p); curl_slist_free_all(headers); curl_easy_cleanup(easy); raw_free(r); return 0;
+}
+#endif /* MLBROWSER_HAVE_CURL */
+
+static int do_request_native(const NHttpReq* rq, const Url* u, const char* method, const char* extra, const unsigned char* body, size_t blen,
+                             int64_t deadline, RawResp* r, char* err, size_t ecap) {
+    char target[sizeof u->pq * 3];
+    if (!encode_target(u->pq, target, sizeof target)) { set_err(err, ecap, "путь URL после кодирования слишком длинный"); return 0; }
     for (int attempt = 0; attempt < 2; attempt++) {
         Conn* c = pool_take(u); int reused = c != NULL;
         if (!c) { c = conn_open(u, deadline, err, ecap); if (!c) return 0; }
         /* заголовки запроса */
-        Str q = {0}; char target[8300]; encode_target(u->pq, target, sizeof target);
+        Str q = {0};
         char hostline[320]; int v6 = strchr(u->host, ':') != NULL; int defport = u->https ? u->port == 443 : u->port == 80;
         if (defport) snprintf(hostline, sizeof hostline, "%s%s%s", v6 ? "[" : "", u->host, v6 ? "]" : ""); else snprintf(hostline, sizeof hostline, "%s%s%s:%d", v6 ? "[" : "", u->host, v6 ? "]" : "", u->port);
         char l[512];
         str_adds(&q, method); str_adds(&q, " "); str_adds(&q, target); str_adds(&q, " HTTP/1.1\r\nHost: "); str_adds(&q, hostline); str_adds(&q, "\r\n");   /* без промежуточного буфера: длинные URL не обрезаются */
         #define USER_HAS(n) (extra && ({ char _t[8]; hdr_get(extra, n, _t, sizeof _t) || 0; }))
+        int range_request = USER_HAS("Range");
         if (!USER_HAS("User-Agent")) { snprintf(l, sizeof l, "User-Agent: %s\r\n", rq->user_agent ? rq->user_agent : DEF_UA); str_adds(&q, l); }
         if (!USER_HAS("Accept")) str_adds(&q, "Accept: */*\r\n");
         if (!USER_HAS("Accept-Language")) str_adds(&q, "Accept-Language: en-US,en;q=0.9\r\n");
-        if (!USER_HAS("Accept-Encoding")) str_adds(&q, rq->sink ? "Accept-Encoding: identity\r\n" : "Accept-Encoding: gzip, deflate\r\n");
+        if (!USER_HAS("Accept-Encoding")) str_adds(&q, (rq->sink || range_request) ? "Accept-Encoding: identity\r\n" : "Accept-Encoding: gzip, deflate\r\n");
         if (!USER_HAS("Connection")) str_adds(&q, "Connection: keep-alive\r\n");
-        if (rq->jar && !USER_HAS("Cookie")) { char ck[8192]; jar_header(rq->jar, u, ck, sizeof ck); if (ck[0]) { str_adds(&q, "Cookie: "); str_adds(&q, ck); str_adds(&q, "\r\n"); } }
+        if (rq->jar && !USER_HAS("Cookie")) { char ck[8192]; jar_header(rq->jar, u, rq->site_for_cookies, rq->is_top_level_navigation, method, ck, sizeof ck); if (ck[0]) { str_adds(&q, "Cookie: "); str_adds(&q, ck); str_adds(&q, "\r\n"); } }
         if (blen || !strcmp(method, "POST") || !strcmp(method, "PUT") || !strcmp(method, "PATCH")) { snprintf(l, sizeof l, "Content-Length: %zu\r\n", blen); str_adds(&q, l); }
         #undef USER_HAS
         if (extra) {
@@ -510,9 +892,20 @@ static int do_request(const NHttpReq* rq, const Url* u, const char* method, cons
             if (r->status >= 100 && r->status < 200 && r->status != 101) { free(h.p); continue; }
             r->head = h.p; break;
         }
+        /* Доставляем финальные заголовки сразу после их разбора, до чтения тела.
+           Ответы с Location не публикуем, пока не пройдены редиректы. */
+        char early_loc[4096] = "";
+        int early_redirect = (r->status == 301 || r->status == 302 || r->status == 303 || r->status == 307 || r->status == 308) && hdr_get(r->head, "Location", early_loc, sizeof early_loc);
+        if (rq->headers_cb && (!early_redirect || rq->max_redirects < 0)) {
+            char response_url[9000];
+            snprintf(response_url, sizeof response_url, "%s%s", u->origin, u->pq);
+            if (!rq->headers_cb(r->head ? r->head : "", response_url, rq->headers_user, err, ecap)) { raw_free(r); conn_destroy(c); return 0; }
+        }
         char conn_hdr[128] = ""; hdr_get(r->head, "Connection", conn_hdr, sizeof conn_hdr);
         r->keepalive = r->http11 ? !has_token(conn_hdr, "close") : has_token(conn_hdr, "keep-alive");
-        if (!read_body(c, r, method, rq->sink, rq->max_body ? rq->max_body : (size_t)256 << 20, deadline, err, ecap)) { raw_free(r); conn_destroy(c); return 0; }
+        /* Bodies of followed redirects must be consumed from the socket but never enter the final response pipe. */
+        int discard_redirect_body = early_redirect && rq->max_redirects >= 0 && rq->sink != NULL;
+        if (!read_body(c, r, method, rq->sink, discard_redirect_body, rq->max_body ? rq->max_body : (size_t)256 << 20, deadline, err, ecap)) { raw_free(r); conn_destroy(c); return 0; }
         if (r->keepalive) pool_put(c); else conn_destroy(c);
         return 1;
         retry: ;
@@ -520,8 +913,18 @@ static int do_request(const NHttpReq* rq, const Url* u, const char* method, cons
     set_err(err, ecap, "не удалось выполнить запрос"); return 0;
 }
 
+static int do_request(const NHttpReq* rq, const Url* u, const char* method, const char* extra, const unsigned char* body, size_t blen,
+                      int64_t deadline, RawResp* r, char* err, size_t ecap) {
+#ifdef MLBROWSER_HAVE_CURL
+    const char *transport = getenv("MLBROWSER_NET");
+    if (!transport || strcmp(transport, "native"))
+        return do_request_curl(rq, u, method, extra, body, blen, deadline, r, err, ecap);
+#endif
+    return do_request_native(rq, u, method, extra, body, blen, deadline, r, err, ecap);
+}
+
 /* ══════════════ HTTP-кэш ══════════════
-   Файл записи cache/http/<хэш url>.e:  «MLC1\n<url>\n<status>\n<stored>\n<lifetime>\n<headlen>\n<bodylen>\n» + заголовки + тело (как пришли по сети,
+   Файл записи cache/http/<хэш url>.e:  «MLC2\n<url>\n<status>\n<stored>\n<lifetime>\n<headlen>\n<bodylen>\n» + заголовки + тело (как пришли по сети,
    т. е. возможно со сжатием — декодирование делает общий код после запроса). Запись — через временный файл и rename (безопасно для нескольких процессов). */
 #include <dirent.h>
 #include <sys/stat.h>
@@ -562,15 +965,18 @@ static void cache_evict(void) {                                                 
     }
     free(v);
 }
-typedef struct { char url[2100]; int status; long long stored, lifetime; char* head; size_t headlen; unsigned char* body; size_t bodylen; } CEnt;
+typedef struct { char url[NHTTP_URL_MAX]; int status; long long stored, lifetime; char* head; size_t headlen; unsigned char* body; size_t bodylen; } CEnt;
 static void cent_free(CEnt* e) { free(e->head); free(e->body); memset(e, 0, sizeof *e); }
 static int cache_load(const char* url, CEnt* e) {
     memset(e, 0, sizeof *e); if (!g_cdir[0]) return 0;
     char path[420]; cpath(url, path, sizeof path); FILE* f = fopen(path, "rb"); if (!f) return 0;
-    char l[2200]; long long hl = 0, bl = 0; int ok = 0;
-    if (fgets(l, sizeof l, f) && !strcmp(l, "MLC1\n") && fgets(l, sizeof l, f)) {
-        size_t n = strlen(l); if (n) l[n - 1] = 0; snprintf(e->url, sizeof e->url, "%s", l);
-        if (!strcmp(e->url, url) && fgets(l, sizeof l, f)) { e->status = atoi(l);
+    char l[NHTTP_URL_MAX + 2]; long long hl = 0, bl = 0; int ok = 0;
+    if (fgets(l, sizeof l, f) && !strcmp(l, "MLC2\n") && fgets(l, sizeof l, f)) {
+        size_t n = strlen(l);
+        if (n && l[n - 1] == '\n') {
+            l[n - 1] = 0; snprintf(e->url, sizeof e->url, "%s", l);
+        }
+        if (n && l[n - 1] == 0 && !strcmp(e->url, url) && fgets(l, sizeof l, f)) { e->status = atoi(l);
             if (fgets(l, sizeof l, f)) { e->stored = atoll(l); if (fgets(l, sizeof l, f)) { e->lifetime = atoll(l); if (fgets(l, sizeof l, f)) { hl = atoll(l); if (fgets(l, sizeof l, f)) { bl = atoll(l); ok = 1; } } } } }
     }
     if (ok && hl >= 0 && bl >= 0 && hl < (1 << 20) && bl < (64ll << 20)) {
@@ -586,7 +992,7 @@ static int cache_load(const char* url, CEnt* e) {
 static void cache_write(const CEnt* e) {
     char path[420], tmp[440]; cpath(e->url, path, sizeof path); snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
     FILE* f = fopen(tmp, "wb"); if (!f) return;
-    fprintf(f, "MLC1\n%s\n%d\n%lld\n%lld\n%zu\n%zu\n", e->url, e->status, e->stored, e->lifetime, e->headlen, e->bodylen);
+    fprintf(f, "MLC2\n%s\n%d\n%lld\n%lld\n%zu\n%zu\n", e->url, e->status, e->stored, e->lifetime, e->headlen, e->bodylen);
     int ok = fwrite(e->head, 1, e->headlen, f) == e->headlen && (!e->bodylen || fwrite(e->body, 1, e->bodylen, f) == e->bodylen);
     ok = (fclose(f) == 0) && ok;
     if (ok) rename(tmp, path); else unlink(tmp);
@@ -630,11 +1036,17 @@ static void cache_store(const char* url, const RawResp* r) {
 /* одно звено: кэш → (условный) запрос → обновление кэша. *from: 0 сеть, 1 свежий кэш, 2 подтверждён 304 */
 static int cached_request(const NHttpReq* rq, const Url* u, const char* method, const char* extra, const unsigned char* body, size_t blen, int64_t deadline, RawResp* r, int* from, char* err, size_t ecap) {
     *from = 0;
-    char url[2100]; snprintf(url, sizeof url, "%s%s", u->origin, u->pq);
+    char url[NHTTP_URL_MAX];
+    size_t origin_len = strlen(u->origin), pq_len = strlen(u->pq);
+    int cache_key_ok = origin_len < sizeof url && pq_len < sizeof url - origin_len;
+    if (cache_key_ok) {
+        memcpy(url, u->origin, origin_len);
+        memcpy(url + origin_len, u->pq, pq_len + 1);
+    } else url[0] = 0;
     int plain = !rq->sink && !rq->headers && !body && !strcmp(method, "GET");
-    if (!g_cdir[0] || !plain) {
+    if (!g_cdir[0] || !plain || !cache_key_ok) {
         int ok = do_request(rq, u, method, extra, body, blen, deadline, r, err, ecap);
-        if (ok && g_cdir[0] && strcmp(method, "GET") && strcmp(method, "HEAD") && r->status >= 200 && r->status < 400) { char path[420]; cpath(url, path, sizeof path); unlink(path); }   /* небезопасный метод инвалидирует запись */
+        if (ok && cache_key_ok && g_cdir[0] && strcmp(method, "GET") && strcmp(method, "HEAD") && r->status >= 200 && r->status < 400) { char path[420]; cpath(url, path, sizeof path); unlink(path); }   /* небезопасный метод инвалидирует запись */
         return ok;
     }
     CEnt e; int have = cache_load(url, &e); char* cond = NULL;
@@ -695,34 +1107,56 @@ int nhttp_perform(const NHttpReq* rq, NHttpResp* out) {
     int maxr = rq->max_redirects == 0 ? 20 : rq->max_redirects;
     char method[16]; snprintf(method, sizeof method, "%s", rq->method && *rq->method ? rq->method : "GET");
     for (char* p = method; *p; p++) *p = (char)toupper((unsigned char)*p);
-    char url[8300]; snprintf(url, sizeof url, "%s", rq->url);
+    char url[NHTTP_URL_MAX];
+    size_t request_url_len = strlen(rq->url);
+    if (request_url_len >= sizeof url) {
+        set_err(out->err, sizeof out->err, "URL длиннее допустимого лимита");
+        return 0;
+    }
+    memcpy(url, rq->url, request_url_len + 1);
     const unsigned char* body = rq->body; size_t blen = rq->body_len;
     char* extra = sdup(rq->headers);
     Str all = {0};
     for (int hop = 0;; hop++) {
+        char upgraded[NHTTP_URL_MAX];
+        if (websec_hsts_upgrade_url(url, upgraded, sizeof upgraded)) {
+            size_t upgraded_len = strlen(upgraded);
+            if (upgraded_len >= sizeof url) { set_err(out->err, sizeof out->err, "URL после HSTS слишком длинный"); free(extra); free(all.p); return 0; }
+            memcpy(url, upgraded, upgraded_len + 1);
+        }
         Url u; if (!parse_url(url, &u)) { set_err(out->err, sizeof out->err, "неподдерживаемый или неверный URL"); free(extra); free(all.p); return 0; }
         if (u.https && !ntls_available()) { set_err(out->err, sizeof out->err, "HTTPS недоступен: не найдена библиотека TLS"); free(extra); free(all.p); return 0; }
-        snprintf(out->final_url, sizeof out->final_url, "%s%s", u.origin, u.pq);
+        size_t final_origin_len = strlen(u.origin), final_pq_len = strlen(u.pq);
+        if (final_origin_len >= sizeof out->final_url || final_pq_len >= sizeof out->final_url - final_origin_len) {
+            set_err(out->err, sizeof out->err, "итоговый URL длиннее допустимого лимита"); free(extra); free(all.p); return 0;
+        }
+        memcpy(out->final_url, u.origin, final_origin_len);
+        memcpy(out->final_url + final_origin_len, u.pq, final_pq_len + 1);
         RawResp r; memset(&r, 0, sizeof r);
         int from_cache = 0;
         if (!cached_request(rq, &u, method, extra, body, blen, deadline, &r, &from_cache, out->err, sizeof out->err)) { free(extra); free(all.p); return 0; }
         out->from_cache = from_cache;
         if (!from_cache) copy_set_cookies(rq->jar, &u, r.head);                    /* куки из ответа, взятого из кэша, повторно не применяем */
+        if (!from_cache) websec_hsts_remember(u.host, u.https, r.head);
         str_adds(&all, r.head); str_adds(&all, "\r\n");
-        char loc[4096];
-        int redirect = (r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308) && hdr_get(r.head, "Location", loc, sizeof loc);
+        char loc[8192];
+        int redirect_status = (r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308);
+        int location_status = redirect_status ? hdr_get_checked(r.head, "Location", loc, sizeof loc) : 0;
+        if (location_status < 0) { set_err(out->err, sizeof out->err, "слишком длинный Location"); raw_free(&r); free(extra); free(all.p); return 0; }
+        int redirect = redirect_status && location_status > 0;
         if (redirect && maxr >= 0) {
             if (hop >= maxr) { set_err(out->err, sizeof out->err, "слишком много перенаправлений"); raw_free(&r); free(extra); free(all.p); return 0; }
-            char next[8300];
+            char next[NHTTP_URL_MAX];
             if (!resolve_location(&u, loc, next, sizeof next)) { set_err(out->err, sizeof out->err, "неверный Location"); raw_free(&r); free(extra); free(all.p); return 0; }
             Url nu; if (!parse_url(next, &nu)) { set_err(out->err, sizeof out->err, "Location указывает на неподдерживаемую схему"); raw_free(&r); free(extra); free(all.p); return 0; }
-            if (rq->sink && r.sunk) { rewind(rq->sink); if (ftruncate(fileno(rq->sink), 0) != 0) {} }          /* тело редиректа не нужно */
             if (r.status == 303 || ((r.status == 301 || r.status == 302) && !strcmp(method, "POST"))) { if (strcmp(method, "HEAD")) snprintf(method, sizeof method, "GET"); body = NULL; blen = 0; }
             if (extra && (nu.https != u.https || nu.port != u.port || strcmp(nu.host, u.host))) {            /* на другой origin не переносим Authorization/Cookie */
                 const char* drop[] = {"Authorization", "Cookie", "Proxy-Authorization", NULL}; hdr_strip(extra, drop);
             }
             if (!body) { const char* drop[] = {"Content-Type", NULL}; if (extra) hdr_strip(extra, drop); }
-            snprintf(url, sizeof url, "%s", next); raw_free(&r); continue;
+            size_t next_len = strlen(next);
+            if (next_len >= sizeof url) { set_err(out->err, sizeof out->err, "URL перенаправления слишком длинный"); raw_free(&r); free(extra); free(all.p); return 0; }
+            memcpy(url, next, next_len + 1); raw_free(&r); continue;
         }
         /* итоговый ответ */
         out->status = r.status;

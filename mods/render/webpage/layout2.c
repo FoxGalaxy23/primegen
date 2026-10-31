@@ -6,6 +6,7 @@
 #include "font_manager.h"
 #include "fx.h"
 #include "gal.h"
+#include "../ttf_render/shaping.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -47,7 +48,9 @@ Cmd* l2_dl; int l2_dn; static int g_dcap;
 uint32_t l2_canvas_bg = 0xFFFFFFFFu; float l2_doc_w, l2_doc_h;
 float* l2_rects; int l2_nrects;
 static int g_fixed;
-static DOMNode** NV; static int NVN; static float VW, VH;
+typedef struct Box Box;
+static DOMNode** NV; static int NVN; static Box** GBOX; static float VW, VH, g_page_scroll_x, g_page_scroll_y;
+void l2_set_page_scroll(float x, float y) { g_page_scroll_x=x<0?0:x; g_page_scroll_y=y<0?0:y; }
 
 static int dl_add(Cmd c) {
     if (l2_dn == g_dcap) { g_dcap = g_dcap ? g_dcap * 2 : 4096; Cmd* n = realloc(l2_dl, (size_t)g_dcap * sizeof(Cmd)); if (!n) return -1; l2_dl = n; }
@@ -205,10 +208,41 @@ int l2_scroll_size(const DOMNode* n, float* sw, float* sh, float* cw, float* ch)
     if (!n || !g_scr || n->idx < 0 || n->idx >= g_scrn || !g_scr[n->idx].is) return 0;
     const ScSt* e = &g_scr[n->idx]; if (sw) *sw = e->sw; if (sh) *sh = e->sh; if (cw) *cw = e->cw; if (ch) *ch = e->ch; return 1;
 }
-void l2_scroll_set(const DOMNode* n, float x, float y) {
+static void l2_scroll_set_impl(const DOMNode* n, float x, float y, int apply_snap) {
     if (!n || !g_scr || n->idx < 0 || n->idx >= g_scrn) return;
-    ScSt* e = &g_scr[n->idx]; e->x = x < 0 ? 0 : x; e->y = y < 0 ? 0 : y;
+    ScSt* e = &g_scr[n->idx];
+    x = sc_clamp(x, e->mx); y = sc_clamp(y, e->my);
+    /* CSS Scroll Snap: choose the closest direct-child snap area on enabled axes. */
+    if (apply_snap && n->st.scroll_snap_type && l2_rects && n->idx < l2_nrects) {
+        const float* cr = &l2_rects[n->idx * 4];
+        float best_x = x, best_y = y, dx = 1e30f, dy = 1e30f;
+        int use_x = (n->st.scroll_snap_type & 1) != 0, use_y = (n->st.scroll_snap_type & 2) != 0;
+        for (int i = 0; i < NVN && i < l2_nrects; i++) {
+            DOMNode* ch = NV ? NV[i] : NULL;
+            if (!ch || ch->parent != n->idx || ch->st.scroll_snap_align == 0) continue;
+            const float* r = &l2_rects[i * 4];
+            if (r[2] <= 0 || r[3] <= 0) continue;
+            if (use_x) {
+                float t = r[0] - cr[0];
+                if (ch->st.scroll_snap_align == 2) t -= (e->cw - r[2]) * 0.5f;
+                else if (ch->st.scroll_snap_align == 3) t -= e->cw - r[2];
+                t = sc_clamp(t, e->mx); float d = fabsf(t - x);
+                if (d < dx) { dx = d; best_x = t; }
+            }
+            if (use_y) {
+                float t = r[1] - cr[1];
+                if (ch->st.scroll_snap_align == 2) t -= (e->ch - r[3]) * 0.5f;
+                else if (ch->st.scroll_snap_align == 3) t -= e->ch - r[3];
+                t = sc_clamp(t, e->my); float d = fabsf(t - y);
+                if (d < dy) { dy = d; best_y = t; }
+            }
+        }
+        x = best_x; y = best_y;
+    }
+    e->x = x; e->y = y;
 }
+void l2_scroll_set(const DOMNode* n, float x, float y) { l2_scroll_set_impl(n, x, y, 1); }
+void l2_scroll_set_raw(const DOMNode* n, float x, float y) { l2_scroll_set_impl(n, x, y, 0); }
 int l2_scroll_state_export(const DOMNode* head, L2ScrollState* out, int cap) {
     if (!head || g_scr_head != head || !g_scr || g_scrn <= 0) return 0;
     if (!out) return g_scrn;
@@ -238,28 +272,65 @@ void l2_scroll_offset_of_ancestors(const DOMNode* n, float* ox, float* oy) {
     }
 }
 
+float l2_timeline_progress(const DOMNode* n, int timeline, int axis) {
+    if (!n || !NV || n->idx < 0 || n->idx >= NVN) return 0.0f;
+    if (timeline == 2) { /* view(): progress as the element traverses the relevant viewport axis */
+        if (!l2_rects || n->idx >= l2_nrects) return 0.0f;
+        const float* r=&l2_rects[n->idx*4]; float ox=0,oy=0; l2_scroll_offset_of_ancestors(n,&ox,&oy);
+        int horizontal = axis==2 ? 1 : axis==3 ? 0 : axis==1 ? n->st.writing_mode==0 : n->st.writing_mode!=0;
+        float pos=horizontal?r[0]-ox-g_page_scroll_x:r[1]-oy-g_page_scroll_y;
+        float size=horizontal?r[2]:r[3], viewport=horizontal?VW:VH; if(size<1)size=1;
+        float denom=viewport+size; if(denom<=0)return 0.0f;
+        float p=(viewport-pos)/denom; if(p<0)p=0;if(p>1)p=1;return p;
+    }
+    if (timeline != 1) return 0.0f;
+    int horizontal=0;
+    if(axis==2) horizontal=1;
+    else if(axis==3) horizontal=0;
+    else if(axis==1) horizontal=n->st.writing_mode==0;
+    else horizontal=n->st.writing_mode!=0;
+    int guard=0;
+    for(int p=n->parent;p>=0&&p<NVN&&p<g_scrn&&guard++<4096;p=NV[p]->parent){
+        const DOMNode* a=NV[p]; if(!g_scr[p].is)continue;
+        if(horizontal && !a->st.sc_x)continue;
+        if(!horizontal && !a->st.sc_y)continue;
+        float max=horizontal?g_scr[p].mx:g_scr[p].my;
+        if(max<=0.01f)continue;
+        float cur=horizontal?sc_clamp(g_scr[p].x,g_scr[p].mx):sc_clamp(g_scr[p].y,g_scr[p].my);
+        float pr=cur/max;if(pr<0)pr=0;if(pr>1)pr=1;return pr;
+    }
+    /* With no element scroller, scroll() uses the document viewport timeline. */
+    float max = horizontal ? l2_doc_w - VW : l2_doc_h - VH;
+    float cur = horizontal ? g_page_scroll_x : g_page_scroll_y;
+    if (max < 0.01f) return 0.0f;
+    float p=cur/max;if(p<0)p=0;if(p>1)p=1;return p;
+}
+
 /* ══════════════ боксы ══════════════ */
 enum { K_BLOCK = 1, K_INLINE, K_TEXT, K_ATOM, K_BR };
-enum { R_NONE, R_IMG, R_CTRL, R_PLACE, R_CANVAS };
+enum { R_NONE, R_IMG, R_CTRL, R_PLACE, R_CANVAS, R_VIDEO };
 typedef struct { TTFFont* f; int size, style, asc, desc; float lh; int weight, ital; } FM;
-typedef struct Box Box;
 typedef struct AbsRef { Box* b; float sx, sy; struct AbsRef* next; } AbsRef;
 typedef struct StkRef { int slot; DOMNode* node; struct StkRef* next; } StkRef;   /* sticky-потомок: слот C_STK, в который родитель допишет границы контейнера */
 struct Box {
     DOMNode* n; const NodeStyle* st; Box *parent, *first, *last, *next;
+    float zoom_scale;               /* cumulative CSS zoom used by layout, not a paint-only transform */
     uint8_t kind, anon, repl, oof, flt, skipbg, mforce, ic_ok;
     DOMNode* click; const char* text; FM* fm;
     float x, y, w, h, fb;
     float mt, mr, mb, ml, pt, pr, pb, pl, bt, br, bb, bl; uint8_t mla, mra; float fml, fmr;
     int slot, clipslot; AbsRef *abs, *abs_tail; StkRef* stk;
     ImgPix* img; float nat_w, nat_h; float ic_min, ic_max;
+    float* grid_col_size; float* grid_row_size;
+    int grid_col_count, grid_row_count, grid_col_origin, grid_row_origin;
+    float grid_col_gap, grid_row_gap;
 };
 typedef struct { float x0, y0, x1, y1; } FRect;
 #define FCMAX 160
 typedef struct { FRect l[FCMAX], r[FCMAX]; int nl, nr; } FCtx;
 typedef struct { FCtx* fc; Box* owner; } LS;
 
-static float lenpx(const Len* l, float base) { return l->px + l->pct * base / 100.0f + l->vw * VW + l->vh * VH; }
+static float lenpx(const Len* l, float base) { return l->px + l->pct * base / 100.0f + (l->vw + l->svw + l->dvw) * VW + (l->vh + l->svh + l->dvh) * VH + l->lh; }
 static float collapse2(float a, float b) { if (a >= 0 && b >= 0) return a > b ? a : b; if (a <= 0 && b <= 0) return a < b ? a : b; return a + b; }
 static float fmaxf2(float a, float b) { return a > b ? a : b; }
 static float fminf2(float a, float b) { return a < b ? a : b; }
@@ -290,8 +361,60 @@ static float text_w(FM* m, const char* s, int len) {
 }
 
 /* ══════════════ построение боксов ══════════════ */
+static void zoom_len(Len* l, float z) {
+    l->px *= z; l->vw *= z; l->vh *= z; l->svw *= z; l->svh *= z;
+    l->dvw *= z; l->dvh *= z; l->lh *= z;
+}
+static void zoom_fxlen(FxLen* l, float z) { l->px *= z; }
+static void zoom_fxlist(FxList* f, float z) {
+    for (int i = 0; i < f->n; i++) if (f->op[i].kind == FXO_BLUR || f->op[i].kind == FXO_SHADOW) {
+        if (f->op[i].kind == FXO_BLUR) f->op[i].v *= z;
+        f->op[i].x *= z; f->op[i].y *= z; f->op[i].blur *= z;
+    }
+}
+static void zoom_style_lengths(NodeStyle* s, float z) {
+    s->font_size *= z; s->lh_px *= z; s->text_indent *= z; s->word_spacing *= z; s->outline_offset *= z; s->outline_w *= z;
+    zoom_len(&s->text_indent_len, z); zoom_len(&s->word_spacing_len, z);
+    s->gap_r *= z; s->gap_c *= z; s->spacing *= z;
+    s->sh_x *= z; s->sh_y *= z; s->sh_blur *= z; s->sh_spread *= z;
+    s->ts_x *= z; s->ts_y *= z; s->ts_blur *= z;
+    for (int i = 0; i < 4; i++) {
+        zoom_len(&s->margin[i], z); zoom_len(&s->padding[i], z); zoom_len(&s->inset[i], z);
+        s->border_w[i] *= z; s->radius[i] *= z;
+    }
+    zoom_len(&s->width, z); zoom_len(&s->height, z); zoom_len(&s->min_w, z); zoom_len(&s->max_w, z);
+    zoom_len(&s->column_width, z); zoom_len(&s->contain_intrinsic_w, z); zoom_len(&s->contain_intrinsic_h, z);
+    s->column_rule_width *= z;
+    zoom_len(&s->min_h, z); zoom_len(&s->max_h, z); zoom_len(&s->flex_basis, z);
+    zoom_len(&s->bg_w, z); zoom_len(&s->bg_h, z); zoom_len(&s->bg_px, z); zoom_len(&s->bg_py, z);
+    zoom_len(&s->mask.w, z); zoom_len(&s->mask.h, z); zoom_len(&s->mask.px, z); zoom_len(&s->mask.py, z);
+    for (int i = 0; i < 4; i++) { s->clip.rad[i] *= z; zoom_fxlen(&s->clip.a[i], z); }
+    for (int i = 0; i < s->clip.n && i < 16; i++) { zoom_fxlen(&s->clip.pt[i][0], z); zoom_fxlen(&s->clip.pt[i][1], z); }
+    zoom_fxlen(&s->xf.ox, z); zoom_fxlen(&s->xf.oy, z);
+    for (int i = 0; i < s->xf.n; i++) if (s->xf.op[i].kind == XF_TRANSLATE) {
+        zoom_fxlen(&s->xf.op[i].t[0], z); zoom_fxlen(&s->xf.op[i].t[1], z);
+    }
+    zoom_fxlist(&s->filter, z); zoom_fxlist(&s->backdrop, z);
+    /* Percentages are relative to the already-scaled containing box and stay unchanged. */
+    s->zoom = 1.0f;
+}
 static Box* newbox(DOMNode* n, const NodeStyle* st, Box* parent) {
-    Box* b = la(sizeof(Box)); b->n = n; b->st = st; b->parent = parent; b->slot = b->clipslot = -1; b->fb = -1e9f; return b;
+    Box* b = la(sizeof(Box)); b->n = n; b->parent = parent; b->slot = b->clipslot = -1; b->fb = -1e9f;
+    if (n && GBOX && n->idx >= 0 && n->idx < NVN) GBOX[n->idx] = b;
+    /* Anonymous inline wrappers reuse a style that has already been scaled. */
+    if (parent && st == parent->st) {
+        b->st = st; b->zoom_scale = parent->zoom_scale > 0 ? parent->zoom_scale : 1.0f; return b;
+    }
+    float parent_zoom = parent && parent->zoom_scale > 0 ? parent->zoom_scale : 1.0f;
+    float own_zoom = st->zoom > 0 ? st->zoom : 1.0f;
+    b->zoom_scale = parent_zoom * own_zoom;
+    if (b->zoom_scale < 0.1f) b->zoom_scale = 0.1f;
+    if (b->zoom_scale > 64.0f) b->zoom_scale = 64.0f;
+    /* Keep the old zero-copy path for ordinary pages; zoomed boxes get a private
+       style copy so line metrics and CSS-pixel lengths participate in layout. */
+    if (fabsf(b->zoom_scale - 1.0f) <= 0.0001f) { b->st = st; return b; }
+    NodeStyle* layout_style = la(sizeof(NodeStyle)); *layout_style = *st;
+    zoom_style_lengths(layout_style, b->zoom_scale); b->st = layout_style; return b;
 }
 static void append(Box* p, Box* c) { c->parent = p; if (p->last) p->last->next = c; else p->first = c; p->last = c; }
 
@@ -330,8 +453,33 @@ static int is_hidden_input(const DOMNode* n) { return n->type == TAG_INPUT && !s
 
 static void build_children(Box* parent, DOMNode* n, DOMNode* click);
 
+/* Native <details> behavior: when closed, only its first <summary> subtree participates in layout.
+   This also suppresses direct text nodes, which a CSS [hidden]-style rule alone cannot hide. */
+static int hidden_by_closed_details(int idx) {
+    if (!NV || idx < 0 || idx >= NVN) return 0;
+    int child = idx, parent = NV[idx]->parent, guard = 0;
+    while (parent >= 0 && parent < NVN && guard++ < 4096) {
+        DOMNode* p = NV[parent];
+        if (!strcmp(p->tag, "details")) {
+            char open[8];
+            if (!webpage_attr_get(p, "open", open, sizeof open)) {
+                int summary = -1;
+                for (int j = parent + 1; j <= p->subtree_end && j < NVN; j++) {
+                    if (NV[j]->parent == parent && !strcmp(NV[j]->tag, "summary")) { summary = j; break; }
+                }
+                int direct = child, steps = 0;
+                while (direct >= 0 && direct < NVN && NV[direct]->parent != parent && steps++ < 4096) direct = NV[direct]->parent;
+                if (direct != summary) return 1;
+            }
+        }
+        child = parent; parent = p->parent;
+    }
+    return 0;
+}
+
 static void build_elem(Box* parent, DOMNode* n, DOMNode* click, const PseudoBox* pseudo);
 static void build_node(Box* parent, int idx, DOMNode* click) {
+    if (hidden_by_closed_details(idx)) return;
     DOMNode* n = NV[idx];
     if (n->type == TAG_TEXT) {
         Box* b = newbox(n, &n->st, parent); b->kind = K_TEXT; b->text = xform_text(b); b->click = click; append(parent, b); return;
@@ -360,8 +508,9 @@ static void build_elem(Box* parent, DOMNode* n, DOMNode* click, const PseudoBox*
     if (n->type == TAG_IMG) repl = R_IMG;
     else if (ctrl_kind(n)) repl = R_CTRL;
     else if (!strcmp(n->tag, "canvas")) { repl = R_CANVAS; snprintf(n->src, sizeof n->src, "canvas:%d", n->idx); }   /* см. images.c: webpage_image_inject — сюда JS кладёт пиксели через D.canvasCommit */
-    else if (!strcmp(n->tag, "svg") && n->src[0]) repl = R_IMG;           /* встроенный svg: разметка сохранена в кэш (html.c), рисуется как картинка */
-    else if (!strcmp(n->tag, "iframe") || !strcmp(n->tag, "svg") || !strcmp(n->tag, "video") || !strcmp(n->tag, "audio") ||
+    else if (!strcmp(n->tag, "svg") && n->src[0]) repl = R_IMG;           /* встроенный svg: разметка сохранена в кэше, рисуется как картинка */
+    else if (!strcmp(n->tag, "video")) { repl = R_VIDEO; snprintf(n->media_frame_key, sizeof n->media_frame_key, "video:%d", n->idx); }
+    else if (!strcmp(n->tag, "iframe") || !strcmp(n->tag, "svg") || !strcmp(n->tag, "audio") ||
              !strcmp(n->tag, "object") || !strcmp(n->tag, "embed")) repl = R_PLACE;
     b->repl = (uint8_t)repl;
     if (st->position >= POS_ABSOLUTE) { b->oof = 1; b->kind = K_BLOCK; }
@@ -372,9 +521,10 @@ static void build_elem(Box* parent, DOMNode* n, DOMNode* click, const PseudoBox*
         case DSP_INLINE_BLOCK: case DSP_INLINE_FLEX: b->kind = K_ATOM; break;
         default: b->kind = K_BLOCK; break;
     }
-    if (repl == R_IMG) {
-        const char* u = n->src; ImgPix* px = u[0] ? webpage_image_get(u) : NULL; b->img = px;
-        if (px) { b->nat_w = (float)px->w; b->nat_h = (float)px->h; } else { b->nat_w = n->attr_w > 0 ? (float)n->attr_w : 0; b->nat_h = n->attr_h > 0 ? (float)n->attr_h : 0; }
+    if (repl == R_IMG || repl == R_VIDEO) {
+        const char* u = repl == R_VIDEO ? n->media_frame_key : n->src; ImgPix* px = u[0] ? webpage_image_get(u) : NULL; b->img = px;
+        if (px) { b->nat_w = (float)px->w; b->nat_h = (float)px->h; }
+        else { b->nat_w = n->attr_w > 0 ? (float)n->attr_w : (repl == R_VIDEO ? 300.0f : 0.0f); b->nat_h = n->attr_h > 0 ? (float)n->attr_h : (repl == R_VIDEO ? 150.0f : 0.0f); }
     }
     append(parent, b);
     if (pseudo) {
@@ -386,7 +536,7 @@ static void build_elem(Box* parent, DOMNode* n, DOMNode* click, const PseudoBox*
                 Box* tb = newbox(tn, &tn->st, b); tb->kind = K_TEXT; tb->text = xform_text(tb); tb->click = b->click; append(b, tb);
             }
         }
-    } else if (!repl) build_children(b, n, b->click);
+    } else if (!repl && st->content_visibility != 2) build_children(b, n, b->click);
 }
 
 static void build_children(Box* parent, DOMNode* n, DOMNode* click) {
@@ -481,16 +631,20 @@ int webpage_ctrl_default_size(DOMNode* n, float* w, float* h) {                 
 static void repl_size(Box* b, float avail, float chd, float* ow, float* oh) {
     const NodeStyle* s = b->st; float w = -1, h = -1, nw = 0, nh = 0;
     float ex_w = b->pl + b->pr + b->bl + b->br, ex_h = b->pt + b->pb + b->bt + b->bb;
-    if (b->repl == R_IMG) { nw = b->nat_w; nh = b->nat_h; }
+    if (b->repl == R_IMG || b->repl == R_VIDEO) { nw = b->nat_w; nh = b->nat_h; }
     else if (b->repl == R_PLACE || b->repl == R_CANVAS) { nw = b->n->attr_w > 0 ? (float)b->n->attr_w : 300; nh = b->n->attr_h > 0 ? (float)b->n->attr_h : 150; if (b->repl == R_PLACE && !strcmp(b->n->tag, "svg") && b->n->attr_w <= 0) { nw = 0; nh = 0; } }
     else { webpage_ctrl_default_size(b->n, &nw, &nh); }
     int wp = s->width.set && s->width.pct != 0 && avail <= 0, hp = s->height.set && s->height.pct != 0 && chd < 0;
     if (s->width.set && !wp) { w = lenpx(&s->width, avail); if (s->box_sizing) w -= ex_w; }
     if (s->height.set && !hp) { h = lenpx(&s->height, chd >= 0 ? chd : 0); if (s->box_sizing) h -= ex_h; }
-    if (b->repl != R_IMG) { if (w < 0) w = nw; if (h < 0) h = nh; }          /* пропорции сохраняем только у картинок */
+    if (b->repl != R_IMG && b->repl != R_VIDEO) { if (w < 0) w = nw; if (h < 0) h = nh; }
     else if (w < 0 && h < 0) { w = nw; h = nh; }
     else if (w < 0) w = nh > 0 ? h * nw / nh : nw;
     else if (h < 0) h = nw > 0 ? w * nh / nw : nh;
+    if (s->aspect_ratio > 0.0f) {
+        if (s->width.set && !s->height.set && w > 0) h = w / s->aspect_ratio;
+        else if (s->height.set && !s->width.set && h > 0) w = h * s->aspect_ratio;
+    }
     if (b->repl != R_CTRL && s->max_w.set && avail > 0) { float mw = lenpx(&s->max_w, avail) - (s->box_sizing ? ex_w : 0); if (w > mw) { if (!s->height.set && w > 0) h = h * mw / w; w = mw; } }
     if (b->repl != R_CTRL && s->min_w.set && avail > 0) { float mw = lenpx(&s->min_w, avail) - (s->box_sizing ? ex_w : 0); if (w < mw) { if (!s->height.set && w > 0) h = h * mw / w; w = mw; } }
     if (w < 0) w = 0; if (h < 0) h = 0;
@@ -502,6 +656,235 @@ enum { I_WORD, I_SPACE, I_BREAK, I_ATOM, I_OPEN, I_CLOSE, I_FLOAT, I_ABS };
 typedef struct { uint8_t t, glue; Box* b; const char* s; int len; float w; int fs, fe; } Item;
 typedef struct { Item* v; int n, cap; } IV;
 static void iv_add(IV* iv, Item it) { if (iv->n == iv->cap) { iv->cap = iv->cap ? iv->cap * 2 : 64; iv->v = realloc(iv->v, (size_t)iv->cap * sizeof(Item)); } iv->v[iv->n++] = it; }
+
+static int node_bidi_segment_scope(const DOMNode* node, TTFBidiScope* out) {
+    uint8_t inner[TTF_BIDI_MAX_SCOPE_DEPTH];
+    uintptr_t inner_ids[TTF_BIDI_MAX_SCOPE_DEPTH];
+    unsigned count = 0;
+    int guard = 0;
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    /* unicode-bidi is not inherited. Collect the explicit scopes from the text
+     * owner to the root, then reverse them so ICU receives outer scopes first. */
+    while (node && guard++ < 4096) {
+        const NodeStyle* st = &node->st;
+        uint8_t mode = TTF_BIDI_SEGMENT_NORMAL;
+        switch (st->unicode_bidi) {
+        case 1: mode = (uint8_t)(st->direction ? TTF_BIDI_SEGMENT_EMBED_RTL : TTF_BIDI_SEGMENT_EMBED_LTR); break;
+        case 2: mode = (uint8_t)(st->direction ? TTF_BIDI_SEGMENT_ISOLATE_RTL : TTF_BIDI_SEGMENT_ISOLATE_LTR); break;
+        case 3: mode = (uint8_t)(st->direction ? TTF_BIDI_SEGMENT_OVERRIDE_RTL : TTF_BIDI_SEGMENT_OVERRIDE_LTR); break;
+        case 4: mode = (uint8_t)(st->direction ? TTF_BIDI_SEGMENT_ISOLATE_OVERRIDE_RTL : TTF_BIDI_SEGMENT_ISOLATE_OVERRIDE_LTR); break;
+        case 5: mode = TTF_BIDI_SEGMENT_ISOLATE_FIRST_STRONG; break;
+        default: break;
+        }
+        if (mode != TTF_BIDI_SEGMENT_NORMAL) {
+            if (count >= TTF_BIDI_MAX_SCOPE_DEPTH) return 0;
+            inner[count] = mode;
+            inner_ids[count] = (uintptr_t)node;
+            count++;
+        }
+        if (node->parent < 0 || node->parent >= NVN || !NV) break;
+        node = NV[node->parent];
+    }
+    out->count = (uint8_t)count;
+    for (unsigned i = 0; i < count; i++) {
+        out->modes[i] = inner[count - i - 1];
+        out->ids[i] = inner_ids[count - i - 1];
+    }
+    return 1;
+}
+
+/* Return true when node is node itself or a DOM descendant. */
+static int bidi_node_within(const DOMNode* node, const DOMNode* ancestor) {
+    int guard = 0;
+    while (node && guard++ < 4096) {
+        if (node == ancestor) return 1;
+        if (!NV || node->parent < 0 || node->parent >= NVN) break;
+        node = NV[node->parent];
+    }
+    return 0;
+}
+
+static int bidi_len_nonzero(const Len* l) {
+    return l && (fabsf(l->px) > 0.01f || fabsf(l->pct) > 0.01f ||
+                 fabsf(l->vw) > 0.01f || fabsf(l->vh) > 0.01f ||
+                 fabsf(l->svw) > 0.01f || fabsf(l->svh) > 0.01f ||
+                 fabsf(l->dvw) > 0.01f || fabsf(l->dvh) > 0.01f ||
+                 fabsf(l->lh) > 0.01f);
+}
+
+/* Reposition text runs after line wrapping. The display-list and DOM order stay
+ * logical (copy/selection rely on it), while x-coordinates are visual order.
+ * An inline C_BOX can span multiple text runs when all runs between its first
+ * and last descendant belong to that inline element. Before committing, the
+ * pass verifies that each decorated fragment stays contiguous in visual order;
+ * otherwise the whole line stays on the legacy path. */
+static void bidi_reposition_line_commands(int cmd_start, int cmd_end, int base_direction) {
+    if (cmd_start < 0 || cmd_end <= cmd_start || cmd_end > l2_dn) return;
+    int count = 0, box_count = 0;
+    for (int i = cmd_start; i < cmd_end; i++) {
+        if (l2_dl[i].t == C_TEXT) count++;
+        else if (l2_dl[i].t == C_BOX) box_count++;
+        else if (l2_dl[i].t != C_HIT) return;
+    }
+    if (count < 2) return;
+
+    const char** segments = malloc((size_t)count * sizeof(*segments));
+    size_t* lengths = malloc((size_t)count * sizeof(*lengths));
+    size_t* visual = malloc((size_t)count * sizeof(*visual));
+    size_t* visual_pos = malloc((size_t)count * sizeof(*visual_pos));
+    int* cmd_index = malloc((size_t)count * sizeof(*cmd_index));
+    int* hit_index = malloc((size_t)count * sizeof(*hit_index));
+    float* flow_pad_left = calloc((size_t)count, sizeof(*flow_pad_left));
+    float* flow_pad_right = calloc((size_t)count, sizeof(*flow_pad_right));
+    float* visual_pad_left = calloc((size_t)count, sizeof(*visual_pad_left));
+    float* visual_pad_right = calloc((size_t)count, sizeof(*visual_pad_right));
+    float* new_x = malloc((size_t)count * sizeof(*new_x));
+    int* box_index = box_count ? malloc((size_t)box_count * sizeof(*box_index)) : NULL;
+    int* box_first = box_count ? malloc((size_t)box_count * sizeof(*box_first)) : NULL;
+    int* box_last = box_count ? malloc((size_t)box_count * sizeof(*box_last)) : NULL;
+    float* box_left = box_count ? malloc((size_t)box_count * sizeof(*box_left)) : NULL;
+    float* box_right = box_count ? malloc((size_t)box_count * sizeof(*box_right)) : NULL;
+    TTFBidiScope* scopes = calloc((size_t)count, sizeof(*scopes));
+    if (!segments || !lengths || !visual || !visual_pos || !cmd_index || !hit_index ||
+        !flow_pad_left || !flow_pad_right || !visual_pad_left || !visual_pad_right || !new_x ||
+        (box_count && (!box_index || !box_first || !box_last || !box_left || !box_right)) || !scopes) {
+        free(segments); free(lengths); free(visual); free(visual_pos); free(cmd_index); free(hit_index);
+        free(flow_pad_left); free(flow_pad_right); free(visual_pad_left); free(visual_pad_right); free(new_x);
+        free(box_index); free(box_first); free(box_last); free(box_left); free(box_right); free(scopes);
+        return;
+    }
+
+    int n = 0, nb = 0, eligible = 1;
+    for (int i = cmd_start; i < cmd_end; i++) {
+        Cmd* c = &l2_dl[i];
+        if (c->t == C_BOX) { box_index[nb++] = i; continue; }
+        if (c->t != C_TEXT) continue;
+        if (!c->s || !c->s[0] || !c->node || c->node->idx < 0 || !isfinite(c->x) || !isfinite(c->w) || c->w < 0.0f) {
+            eligible = 0; break;
+        }
+        segments[n] = c->s; lengths[n] = strlen(c->s); cmd_index[n] = i;
+        if (!node_bidi_segment_scope(c->node, &scopes[n])) { eligible = 0; break; }
+        hit_index[n] = (i + 1 < cmd_end && l2_dl[i + 1].t == C_HIT) ? i + 1 : -1;
+        n++;
+    }
+
+    /* Measure each box against the full source-order run range it owns. The
+     * fragment edges (F_NOLEFT/F_NORIGHT) deliberately carry no padding to a
+     * new line; this allows a single inline element to span wrapped lines. */
+    for (int b = 0; eligible && b < nb; b++) {
+        Cmd* box = &l2_dl[box_index[b]];
+        if (!box->node || !isfinite(box->x) || !isfinite(box->w) || !isfinite(box->h) || box->w < 0.0f || box->h < 0.0f ||
+            bidi_len_nonzero(&box->node->st.margin[1]) || bidi_len_nonzero(&box->node->st.margin[3])) {
+            eligible = 0; break;
+        }
+        int first = -1, last = -1, descendants = 0;
+        float content_left = INFINITY, content_right = -INFINITY;
+        for (int j = 0; j < n; j++) {
+            Cmd* text = &l2_dl[cmd_index[j]];
+            if (!bidi_node_within(text->node, box->node)) continue;
+            if (first < 0) first = j;
+            last = j; descendants++;
+            if (text->x < content_left) content_left = text->x;
+            if (text->x + text->w > content_right) content_right = text->x + text->w;
+        }
+        if (descendants == 0 || first < 0 || last < first || last - first + 1 != descendants ||
+            !isfinite(content_left) || !isfinite(content_right)) {
+            eligible = 0; break;
+        }
+        /* A box cannot safely wrap around another inline sibling, atomic item,
+         * or untracked gap. Reject it rather than stretching it across them. */
+        float le = (box->flags & F_NOLEFT) ? 0.0f : content_left - box->x;
+        float re = (box->flags & F_NORIGHT) ? 0.0f : (box->x + box->w) - content_right;
+        if (!isfinite(le) || !isfinite(re) || le < -1.0f || re < -1.0f || le > 4096.0f || re > 4096.0f) {
+            eligible = 0; break;
+        }
+        if (le < 0.0f) le = 0.0f;
+        if (re < 0.0f) re = 0.0f;
+        box_first[b] = first; box_last[b] = last; box_left[b] = le; box_right[b] = re;
+        if (le > flow_pad_left[first]) flow_pad_left[first] = le;
+        if (re > flow_pad_right[last]) flow_pad_right[last] = re;
+    }
+
+    if (eligible) {
+        /* Verify the pre-reorder line geometry. Horizontal margins and atomics
+         * are unsupported, but line-local spaces already included in a text run
+         * remain part of that run's measured width. */
+        for (int i = 1; i < n; i++) {
+            const Cmd* prev = &l2_dl[cmd_index[i - 1]];
+            const Cmd* cur = &l2_dl[cmd_index[i]];
+            float prev_edge = prev->x + prev->w + flow_pad_right[i - 1];
+            float cur_edge = cur->x - flow_pad_left[i];
+            if (fabsf(prev_edge - cur_edge) > 2.5f || fabsf(prev->y - cur->y) > 1.0f) {
+                eligible = 0; break;
+            }
+        }
+    }
+
+    if (eligible && ttf_bidi_reorder_segments_scoped(segments, lengths, scopes, (size_t)n, base_direction, visual)) {
+        for (int v = 0; v < n; v++) {
+            if (visual[v] >= (size_t)n) { eligible = 0; break; }
+            visual_pos[visual[v]] = (size_t)v;
+        }
+        /* A decorated fragment must stay contiguous after bidi resolution. A
+         * split would require true fragment-tree painting (including split
+         * borders/radii), so keep the original geometry in that case. */
+        for (int b = 0; eligible && b < nb; b++) {
+            size_t minv = (size_t)n, maxv = 0;
+            for (int j = box_first[b]; j <= box_last[b]; j++) {
+                if (visual_pos[j] < minv) minv = visual_pos[j];
+                if (visual_pos[j] > maxv) maxv = visual_pos[j];
+            }
+            if (maxv < minv || maxv - minv + 1 != (size_t)(box_last[b] - box_first[b] + 1)) {
+                eligible = 0; break;
+            }
+            int left_logical = (int)visual[minv];
+            int right_logical = (int)visual[maxv];
+            if (box_left[b] > visual_pad_left[left_logical]) visual_pad_left[left_logical] = box_left[b];
+            if (box_right[b] > visual_pad_right[right_logical]) visual_pad_right[right_logical] = box_right[b];
+        }
+        if (eligible) {
+            float left = INFINITY;
+            for (int i = 0; i < n; i++) {
+                float edge = l2_dl[cmd_index[i]].x - flow_pad_left[i];
+                if (edge < left) left = edge;
+            }
+            if (isfinite(left)) {
+                float x = left;
+                for (int v = 0; v < n; v++) {
+                    size_t logical = visual[v];
+                    Cmd* c = &l2_dl[cmd_index[logical]];
+                    new_x[logical] = x + visual_pad_left[logical];
+                    x += visual_pad_left[logical] + c->w + visual_pad_right[logical];
+                }
+                /* Commit only after all validation has completed. */
+                for (int i = 0; i < n; i++) {
+                    Cmd* c = &l2_dl[cmd_index[i]];
+                    float dx = new_x[i] - c->x;
+                    c->x = new_x[i];
+                    if (hit_index[i] >= 0) l2_dl[hit_index[i]].x += dx;
+                }
+                for (int b = 0; b < nb; b++) {
+                    Cmd* box = &l2_dl[box_index[b]];
+                    float frag_left = INFINITY, frag_right = -INFINITY;
+                    for (int j = box_first[b]; j <= box_last[b]; j++) {
+                        Cmd* text = &l2_dl[cmd_index[j]];
+                        if (text->x < frag_left) frag_left = text->x;
+                        if (text->x + text->w > frag_right) frag_right = text->x + text->w;
+                    }
+                    if (isfinite(frag_left) && isfinite(frag_right) && frag_right >= frag_left) {
+                        box->x = frag_left - box_left[b];
+                        box->w = (frag_right + box_right[b]) - box->x;
+                    }
+                }
+            }
+        }
+    }
+
+    free(segments); free(lengths); free(visual); free(visual_pos); free(cmd_index); free(hit_index);
+    free(flow_pad_left); free(flow_pad_right); free(visual_pad_left); free(visual_pad_right); free(new_x);
+    free(box_index); free(box_first); free(box_last); free(box_left); free(box_right); free(scopes);
+}
 
 static float intr(Box* b, int mode);
 static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float forced_h, float ch_def, LS* ls);
@@ -525,7 +908,7 @@ static void flatten(Box* c, IV* iv, FCfg* cfg, int* last_space) {
                 if (isw) {
                     const char* e = p; while (*e && (*e == ' ' || *e == '\t' || *e == '\r' || *e == '\f' || (*e == '\n' && !(pre || ws == WS_PRE_LINE)))) e++;
                     if (pre) { int cnt = 0; for (const char* q = p; q < e; q++) cnt += *q == '\t' ? 8 : 1; Item it = {I_WORD, 0, ch, p, (int)(e - p), text_w(m, " ", 1) * cnt, 0, 0}; it.s = NULL; iv_add(iv, it); iv->v[iv->n - 1].len = -cnt; *last_space = 0; }
-                    else if (!*last_space) { Item it = {I_SPACE, 0, ch, p, 1, text_w(m, " ", 1), 0, 0}; iv_add(iv, it); *last_space = 1; }
+                    else if (!*last_space) { float ws = ch->st->word_spacing_len.set ? lenpx(&ch->st->word_spacing_len, cfg->avail) : ch->st->word_spacing; Item it = {I_SPACE, 0, ch, p, (int)(e - p), fmaxf2(0.0f, text_w(m, " ", 1) + ws), 0, 0}; iv_add(iv, it); *last_space = 1; }
                     p = e; if (p == e && e == p && cc == '\n' && !pre && ws != WS_PRE_LINE) {}
                     continue;
                 }
@@ -628,15 +1011,136 @@ static int has_visual_box(const NodeStyle* s) {
     return (s->bg >> 24) != 0 || s->border_w[0] > 0 || s->border_w[1] > 0 || s->border_w[2] > 0 || s->border_w[3] > 0 || ((s->sh_color >> 24) != 0);
 }
 
+static int column_metrics(const NodeStyle* st, float cw, float* gap_out, float* width_out) {
+    int ncol = st->column_count;
+    float gap = st->gap_c > 0 ? st->gap_c : st->font_size;
+    float pref = st->column_width.set ? lenpx(&st->column_width, cw) : 0;
+    if (ncol < 1 && pref > 0) { ncol = (int)((cw + gap) / (pref + gap)); if (ncol < 1) ncol = 1; if (ncol > 32) ncol = 32; }
+    if (ncol < 1) ncol = 1;
+    if (ncol > 32) ncol = 32;
+    if (ncol == 1 && pref <= 0) { if (gap_out) *gap_out = gap; if (width_out) *width_out = cw; return 1; }
+    float colw = (cw - gap * (ncol - 1)) / ncol;
+    if (colw < 1) colw = 1;
+    if (gap_out) *gap_out = gap;
+    if (width_out) *width_out = colw;
+    return ncol;
+}
+static void column_rule_emit(const NodeStyle* st, float x, float y, float colw, float gap, int ncol, float h) {
+    if (!st || ncol < 2 || st->column_rule_width <= 0 || st->column_rule_style == BS_NONE || !(st->column_rule_color >> 24)) return;
+    for (int i = 0; i < ncol - 1; i++) {
+        Cmd q; memset(&q,0,sizeof q); q.t=C_RECT; q.x=x+(i+1)*colw+i*gap+(gap-st->column_rule_width)*0.5f; q.y=y; q.w=st->column_rule_width; q.h=h; q.color=st->column_rule_color; dl_add(q);
+    }
+}
+static size_t utf8_unit(const unsigned char* s, size_t n) {
+    if (!n) return 0;
+    unsigned char c=s[0]; size_t k=c>=0xF0?4:c>=0xE0?3:c>=0xC0?2:1;
+    return k>n?n:k;
+}
+/* Vertical writing baseline: one glyph per vertical advance, columns progress according
+   to vertical-rl / vertical-lr. This is real vertical layout; glyph rotation and complex
+   grapheme shaping remain intentionally separate limitations. */
+static float layout_inline_vertical(Box* c, IV* iv, float x, float y, float w, LS* ls) {
+    (void)ls;
+    const NodeStyle* cs=c->st; FM* rootfm=fm_of(c);
+    float adv=rootfm->lh>1?rootfm->lh:(float)rootfm->size*1.2f;
+    float limit=cs->height.set?lenpx(&cs->height, VH):(VH-y);
+    if(limit<adv)limit=adv;
+    float col_x=(cs->writing_mode==1)?x+w-adv:x;
+    float ycur=y, max_y=y, max_x=x+w;
+    int rtl_columns=(cs->writing_mode==1), col=0;
+    for(int i=0;i<iv->n;i++){
+        Item* it=&iv->v[i];
+        if(it->t==I_OPEN || it->t==I_CLOSE){
+            /* Vertical margin/padding on inline fragments is approximated on the inline axis. */
+            if(it->t==I_OPEN) ycur += it->b->ml + it->b->pl + it->b->bl;
+            else ycur += it->b->pr + it->b->br + it->b->mr;
+            continue;
+        }
+        if(it->t==I_FLOAT || it->t==I_ABS) {
+            if(it->t==I_ABS) register_abs(ls,it->b,col_x,ycur);
+            else place_float(it->b,it->fs,it->fe,ls,x,x+w,ycur);
+            continue;
+        }
+        if(it->t==I_BREAK){
+            col++; col_x=rtl_columns?x+w-(col+1)*adv:x+col*adv; ycur=y; continue;
+        }
+        if(it->t==I_ATOM){
+            Box* a=it->b;
+            if(ycur+a->h>y+limit && ycur>y){col++;col_x=rtl_columns?x+w-(col+1)*adv:x+col*adv;ycur=y;}
+            dl_shift(it->fs,it->fe,col_x+(adv-a->w)*0.5f-a->x,ycur-a->y);
+            a->x=col_x+(adv-a->w)*0.5f; a->y=ycur;
+            ycur += a->h>adv?a->h:adv; if(ycur>max_y)max_y=ycur;
+            continue;
+        }
+        const char* src=it->s; size_t len=src?(it->len>0?(size_t)it->len:0):(it->len<0?(size_t)-it->len:0);
+        if(!src && it->len<0){
+            for(size_t q=0;q<len;q++){
+                if(ycur+adv>y+limit && ycur>y){col++;col_x=rtl_columns?x+w-(col+1)*adv:x+col*adv;ycur=y;}
+                FM* fm=fm_of(it->b); char sp=' '; float tw=text_w(fm,&sp,1);
+                char* ss=sa(2);if(ss){ss[0]=' ';ss[1]=0;Cmd cm;memset(&cm,0,sizeof cm);cm.t=C_TEXT;cm.x=col_x+(adv-tw)*0.5f;cm.y=ycur+(adv-(fm->asc+fm->desc))*0.5f;cm.w=tw;cm.h=(float)(fm->asc+fm->desc);cm.node=it->b->n;cm.s=ss;cm.fam=fam_of(it->b);cm.size=fm->size;cm.color=it->b->st->color;cm.tstyle=(uint8_t)fm->style;cm.weight=(uint16_t)fm->weight;cm.ital=(uint8_t)fm->ital;cm.deco=it->b->st->deco;cm.opacity=it->b->st->opacity;if(it->b->st->visibility==0)dl_add(cm);}
+                ycur+=adv;if(ycur>max_y)max_y=ycur;
+            }
+            continue;
+        }
+        if(!src || !len)continue;
+        if(it->b->st->text_combine_upright && len>=2 && len<=4) {
+            int digits=1; for(size_t z=0;z<len;z++) if(src[z]<'0'||src[z]>'9') digits=0;
+            if(digits) {
+                if(ycur+adv>y+limit && ycur>y){col++;col_x=rtl_columns?x+w-(col+1)*adv:x+col*adv;ycur=y;}
+                FM* fm=fm_of(it->b); float tw=text_w(fm,src,(int)len); char* ss=sa(len+1);
+                if(ss){memcpy(ss,src,len);ss[len]=0;Cmd cm;memset(&cm,0,sizeof cm);cm.t=C_TEXT;cm.x=col_x+(adv-tw)*0.5f;cm.y=ycur+(adv-(fm->asc+fm->desc))*0.5f;cm.w=tw;cm.h=(float)(fm->asc+fm->desc);cm.node=it->b->n;cm.s=ss;cm.fam=fam_of(it->b);cm.size=fm->size;cm.color=it->b->st->color;cm.tstyle=(uint8_t)fm->style;cm.weight=(uint16_t)fm->weight;cm.ital=(uint8_t)fm->ital;cm.deco=it->b->st->deco;cm.opacity=it->b->st->opacity;if(it->b->st->visibility==0)dl_add(cm);}
+                ycur+=adv;if(ycur>max_y)max_y=ycur;continue;
+            }
+        }
+        size_t q=0;
+        while(q<len){
+            size_t unit=utf8_unit((const unsigned char*)src+q,len-q);
+            if(!unit)break;
+            if(ycur+adv>y+limit && ycur>y){col++;col_x=rtl_columns?x+w-(col+1)*adv:x+col*adv;ycur=y;}
+            FM* fm=fm_of(it->b); float tw=text_w(fm,src+q,(int)unit);
+            char* ss=sa(unit+1);
+            if(ss){memcpy(ss,src+q,unit);ss[unit]=0;Cmd cm;memset(&cm,0,sizeof cm);cm.t=C_TEXT;cm.x=col_x+(adv-tw)*0.5f;cm.y=ycur+(adv-(fm->asc+fm->desc))*0.5f;cm.w=tw;cm.h=(float)(fm->asc+fm->desc);cm.node=it->b->n;cm.s=ss;cm.fam=fam_of(it->b);cm.size=fm->size;cm.color=it->b->st->color;cm.tstyle=(uint8_t)fm->style;cm.weight=(uint16_t)fm->weight;cm.ital=(uint8_t)fm->ital;cm.deco=it->b->st->deco;cm.opacity=it->b->st->opacity;if(it->b->st->visibility==0)dl_add(cm);if(it->b->click){Cmd h;memset(&h,0,sizeof h);h.t=C_HIT;h.x=cm.x;h.y=cm.y;h.w=cm.w;h.h=cm.h;h.node=it->b->click;dl_add(h);}}
+            ycur+=adv;if(ycur>max_y)max_y=ycur;q+=unit;
+        }
+    }
+    if(max_x<x+(col+1)*adv)max_x=x+(col+1)*adv;
+    free(iv->v);iv->v=NULL;iv->n=iv->cap=0;
+    return max_y-y;
+}
+
 static float layout_inline(Box* c, float x, float y, float w, LS* ls) {
     IV iv = {0}; FCfg cfg = {w, 0, w, ls}; int last_sp = 1;
     flatten(c, &iv, &cfg, &last_sp);
     FM* strut = fm_of(c); const NodeStyle* cs = c->st;
-    float cy = y; int i = 0; int ni = iv.n; int first_line = 1;
+    if (cs->writing_mode != 0) return layout_inline_vertical(c, &iv, x, y, w, ls);
+    float colgap = 0, colw = w; int ncols = column_metrics(cs, w, &colgap, &colw);
+    int multicol = ncols > 1 && iv.n > 0; float xbase = x, ybase = y;
+    int lines_per_col = 0; float col_target_h = 0; int auto_fill = cs->column_fill == 1;
+    if (multicol) {
+        if (cs->height.set) col_target_h = lenpx(&cs->height, VH);
+        if (auto_fill && !cs->height.set) lines_per_col = 0x3fffffff; /* unconstrained auto-fill keeps the stream in one column */
+        else if (col_target_h > 0 && auto_fill) lines_per_col = 0x3fffffff;
+        else {
+            /* Estimate total line count for balance. Width estimates are token based; actual shaping still decides breaks. */
+            int lines = 1; float run = 0;
+            for (int z=0; z<iv.n; z++) {
+                Item* it=&iv.v[z];
+                if (it->t==I_BREAK) { lines++; run=0; continue; }
+                if (it->t==I_SPACE) { run += it->w; continue; }
+                if (it->t!=I_WORD && it->t!=I_ATOM) continue;
+                if (run>0 && run+it->w>colw) { lines++; run=it->w; } else run+=it->w;
+            }
+            lines_per_col=(lines+ncols-1)/ncols; if(lines_per_col<1)lines_per_col=1;
+            if (col_target_h<=0) col_target_h=lines_per_col*(strut->lh>0?strut->lh:cs->font_size*1.2f);
+        }
+    }
+    float cy = y; int i = 0; int ni = iv.n; int first_line = 1; int line_no = 0;
+    int col = 0, col_line = 0, col_used = 1; float col_max_h = 0;
     OpenFrag stack[24]; int nst = 0;
     char* rbuf = NULL; size_t rcap = 0;
 
     while (i < ni) {
+        if (cs->line_clamp && line_no >= cs->line_clamp) break;
         while (i < ni && iv.v[i].t == I_SPACE) i++;
         while (i < ni && (iv.v[i].t == I_FLOAT || iv.v[i].t == I_ABS)) {
             Item* it = &iv.v[i];
@@ -644,8 +1148,22 @@ static float layout_inline(Box* c, float x, float y, float w, LS* ls) {
             i++; while (i < ni && iv.v[i].t == I_SPACE) i++;
         }
         if (i >= ni) break;
-        float L = x, R = x + w; if (ls->fc) fc_range(ls->fc, cy, cy + strut->lh, &L, &R);
-        float lw = 0; int j = i, brk_end = -1, brk_next = -1; float brk_lw = 0, brk_left = 0; int forced = 0, jend = -1, next_i = -1;
+        float balance_limit=0;
+        if (cs->text_wrap==2 || cs->text_wrap==3) {
+            float total=0, widest=0; int p_end=i;
+            for(;p_end<ni && iv.v[p_end].t!=I_BREAK;p_end++) {
+                Item* pi=&iv.v[p_end];
+                if(pi->t==I_WORD || pi->t==I_ATOM){total+=pi->w;if(pi->w>widest)widest=pi->w;}
+                else if(pi->t==I_SPACE) total+=pi->w;
+            }
+            float avail=w-(line_no==0?(cs->text_indent_len.set?lenpx(&cs->text_indent_len,w):cs->text_indent):0);
+            if(avail<1)avail=w>1?w:1;
+            int lines=(int)ceilf(total/avail);if(lines<1)lines=1;
+            balance_limit=total/lines;if(balance_limit<widest)balance_limit=widest;if(balance_limit>avail)balance_limit=avail;
+        }
+        float L = x, R = x + w; if (ls->fc) fc_range(ls->fc, cy, cy + strut->lh, &L, &R); if (line_no == 0) L += cs->text_indent_len.set ? lenpx(&cs->text_indent_len, w) : cs->text_indent;
+        float wrap_limit=(R-L); if(balance_limit>0 && balance_limit<wrap_limit)wrap_limit=balance_limit;
+        float lw = 0; int j = i, brk_end = -1, brk_next = -1; float brk_lw = 0; int forced = 0, jend = -1, next_i = -1;
         float lw_at_open_ok = 0; (void)lw_at_open_ok;
         for (; j < ni; j++) {
             Item* it = &iv.v[j];
@@ -653,11 +1171,11 @@ static float layout_inline(Box* c, float x, float y, float w, LS* ls) {
             if (it->t == I_FLOAT) { place_float(it->b, it->fs, it->fe, ls, x, x + w, cy); L = x; R = x + w; if (ls->fc) fc_range(ls->fc, cy, cy + strut->lh, &L, &R); continue; }
             if (it->t == I_ABS) { register_abs(ls, it->b, x + lw, cy); continue; }
             if (it->t == I_SPACE) {
-                if (j > i && lw > 0) { brk_end = j; brk_next = j + 1; brk_lw = lw; brk_left = 0; }
+                if (j > i && lw > 0) { brk_end = j; brk_next = j + 1; brk_lw = lw; }
                 lw += it->w; continue;
             }
-            int wrap_ok = it->b->st->white_space != WS_NOWRAP && it->b->st->white_space != WS_PRE;
-            if ((it->t == I_WORD || it->t == I_ATOM) && wrap_ok && lw > 0 && lw + it->w > (R - L) + 0.01f) {
+            int wrap_ok = it->b->st->text_wrap != 1 && it->b->st->white_space != WS_NOWRAP && it->b->st->white_space != WS_PRE;
+            if ((it->t == I_WORD || it->t == I_ATOM) && wrap_ok && lw > 0 && lw + it->w > wrap_limit + 0.01f) {
                 if (it->t == I_ATOM || !it->glue) { if (iv.v[j - 1].t != I_SPACE) { jend = j; next_i = j; } else { jend = j - 1; next_i = j; } goto line_done; }
                 if (brk_end > i) { jend = brk_end; next_i = brk_next; lw = brk_lw; goto line_done; }
             }
@@ -693,24 +1211,33 @@ static float layout_inline(Box* c, float x, float y, float w, LS* ls) {
         float base = cy + ab_max;
         if (first_line) { c->fb = base; first_line = 0; }
         /* выравнивание */
-        L = x; R = x + w; if (ls->fc) fc_range(ls->fc, cy, cy + lh, &L, &R);
+        L = x; R = x + w; if (ls->fc) fc_range(ls->fc, cy, cy + lh, &L, &R); if (line_no == 0) L += cs->text_indent_len.set ? lenpx(&cs->text_indent_len, w) : cs->text_indent;
         float space = (R - L) - lw, sx = L; int nsp = 0;
         int last_line = forced || jend >= ni;
-        if (cs->text_align == ALIGN_CENTER) sx = L + (space > 0 ? space / 2 : 0); else if (cs->text_align == ALIGN_RIGHT) sx = L + (space > 0 ? space : 0);
+        int line_align = cs->text_align;
+        if (line_align == ALIGN_START) line_align = cs->direction ? ALIGN_RIGHT : ALIGN_LEFT;
+        else if (line_align == ALIGN_END) line_align = cs->direction ? ALIGN_LEFT : ALIGN_RIGHT;
+        if (line_align == ALIGN_CENTER) sx = L + (space > 0 ? space / 2 : 0); else if (line_align == ALIGN_RIGHT) sx = L + (space > 0 ? space : 0);
         float jextra = 0;
         if (cs->text_align == ALIGN_JUSTIFY && !last_line && space > 0) { for (int k = i; k < e; k++) if (iv.v[k].t == I_SPACE) nsp++; if (nsp) jextra = space / nsp; }
         /* эмиссия */
         float cx = sx; size_t rl = 0; float rx = 0; Box* rb = NULL; int rstart_k = -1; (void)rstart_k;
+        const char* run_source_start = NULL; const char* run_source_next = NULL; int run_source_valid = 1;
+        int clamp_ellipsis = cs->line_clamp && line_no + 1 >= cs->line_clamp && next_i < ni;
+        int bd = cs->unicode_bidi == 5 ? -1 : (cs->direction ? 1 : 0);
+        int line_cmd_start = l2_dn;
+        int at_line_end = 0, overflow_ellipsis = 0;
         #define FLUSH_RUN() do { if (rb && rl > 0) { \
                 FM* m = fm_of(rb); float off = rb->st->vertical_align == VA_SUB ? 0.2f * m->size : rb->st->vertical_align == VA_SUPER ? -0.33f * m->size : 0; \
                 float ty = base + off - m->asc; \
                 if (rb->st->vertical_align == VA_TOP) ty = cy - (m->lh - (m->asc + m->desc)) / 2 * 0 ; \
-                char* sbuf = sa(rl + 1); memcpy(sbuf, rbuf, rl); sbuf[rl] = 0; \
+                int add_ell = at_line_end && clamp_ellipsis && !overflow_ellipsis; char* sbuf = sa(rl + (add_ell ? 4 : 1)); memcpy(sbuf, rbuf, rl); if (add_ell) { memcpy(sbuf + rl, "…", 3); rl += 3; } sbuf[rl] = 0; \
                 Cmd cm; memset(&cm, 0, sizeof cm); cm.t = C_TEXT; cm.x = rx; cm.y = ty; cm.w = cx - rx; cm.h = (float)(m->asc + m->desc); cm.node = rb->n; cm.s = sbuf; cm.fam = fam_of(rb); \
                 cm.size = m->size; cm.color = rb->st->color; cm.tstyle = (uint8_t)m->style; cm.weight = (uint16_t)m->weight; cm.ital = (uint8_t)m->ital; cm.deco = rb->st->deco; cm.opacity = rb->st->opacity; \
+                if (run_source_valid && run_source_start && !add_ell && rb->text) { ptrdiff_t so = run_source_start - rb->text; if (so >= 0 && (size_t)so <= strlen(rb->text) && (size_t)so <= UINT32_MAX) { cm.text_offset = (uint32_t)so; cm.text_offset_valid = 1; } } \
                 if (rb->st->visibility == 0) dl_add(cm); \
                 if (rb->click) { Cmd h; memset(&h, 0, sizeof h); h.t = C_HIT; h.x = rx; h.y = ty; h.w = cx - rx; h.h = cm.h; h.node = rb->click; dl_add(h); } \
-                } rl = 0; rb = NULL; } while (0)
+                } rl = 0; rb = NULL; run_source_start = run_source_next = NULL; run_source_valid = 1; } while (0)
         for (int k = i; k < e; k++) {
             Item* it = &iv.v[k];
             switch (it->t) {
@@ -727,13 +1254,54 @@ static float layout_inline(Box* c, float x, float y, float w, LS* ls) {
                     if (f->slot >= 0) { FM* m = fm_of(f->b); Cmd* cm = &l2_dl[f->slot]; cm->x = f->x0; cm->w = cx - f->x0; cm->y = base - m->asc - f->b->pt - f->b->bt; cm->h = m->asc + m->desc + f->b->pt + f->b->pb + f->b->bt + f->b->bb; cm->flags = (uint8_t)(f->cont ? F_NOLEFT : 0); }
                     for (int z = q; z + 1 < nst; z++) stack[z] = stack[z + 1]; nst--; break; }
                 cx += it->b->mr; break; }
-            case I_SPACE: if (rb) { if (rl + 2 > rcap) { rcap = rcap ? rcap * 2 : 256; rbuf = realloc(rbuf, rcap); } rbuf[rl++] = ' '; } cx += it->w + jextra; break;
+            case I_SPACE: {
+                /* A collapsed space can belong to a separate DOM text node. Keep it
+                 * as its own run instead of attaching it to a different node, so
+                 * logical caret offsets and copy ranges remain tied to the source. */
+                if (rb && rb != it->b) FLUSH_RUN();
+                if (!rb && it->b) { rb = it->b; rx = cx; rl = 0; run_source_start = run_source_next = NULL; run_source_valid = 1; }
+                if (rb) {
+                    if (run_source_valid) {
+                        if (it->s && it->len == 1 && it->s[0] == ' ' && (!run_source_next || run_source_next == it->s)) {
+                            if (!run_source_start) run_source_start = it->s;
+                            run_source_next = it->s + 1;
+                        } else run_source_valid = 0;
+                    }
+                    if (rl + 2 > rcap) { rcap = rcap ? rcap * 2 : 256; rbuf = realloc(rbuf, rcap); }
+                    if (rbuf && rl + 1 < rcap) rbuf[rl++] = ' ';
+                }
+                cx += it->w + jextra; break; }
             case I_WORD: {
                 if (rb && rb != it->b) FLUSH_RUN();
-                if (!rb) { rb = it->b; rx = cx; rl = 0; }
+                if (!rb) { rb = it->b; rx = cx; rl = 0; run_source_start = run_source_next = NULL; run_source_valid = 1; }
                 size_t need = it->s ? (size_t)it->len : 0; if (!it->s) need = (size_t)(-it->len);
-                if (rl + need + 2 > rcap) { rcap = (rl + need + 2) * 2; rbuf = realloc(rbuf, rcap); }
-                if (it->s) { memcpy(rbuf + rl, it->s, need); rl += need; } else { memset(rbuf + rl, ' ', need); rl += need; }
+                if (run_source_valid) {
+                    if (!it->s || it->len <= 0) run_source_valid = 0;
+                    else if (!run_source_start) { run_source_start = it->s; run_source_next = it->s + need; }
+                    else if (run_source_next == it->s) run_source_next = it->s + need;
+                    else run_source_valid = 0;
+                }
+                /* text-overflow applies to clipped, single-line inline content. Keep whole UTF-8 code points and append an ellipsis. */
+                if (it->s && cs->text_overflow == 1 && cs->overflow_hidden && cs->white_space == WS_NOWRAP) {
+                    FM* tm = fm_of(it->b); float ew = text_w(tm, "…", 3);
+                    if (cx + it->w + ew > R + 0.01f) {
+                        float room = R - cx - ew; if (room < 0) room = 0;
+                        size_t pos = 0; float acc = 0;
+                        while (pos < need) {
+                            size_t clen = 1; unsigned char ch = (unsigned char)it->s[pos];
+                            if (ch >= 0xF0) clen = 4; else if (ch >= 0xE0) clen = 3; else if (ch >= 0xC0) clen = 2;
+                            if (pos + clen > need) clen = need - pos;
+                            float cw = text_w(tm, it->s + pos, (int)clen);
+                            if (acc + cw > room) break;
+                            acc += cw; pos += clen;
+                        }
+                        if (rl + pos + 5 > rcap) { size_t nc = (rl + pos + 5) * 2; char* nb = realloc(rbuf, nc); if (nb) { rbuf = nb; rcap = nc; } }
+                        if (rbuf && rl + pos + 4 <= rcap) { if (pos) { memcpy(rbuf + rl, it->s, pos); rl += pos; } memcpy(rbuf + rl, "…", 3); rl += 3; cx += acc + ew; overflow_ellipsis = 1; run_source_valid = 0; }
+                        k = e; break;
+                    }
+                }
+                if (rl + need + 2 > rcap) { size_t nc = (rl + need + 2) * 2; char* nb = realloc(rbuf, nc); if (nb) { rbuf = nb; rcap = nc; } }
+                if (rbuf && rl + need + 1 <= rcap) { if (it->s) { memcpy(rbuf + rl, it->s, need); rl += need; } else { memset(rbuf + rl, ' ', need); rl += need; } }
                 cx += it->w; break; }
             case I_ATOM: {
                 FLUSH_RUN(); Box* a = it->b; float oh = a->mt + a->h + a->mb; float fbrel = a->fb > -1e8f ? a->fb - a->y : -1e9f;
@@ -747,7 +1315,9 @@ static float layout_inline(Box* c, float x, float y, float w, LS* ls) {
             default: break;
             }
         }
-        FLUSH_RUN();
+        at_line_end = 1; FLUSH_RUN(); at_line_end = 0;
+        if (!clamp_ellipsis && cs->text_overflow != 1 && cs->text_align != ALIGN_JUSTIFY)
+            bidi_reposition_line_commands(line_cmd_start, l2_dn, bd);
         /* незакрытые inline-элементы продолжаются на следующей строке */
         for (int q = 0; q < nst; q++) {
             OpenFrag* f = &stack[q];
@@ -756,11 +1326,22 @@ static float layout_inline(Box* c, float x, float y, float w, LS* ls) {
             f->x0 = x; f->cont = 1;
         }
         cy += lh;
-        i = next_i;
+        i = next_i; line_no++; col_line++;
+        if (cy - (ybase) > col_max_h) col_max_h = cy - ybase;
+        if (multicol && i < ni && col < ncols - 1 &&
+            ((lines_per_col < 0x3fffffff && col_line >= lines_per_col) ||
+             (lines_per_col >= 0x3fffffff && col_target_h > 0 && cy - ybase >= col_target_h))) {
+            col++; col_used=col+1; col_line=0; x=xbase+col*(colw+colgap); w=colw; cy=ybase;
+        }
         }
     }
     free(iv.v); free(rbuf);
     for (int q = 0; q < nst; q++) if (stack[q].slot >= 0) { Cmd* cm = &l2_dl[stack[q].slot]; cm->w = 0; cm->h = 0; }   /* хвост без содержимого */
+    if (multicol) {
+        float last_h=cy-ybase; if(last_h>col_max_h)col_max_h=last_h;
+        column_rule_emit(cs,xbase,ybase,colw,colgap,col_used,col_target_h>col_max_h?col_target_h:col_max_h);
+        return (col_target_h>0 && cs->height.set) ? col_target_h : col_max_h;
+    }
     return cy - y;
 }
 
@@ -786,8 +1367,112 @@ static float mb_eff(Box* c, float cw) {
     return m;
 }
 
+/* A conservative fragmentation fast path for plain text/inline-only children.
+   It lets a paragraph continue in the next column at line boundaries without
+   pretending that block backgrounds, borders, floats or replaced content can
+   be fragmented safely. Rich block fragments stay on the legacy path below. */
+static int mc_fragment_safe(Box* b, int root) {
+    if (!b || !b->st || b->repl || b->oof || b->flt || b->kind == K_ATOM) return 0;
+    int text_node = b->n && b->n->type == TAG_TEXT;
+    if (!text_node && (has_visual_box(b->st) || b->st->overflow_hidden ||
+        b->st->position != POS_STATIC || b->st->column_span ||
+        (b->n && b->st->display == DSP_LIST_ITEM))) return 0;
+    if (!root && !text_node && b->kind == K_BLOCK && !b->anon) return 0;
+    for (Box* c = b->first; c; c = c->next) {
+        int child_text = c->n && c->n->type == TAG_TEXT;
+        if (c->kind == K_ATOM || (!child_text && c->kind == K_BLOCK && !c->anon)) return 0;
+        if (!mc_fragment_safe(c, 0)) return 0;
+    }
+    return 1;
+}
+static int mc_fragmentable_children(Box** items, int k) {
+    for (int i=0; i<k; i++) if (!mc_fragment_safe(items[i], 1)) return 0;
+    return 1;
+}
+static float mc_fragment_text_children(Box* parent, Box** items, int k, float cx, float cy,
+                                      float colw, float gap, int ncol, float target, LS* ls) {
+    float stream=0, measured=0; int maxcol=0;
+    for (int i=0; i<k; i++) {
+        Box* c=items[i]; float mt=mt_eff(c,colw), mb=mb_eff(c,colw);
+        int cmd0=l2_dn;
+        lbb(c,cx,cy+stream+mt,colw,-1,-1,-1,ls);
+        float h=mt+c->h+mb; if (h<0) h=0;
+        /* The safe-path predicate excludes children that could emit a block
+           background/clip or a replaced item; all visible commands are line-local. */
+        for (int j=cmd0; j<l2_dn; j++) {
+            Cmd* q=&l2_dl[j]; if(q->fixed) continue;
+            if(q->t==C_TEXT || q->t==C_HIT) {
+                float off=q->y-cy; int col=off>0?(int)floorf(off/target):0;
+                if(col<0) col=0;
+                if(col>1024) col=1024;
+                float stride=colw+gap; q->x += col*stride; q->y -= col*target;
+                if(col>maxcol)maxcol=col;
+            } else if(q->t==C_MARK && q->node) {
+                float top=q->y-cy, bot=top+q->h;
+                int first=top>0?(int)floorf(top/target):0;
+                int last=bot>0?(int)floorf(fmaxf(0,bot-0.01f)/target):first;
+                if(first<0) first=0;
+                if(last<first) last=first;
+                if(last>1024) last=1024;
+                q->x=cx+first*(colw+gap); q->y=cy;
+                q->w=(last-first)*(colw+gap)+colw; q->h=target;
+                if(last>maxcol)maxcol=last;
+            }
+        }
+        stream+=h; measured+=h;
+    }
+    (void)parent;
+    int used=maxcol+1; if(used<1)used=1;
+    if(used>ncol) used=ncol; /* overflow columns remain clipped by the containing flow for now */
+    column_rule_emit(parent->st,cx,cy,colw,gap,used,target);
+    float content_h=measured<target?measured:target;
+    if(parent->st->height.set && target>0) content_h=target;
+    return content_h;
+}
+
+static float layout_multicol_flow(Box* b, float cx, float cy, float cw, float ch, LS* ls) {
+    const NodeStyle* st=b->st; float gap=0,colw=cw; int ncol=column_metrics(st,cw,&gap,&colw); if(ncol<2)return 0;
+    int count=0; for(Box* c=b->first;c;c=c->next) if(!c->oof)count++;
+    Box** items=la(sizeof(Box*)*(size_t)(count?count:1)); float* hs=la(sizeof(float)*(size_t)(count?count:1)); if(!items||!hs)return 0;
+    int k=0; for(Box* c=b->first;c;c=c->next) if(!c->oof)items[k++]=c;
+    int mark=l2_dn, gmark=g_sgn; float measured=0; FCtx measure_fc; memset(&measure_fc,0,sizeof measure_fc); LS mls=*ls; mls.fc=&measure_fc;
+    /* First measure each direct child at the actual column width; discard the provisional display commands. */
+    for(int i=0;i<k;i++){
+        Box* c=items[i]; if(c->flt) { hs[i]=0; continue; }
+        float mt=mt_eff(c,colw), mb=mb_eff(c,colw); lbb(c,cx,cy+measured+mt,colw,-1,-1,ch,&mls);
+        hs[i]=mt+c->h+mb; if(hs[i]<0)hs[i]=0; measured+=hs[i];
+    }
+    l2_dn=mark; grp_trunc(gmark);
+    float target=st->height.set?lenpx(&st->height,ch>=0?ch:VH):(st->column_fill==1?measured:measured/ncol);
+    if(target<st->font_size*1.2f)target=st->font_size*1.2f;
+    int has_special=0;
+    for(Box* c=b->first;c;c=c->next) if(c->oof || c->flt || (c->st->column_span && c->st->column_span==1)) { has_special=1; break; }
+    int safe_frag = !has_special && k>0 && target>0 && mc_fragmentable_children(items,k);
+    if(safe_frag) {
+        float frag_h=mc_fragment_text_children(b,items,k,cx,cy,colw,gap,ncol,target,ls);
+        return frag_h;
+    }
+    int col=0; float y=cy; float maxh=0; int used=1; float colx=cx;
+    for(Box* c=b->first;c;c=c->next){
+        if(c->oof){register_abs(ls,c,cx,y);continue;}
+        if(c->flt){edges(c,colw);int ds=l2_dn;lbb(c,0,0,colw,-1,-1,ch,ls);place_float(c,ds,l2_dn,ls,colx,colx+colw,y);continue;}
+        int ii=0;while(ii<k&&items[ii]!=c)ii++;float est=ii<k?hs[ii]:0;
+        if(c->st->column_span && c->st->column_span==1){
+            lbb(c,cx,y,cw,-1,-1,ch,ls); y+=c->h; if(y-cy>maxh)maxh=y-cy; col++; if(col>=ncol)col=ncol-1; used=col+1; colx=cx+col*(colw+gap); y=cy; continue;
+        }
+        if(col<ncol-1 && y>cy+0.01f && y+est>cy+target+0.01f){if(y-cy>maxh)maxh=y-cy;col++;used=col+1;colx=cx+col*(colw+gap);y=cy;}
+        float mt=mt_eff(c,colw), mb=mb_eff(c,colw); lbb(c,colx,y+mt,colw,-1,-1,ch,ls);
+        if(c->fb>-1e8f && b->fb<-1e8f)b->fb=c->fb;
+        y+=mt+c->h+mb;
+    }
+    if(y-cy>maxh)maxh=y-cy;
+    column_rule_emit(st,cx,cy,colw,gap,used,st->height.set?target:maxh);
+    if(st->height.set && ch>=0 && target>maxh)maxh=target;
+    return maxh;
+}
 static float layout_flow(Box* b, float cx, float cy, float cw, float ch, LS* ls) {
     if (inline_only(b)) return layout_inline(b, cx, cy, cw, ls);
+    { float cg=0,cwcol=cw; if(column_metrics(b->st,cw,&cg,&cwcol)>1) return layout_multicol_flow(b,cx,cy,cw,ch,ls); }
     int coll_top = flow_container(b) && b->bt == 0 && b->pt == 0;
     int coll_bot = flow_container(b) && b->bb == 0 && b->pb == 0 && !b->st->height.set && !b->st->min_h.set;
     float y = cy, prev_mb = 0; int first = 1;
@@ -939,12 +1624,26 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
 
     float content_h = 0; b->fb = -1e9f;
     float cy = y + b->bt + b->pt;
-    if (b->repl) content_h = 0;
+    int cv_skip = !b->repl && !b->anon && b->n && s->content_visibility == 2;
+    if (!cv_skip && !b->repl && !b->anon && b->n && s->content_visibility == 1 && s->contain_intrinsic_h.set) {
+        float ph = lenpx(&s->contain_intrinsic_h, VH);
+        float visual_top = y - g_page_scroll_y;
+        if (visual_top > VH * 1.25f || visual_top + ph < -VH * 0.25f) cv_skip = 1;
+    }
+    if (cv_skip) {
+        if (s->contain_intrinsic_h.set) content_h = lenpx(&s->contain_intrinsic_h, ch_def >= 0 ? ch_def : VH);
+        else if (fh >= 0) content_h = fh;
+        else if (s->height.set && !(s->height.pct && ch_def < 0)) content_h = lenpx(&s->height, ch_def >= 0 ? ch_def : 0);
+        if (content_h < 0) content_h = 0;
+    } else if (b->repl) content_h = 0;
     else if (!b->anon && b->n && s->display == DSP_TABLE) content_h = layout_table(b, cx, cy, cw, &ls2);
     else if (!b->anon && b->n && s->is_grid) content_h = layout_grid(b, cx, cy, cw, ch_child, &ls2);
     else if (!b->anon && b->n && (s->display == DSP_FLEX || s->display == DSP_INLINE_FLEX)) content_h = layout_flex(b, cx, cy, cw, ch_child, &ls2);
     else content_h = layout_flow(b, cx, cy, cw, ch_child, &ls2);
     if (is_bfc(b) && !b->anon && ls2.fc) { float bot = fc_bottom(ls2.fc, 3); if (bot > cy + content_h) content_h = bot - cy; }
+    if (!b->repl && s->aspect_ratio > 0.0f && s->width.set && !s->height.set && fh < 0) {
+        float content_w = bw - ex_w; if (content_w > 0) content_h = content_w / s->aspect_ratio;
+    }
 
     float bh;
     if (fh >= 0) bh = fh + ex_h; else bh = content_h + ex_h;
@@ -965,7 +1664,7 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
     if (clip >= 0) { Cmd* c = &l2_dl[clip]; c->x = bx + b->bl; c->y = y + b->bt; c->w = bw - b->bl - b->br; c->h = bh - b->bt - b->bb; }
     if (b->repl) {
         Cmd c; memset(&c, 0, sizeof c); c.node = b->n; c.opacity = s->opacity; c.x = bx + b->bl + b->pl; c.y = y + b->bt + b->pt; c.w = bw - ex_w; c.h = bh - ex_h;
-        if ((b->repl == R_IMG && b->img && s->visibility == 0) || (b->repl == R_CANVAS && s->visibility == 0)) { c.t = C_IMG; c.s = b->n->src; dl_add(c); }
+        if ((b->repl == R_IMG && b->img && s->visibility == 0) || (b->repl == R_CANVAS && s->visibility == 0) || (b->repl == R_VIDEO && s->visibility == 0)) { c.t = C_IMG; c.s = b->repl == R_VIDEO ? b->n->media_frame_key : b->n->src; dl_add(c); }
         else if (b->repl == R_CTRL && s->visibility == 0) { c.t = C_CTRL; dl_add(c); }
         else if (b->repl == R_IMG && s->visibility == 0 && !b->img && b->n->alt[0]) { c.t = C_CTRL; dl_add(c); }
     }
@@ -1000,18 +1699,35 @@ static void lbb(Box* b, float x, float y, float avail_w, float forced_w, float f
         Cmd h; memset(&h, 0, sizeof h); h.t = C_HIT; h.x = bx; h.y = y; h.w = bw; h.h = bh; h.node = b->n; dl_add(h);
     }
     if (b->repl && b->click && b->n && s->visibility == 0) { Cmd h; memset(&h, 0, sizeof h); h.t = C_HIT; h.x = bx; h.y = y; h.w = bw; h.h = bh; h.node = b->click; dl_add(h); }
-    if (!b->anon && b->n && s->display == DSP_LIST_ITEM) {                              /* маркер списка */
+    if (!b->anon && b->n && s->display == DSP_LIST_ITEM) {                              /* ::marker / UA list marker */
+        const PseudoBox* mp = b->n->pb[2];
+        int custom_marker = mp && mp->content_state == 1;
+        int suppress_marker = mp && mp->content_state == -1;
+        const NodeStyle* ms = mp ? &mp->st : s;
+        const char* mfam = mp && mp->font_family[0] ? mp->font_family : fam_of(b);
         float base = b->fb > -1e8f ? b->fb : y + b->bt + b->pt + fm_of(b)->asc;
-        if (s->list_style != LS_NONE) {
-            FM* m = fm_of(b); int idx = 1; { DOMNode* n = b->n; int par = n->parent; if (par >= 0) for (int i = par + 1; i < n->idx; i++) if (NV[i]->parent == par && NV[i]->st.display == DSP_LIST_ITEM) idx++; char v[16]; if (webpage_attr_get(NV[par >= 0 ? par : 0], "start", v, sizeof v) && par >= 0) idx += atoi(v) - 1; }
-            Cmd c; memset(&c, 0, sizeof c); c.color = s->color; c.opacity = s->opacity; float sz = m->size * 0.32f;
-            if (s->list_style == LS_DECIMAL) {
-                char* t = sa(24); snprintf(t, 24, "%d.", idx); float tw = text_w(m, t, (int)strlen(t));
-                c.t = C_TEXT; c.s = t; c.x = cx - tw - 6; c.y = base - m->asc; c.w = tw; c.h = (float)(m->asc + m->desc); c.fam = fam_of(b); c.size = m->size; c.tstyle = (uint8_t)m->style; c.weight = (uint16_t)m->weight; c.ital = (uint8_t)m->ital; dl_add(c);
+        if (!suppress_marker && (custom_marker || s->list_style != LS_NONE)) {
+            int weight = ms->weight ? ms->weight : (ms->bold ? 700 : 400), ital = ms->italic ? 1 : 0;
+            TTFFont* ff = font_manager_get_styled(mfam, weight, ital); if (!ff) ff = g_ttf_font;
+            TTFFont* fnorm = font_manager_get_styled(mfam, 400, ital), *fnoital = font_manager_get_styled(mfam, weight, 0);
+            FM mm; memset(&mm, 0, sizeof mm); mm.f=ff; mm.size=(int)(ms->font_size+0.5f); if(mm.size<1)mm.size=1; if(mm.size>400)mm.size=400;
+            mm.weight=weight; mm.ital=ital; mm.style=((ms->bold && ff==fnorm)?TTF_BOLD:0)|((ms->italic && ff==fnoital)?TTF_ITALIC:0);
+            mm.asc=ff?ttf_font_ascent(ff,mm.size):(int)(mm.size*.93f); mm.desc=ff?ttf_font_descent(ff,mm.size):(int)(mm.size*.24f);
+            Cmd c; memset(&c, 0, sizeof c); c.color=ms->color; c.opacity=ms->opacity;
+            if (custom_marker) {
+                const char* t=mp->content; size_t tl=strlen(t); if(tl>599)tl=599;
+                float tw=text_w(&mm,t,(int)tl);
+                if (tl) { c.t=C_TEXT; c.s=t; c.x=cx-tw-6; c.y=base-mm.asc; c.w=tw; c.h=(float)(mm.asc+mm.desc); c.node=b->n; c.fam=mfam; c.size=mm.size; c.tstyle=(uint8_t)mm.style; c.weight=(uint16_t)mm.weight; c.ital=(uint8_t)mm.ital; dl_add(c); }
             } else {
-                c.t = C_RECT; c.w = c.h = sz + 1; c.x = cx - sz - 12; c.y = base - m->size * 0.36f - sz / 2; c.rad = s->list_style == LS_SQUARE ? 0 : c.w / 2;
-                if (s->list_style == LS_CIRCLE) { c.color = s->color; c.rad = c.w / 2; c.flags = 1; }
-                dl_add(c);
+                int idx=1; { DOMNode* n=b->n; int par=n->parent; if(par>=0) for(int i=par+1;i<n->idx;i++) if(NV[i]->parent==par && NV[i]->st.display==DSP_LIST_ITEM) idx++; char v[16]; if(par>=0 && webpage_attr_get(NV[par],"start",v,sizeof v))idx+=atoi(v)-1; }
+                float sz=mm.size*.32f;
+                if(s->list_style==LS_DECIMAL) {
+                    char* t=sa(24); snprintf(t,24,"%d.",idx); float tw=text_w(&mm,t,(int)strlen(t));
+                    c.t=C_TEXT; c.s=t; c.x=cx-tw-6; c.y=base-mm.asc; c.w=tw; c.h=(float)(mm.asc+mm.desc); c.node=b->n; c.fam=mfam; c.size=mm.size; c.tstyle=(uint8_t)mm.style; c.weight=(uint16_t)mm.weight; c.ital=(uint8_t)mm.ital; dl_add(c);
+                } else {
+                    c.t=C_RECT; c.w=c.h=sz+1; c.x=cx-sz-12; c.y=base-mm.size*.36f-sz/2; c.rad=s->list_style==LS_SQUARE?0:c.w/2;
+                    if(s->list_style==LS_CIRCLE){c.rad=c.w/2;c.flags=1;} dl_add(c);
+                }
             }
         }
     }
@@ -1059,6 +1775,22 @@ static void place_positioned(Box* c, float sx, float sy, float px, float py, flo
     float bx = has_l ? px + l + c->ml : has_r ? px + pw - r - c->mr - c->w : sx + c->ml;
     float by = has_t ? py + t + c->mt : has_b ? py + ph - bt2 - c->mb - c->h : sy + c->mt;
     if (c->mla && c->mra && has_l && has_r) bx = px + l + (pw - l - r - c->w) / 2;
+    /* Basic CSS anchor positioning. Named anchors participate in document order; the
+       first visible matching anchor supplies the position-area reference rectangle. */
+    if (s->position_anchor[0] && GBOX) {
+        Box* a=NULL;
+        for(int ai=0;ai<NVN;ai++) if(GBOX[ai] && NV[ai]->st.anchor_name[0] &&
+            !strcmp(NV[ai]->st.anchor_name,s->position_anchor)){a=GBOX[ai];break;}
+        if(a) {
+            const char* area=s->position_area;
+            if(strcasestr(area,"left")) bx=a->x-c->w-c->mr;
+            else if(strcasestr(area,"right")) bx=a->x+a->w+c->ml;
+            else bx=a->x+(a->w-c->w)*0.5f;
+            if(strcasestr(area,"top") || strcasestr(area,"block-start")) by=a->y-c->h-c->mb;
+            else if(strcasestr(area,"bottom") || strcasestr(area,"block-end")) by=a->y+a->h+c->mt;
+            else by=a->y+(a->h-c->h)*0.5f;
+        }
+    }
     dl_shift(s0, l2_dn, bx - c->x, by - c->y); c->x = bx; c->y = by;
     g_fixed = save_fixed;
 }
@@ -1076,9 +1808,11 @@ static void process_abs(Box* b, float px, float py, float pw, float ph, int fixe
 /* ══════════════ вход ══════════════ */
 void l2_layout(DOMNode* head, int vw, int vh) {
     l2_release(); la_reset(); sa_reset(); pa_reset(); g_fixed = 0; g_sgn = 0;
+    free(GBOX); GBOX=NULL;
     VW = (float)vw; VH = (float)vh; l2_canvas_bg = 0xFFFFFFFFu; l2_doc_w = VW; l2_doc_h = 0;
     int n = 0; for (DOMNode* p = head; p; p = p->next) n++;
     free(NV); NV = malloc((size_t)(n ? n : 1) * sizeof(DOMNode*)); NVN = n;
+    GBOX = calloc((size_t)(n ? n : 1), sizeof(Box*));
     { int i = 0; for (DOMNode* p = head; p; p = p->next) NV[i++] = p; }
     sc_prepare(head, n);
     if (!n || !head->v2) return;

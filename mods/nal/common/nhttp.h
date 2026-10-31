@@ -3,8 +3,12 @@
 #include <stddef.h>
 #include <stdio.h>
 
-/* Собственный HTTP/1.1-клиент: DNS, TCP (таймауты), TLS через ntls.h, keep-alive пул соединений, chunked,
-   gzip/deflate, редиректы, куки по RFC 6265 (в памяти). Блокирующий; для асинхронности NAL вызывает его в fork-потомке. */
+/* Largest URL accepted by the native HTTP client, including IDNA normalization. */
+#define NHTTP_URL_MAX 8700
+
+/* HTTP-клиент NAL. При сборке с MLBROWSER_HAVE_CURL используется libcurl-транспорт (HTTP/2, HTTP/3 при наличии QUIC,
+   Brotli и прокси по возможностям сборки); MLBROWSER_NET=native принудительно включает собственный HTTP/1.1-клиент.
+   Оба пути остаются блокирующими; для асинхронности NAL вызывает их в fork-потомке. */
 
 /* ── cookie jar в памяти ── */
 typedef struct NJar NJar;
@@ -16,6 +20,8 @@ void  njar_load_netscape(NJar* j, const char* path);
 int   njar_save_all(NJar* j, const char* path);        /* все непросроченные куки (для jar в файле без БД) */
 int   njar_save_changed(NJar* j, const char* path);    /* только новые/изменённые за время жизни jar; удалённые пишутся с expiry=1; возвращает число строк */
 
+typedef int (*NHttpHeadersCallback)(const char* headers, const char* response_url, void* user, char* err, size_t errcap);
+
 typedef struct {
     const char* method;               /* NULL → "GET" */
     const char* url;
@@ -25,8 +31,12 @@ typedef struct {
     int max_redirects;                /* 0 → 20; <0 — не следовать */
     int timeout_ms;                   /* общий лимит на всю цепочку; 0 → 90000 */
     FILE* sink;                       /* не NULL — тело пишется в файл по мере чтения (без распаковки, Accept-Encoding: identity) */
+    NHttpHeadersCallback headers_cb;  /* вызывается для финальных заголовков до чтения тела; 0 — прервать запрос */
+    void* headers_user;
     size_t max_body;                  /* 0 → 256 МиБ */
     const char* user_agent;           /* NULL → стандартный Chrome-подобный */
+    const char* site_for_cookies;     /* URL инициатора для SameSite; NULL — контекст неизвестен/верхнеуровневая навигация */
+    int is_top_level_navigation;      /* разрешает Lax cookie на безопасном GET/HEAD */
 } NHttpReq;
 
 typedef struct {
@@ -35,7 +45,7 @@ typedef struct {
     char* all_headers;                /* блоки заголовков всех ответов цепочки подряд (как curl -D при -L) */
     unsigned char* body; size_t body_len;   /* malloc; всегда с завершающим '\0' (не входит в body_len); NULL если sink */
     size_t sink_bytes;                /* сколько байт записано в sink */
-    char final_url[2048];
+    char final_url[NHTTP_URL_MAX];
     int from_cache;                   /* последнее звено цепочки: 0 — сеть, 1 — свежая запись кэша без запроса, 2 — кэш после проверки (304) */
     char err[200];
 } NHttpResp;

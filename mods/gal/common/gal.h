@@ -16,7 +16,9 @@ typedef enum {
     GAL_EVENT_MOUSE_MOVE,
     GAL_EVENT_MOUSE_CLICK,
     GAL_EVENT_MOUSE_SCROLL,
-    GAL_EVENT_KEY_PRESS
+    GAL_EVENT_KEY_PRESS,
+    GAL_EVENT_FILE_DROP,
+    GAL_EVENT_COMPOSITION
 } GAL_EventType;
 
 typedef enum {
@@ -24,6 +26,8 @@ typedef enum {
     GAL_MOUSE_MIDDLE = 2,
     GAL_MOUSE_RIGHT = 3
 } GAL_MouseButton;
+
+enum { GAL_MOD_CTRL = 1, GAL_MOD_SHIFT = 2, GAL_MOD_ALT = 4, GAL_MOD_SUPER = 8 };
 
 typedef struct {
     GAL_EventType type;
@@ -33,9 +37,12 @@ typedef struct {
     int scroll_x;
     int scroll_y;
     char key_char;
-    char text[32];
+    char text[256];
     int text_len;
     int key_code;
+    int modifiers;
+    int composition_type; /* 0=start, 1=update, 2=end */
+    char file_path[1024];
 } GAL_Event;
 
 int gal_init(void);

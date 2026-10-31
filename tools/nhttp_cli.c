@@ -9,7 +9,7 @@
 #include <string.h>
 
 int main(int argc, char** argv) {
-    const char *method = NULL, *data = NULL, *jarfile = NULL, *outf = NULL, *url = NULL; char hdrs[4096] = ""; int show = 0, reps = 1, timeout = 0, policy = 0, clear = 0; const char* cachedir = NULL;
+    const char *method = NULL, *data = NULL, *jarfile = NULL, *outf = NULL, *url = NULL, *site_for_cookies = NULL; char hdrs[4096] = ""; int show = 0, reps = 1, timeout = 0, policy = 0, clear = 0, top_level = 1; const char* cachedir = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-X") && i + 1 < argc) method = argv[++i];
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) data = argv[++i];
@@ -19,6 +19,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) timeout = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache") && i + 1 < argc) cachedir = argv[++i];
+        else if (!strcmp(argv[i], "--site-for-cookies") && i + 1 < argc) site_for_cookies = argv[++i];
+        else if (!strcmp(argv[i], "--subresource")) top_level = 0;
         else if (!strcmp(argv[i], "--reload")) policy = NHTTP_CACHE_RELOAD;
         else if (!strcmp(argv[i], "--offline")) policy = NHTTP_CACHE_OFFLINE;
         else if (!strcmp(argv[i], "--clear-cache")) clear = 1;
@@ -31,7 +33,7 @@ int main(int argc, char** argv) {
     int rc = 0;
     for (int n = 0; n < reps; n++) {
         FILE* sink = outf ? fopen(outf, "wb") : NULL;
-        NHttpReq rq = {0}; rq.method = method; rq.url = url; rq.headers = hdrs[0] ? hdrs : NULL; rq.body = (const unsigned char*)data; rq.body_len = data ? strlen(data) : 0; rq.jar = jar; rq.sink = sink; rq.timeout_ms = timeout;
+        NHttpReq rq = {0}; rq.method = method; rq.url = url; rq.headers = hdrs[0] ? hdrs : NULL; rq.body = (const unsigned char*)data; rq.body_len = data ? strlen(data) : 0; rq.jar = jar; rq.sink = sink; rq.timeout_ms = timeout; /* CLI requests model a top-level navigation; browser callers supply their real initiator site. */ rq.site_for_cookies = site_for_cookies ? site_for_cookies : url; rq.is_top_level_navigation = top_level;
         NHttpResp rs;
         int ok = nhttp_perform(&rq, &rs);
         if (sink) fclose(sink);
